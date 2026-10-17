@@ -4,8 +4,8 @@
 // does not corroborate, far-mint requests), parkDivergedCopy, and the debug
 // marker HUD plumbing (debugMark/pruneDebugMarkers).
 //
-// Shared hubs: owns censusHands_ + suppressed_; reads proxyByKey_ (minted by
-// the spawn TU); writes life_ via lifeSet.
+// Shared hubs: owns census_ (+ the merged censusHands_ view) and suppressed_;
+// reads proxyByKey_ (minted by the spawn TU); writes life_ via lifeSet.
 // Must NOT: change any log string - log phrasing is the API consumed by the
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
@@ -75,79 +75,129 @@ void Replicator::applyNpcCensus(GameWorld* gw, Inbound& in) {
     std::deque<InboundNpcCensus> got;
     in.drainNpcCensus(got);
     if (got.empty()) return;
-    // Latest wins (reliable-ordered channel, 1 Hz - normally one pending).
-    const InboundNpcCensus& nc = got.back();
-    // Whose existence claim this is. At two players there is exactly one peer,
-    // so a single set IS "the peer's census" - what was missing is the label,
-    // which is what lets enforcement ask whether the sender actually owns the
-    // cell a body stands in.
-    censusOwner_ = nc.ownerId;
+    // Each SENDER's latest packet, into its own slot. The two-player version
+    // took got.back() into one shared set - with several authors that dropped
+    // all but one census per drain and, across ticks, let each sender's set
+    // overwrite the last, so existence, park positions and freshness flipped
+    // between authors every half second. Within one sender, latest still wins
+    // (reliable-ordered channel, 1 Hz - normally one pending), and a superseded
+    // packet of the same drain is skipped exactly as before.
+    for (std::deque<InboundNpcCensus>::const_iterator gi = got.begin();
+         gi != got.end(); ++gi) {
+        const InboundNpcCensus& nc = *gi;
+        bool superseded = false;
+        for (std::deque<InboundNpcCensus>::const_iterator li = gi + 1;
+             li != got.end() && !superseded; ++li)
+            superseded = (li->ownerId == nc.ownerId);
+        if (superseded) continue;
+        PeerCensus& pc = census_[nc.ownerId];
+        pc.hands.clear();
+        // Keep the outgoing rows as the previous sample before they are
+        // overwritten: two consecutive census positions FROM THE SAME AUTHOR are
+        // the only evidence we have of how fast its copy of an unstreamed body
+        // is travelling, and the walk-converge band has to out-pace exactly that.
+        pc.prev.swap(pc.pos);
+        pc.prevMs = pc.recvMs;
+        pc.pos.clear();
+        unsigned int n = (unsigned int)(nc.hands.size() / 5);
+        bool havePos = nc.pos.size() >= (size_t)n * 3;
+        // PER-ROW ownership check (2026-08-08). A census is one message from one
+        // sender, so before this the sender's rows spoke for every cell we
+        // happened to resolve to that sender - including cells the sender does
+        // not own. The publish side already filters, but it filters against the
+        // SENDER's map, and the maps are only eventually equal: a claim reaches
+        // a peer a round trip after it reaches its author, so there is always a
+        // window in which two sides resolve a cell differently and both believe
+        // they author it. cellLastOwner_ can make such a window permanent (see
+        // Replicator.h), and rebuilding authority out of converged state to
+        // close it was measured strictly worse - so the receiver has to tolerate
+        // disagreement rather than the publisher having to avoid it.
+        //
+        // Judging each row against OUR map is what makes the window harmless: a
+        // row may only speak for a cell we agree the sender owns, so while the
+        // maps disagree, each side simply ignores the other's rows about the
+        // contested region and keeps authoring its own copies. Rejected rows are
+        // NOT culled or hidden - a rejection means we think the cell belongs to
+        // someone else, and authorHoldsBody already declines to judge anything
+        // in a cell we own, so the body stays ours to author and nobody else's
+        // to enforce against.
+        unsigned int nOff = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            Key k;
+            k.t  = nc.hands[i * 5 + 0];
+            k.c  = nc.hands[i * 5 + 1];
+            k.cs = nc.hands[i * 5 + 2];
+            k.i  = nc.hands[i * 5 + 3];
+            k.s  = nc.hands[i * 5 + 4];
+            CensusPos cp;
+            if (havePos) {
+                cp.x = nc.pos[i * 3 + 0];
+                cp.y = nc.pos[i * 3 + 1];
+                cp.z = nc.pos[i * 3 + 2];
+            }
+            // Positionless rows cannot be placed in a cell, so they cannot be
+            // judged and are taken at face value, as before.
+            if (cellAuth_ && gw && havePos &&
+                authorityFor(gw, cp.x, cp.z) != nc.ownerId) {
+                ++nOff;
+                continue;
+            }
+            pc.hands.insert(k);
+            if (havePos) pc.pos[k] = cp;
+        }
+        censusOffCell_ += nOff;
+        pc.recvMs = nowMs();
+        censusRecvMs_ = pc.recvMs;
+        static unsigned long logTick = 0;
+        if ((censusRecvMs_ - logTick) > 10000) {
+            logTick = censusRecvMs_;
+            char b[192];
+            _snprintf(b, sizeof(b) - 1,
+                      "[census] recv n=%u kept=%u offcell=%u culls=%lu (offcell=%lu "
+                      "cellYields=%lu hostRefus=%lu)",
+                      n, n - nOff, nOff, censusCulls_, censusOffCell_, cellYields_,
+                      hostDriveRefusals_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    rebuildCensusUnion();
+}
+
+void Replicator::rebuildCensusUnion() {
+    // Every sender's latest rows, stale or not (staleness is judged where it is
+    // consumed, per sender - see censusVouches). With one sender this is that
+    // sender's set verbatim, which is what censusHands_/censusPos_ always were.
+    // Ascending owner id with insert-if-absent: the lowest id wins a hand two
+    // senders both list (they should not, since rows are filtered by cell
+    // authority, but a stale row can linger until its sender re-publishes).
     censusHands_.clear();
-    // Keep the outgoing rows as the previous sample before they are overwritten:
-    // two consecutive census positions are the only evidence the join has of how
-    // fast the host's copy of an unstreamed body is travelling, and the walk-
-    // converge band has to out-pace exactly that.
-    censusPrev_.swap(censusPos_);
-    censusPrevMs_ = censusRecvMs_;
     censusPos_.clear();
-    unsigned int n = (unsigned int)(nc.hands.size() / 5);
-    bool havePos = nc.pos.size() >= (size_t)n * 3;
-    // PER-ROW ownership check (2026-08-08). censusOwner_ is one label for the
-    // whole message, so before this the sender's rows spoke for every cell we
-    // happened to resolve to that sender - including cells the sender does not
-    // own. The publish side already filters, but it filters against the
-    // SENDER's map, and the two maps are only eventually equal: a claim reaches
-    // the peer a round trip after it reaches us, so there is always a window in
-    // which each side resolves a cell differently and both believe they author
-    // it. cellLastOwner_ can make such a window permanent (see Replicator.h),
-    // and rebuilding authority out of converged state to close it was measured
-    // strictly worse - so the receiver has to tolerate disagreement rather than
-    // the publisher having to avoid it.
-    //
-    // Judging each row against OUR map is what makes the window harmless: a row
-    // may only speak for a cell we agree the sender owns, so while the two
-    // disagree, each side simply ignores the other's rows about the contested
-    // region and keeps authoring its own copies. Rejected rows are NOT culled
-    // or hidden - a rejection means we think the cell is ours, and
-    // authorHoldsBody already declines to judge anything in a cell we own, so
-    // the body stays ours to author and nobody else's to enforce against.
-    unsigned int nOff = 0;
-    for (unsigned int i = 0; i < n; ++i) {
-        Key k;
-        k.t  = nc.hands[i * 5 + 0];
-        k.c  = nc.hands[i * 5 + 1];
-        k.cs = nc.hands[i * 5 + 2];
-        k.i  = nc.hands[i * 5 + 3];
-        k.s  = nc.hands[i * 5 + 4];
-        CensusPos cp;
-        if (havePos) {
-            cp.x = nc.pos[i * 3 + 0];
-            cp.y = nc.pos[i * 3 + 1];
-            cp.z = nc.pos[i * 3 + 2];
+    censusOwnerOf_.clear();
+    unsigned long newest = 0;
+    for (std::map<u32, PeerCensus>::const_iterator ci = census_.begin();
+         ci != census_.end(); ++ci) {
+        const PeerCensus& pc = ci->second;
+        if (pc.recvMs != 0 && (newest == 0 || (long)(pc.recvMs - newest) > 0))
+            newest = pc.recvMs;
+        for (std::set<Key>::const_iterator hi = pc.hands.begin();
+             hi != pc.hands.end(); ++hi) {
+            if (!censusHands_.insert(*hi).second) continue;
+            censusOwnerOf_[*hi] = ci->first;
+            std::map<Key, CensusPos>::const_iterator pi = pc.pos.find(*hi);
+            if (pi != pc.pos.end()) censusPos_[*hi] = pi->second;
         }
-        // Positionless rows cannot be placed in a cell, so they cannot be
-        // judged and are taken at face value, as before.
-        if (cellAuth_ && gw && havePos &&
-            authorityFor(gw, cp.x, cp.z) != nc.ownerId) {
-            ++nOff;
-            continue;
-        }
-        censusHands_.insert(k);
-        if (havePos) censusPos_[k] = cp;
     }
-    censusOffCell_ += nOff;
-    censusRecvMs_ = nowMs();
-    static unsigned long logTick = 0;
-    if ((censusRecvMs_ - logTick) > 10000) {
-        logTick = censusRecvMs_;
-        char b[192];
-        _snprintf(b, sizeof(b) - 1,
-                  "[census] recv n=%u kept=%u offcell=%u culls=%lu (offcell=%lu "
-                  "cellYields=%lu hostRefus=%lu)",
-                  n, n - nOff, nOff, censusCulls_, censusOffCell_, cellYields_,
-                  hostDriveRefusals_);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    censusRecvMs_ = newest;
+}
+
+bool Replicator::censusVouches(const Key& k, unsigned long now) const {
+    for (std::map<u32, PeerCensus>::const_iterator it = census_.begin();
+         it != census_.end(); ++it) {
+        if (it->second.recvMs == 0 ||
+            (now - it->second.recvMs) > (unsigned long)CENSUS_FRESH_MS) continue;
+        if (it->second.hands.find(k) != it->second.hands.end()) return true;
     }
+    return false;
 }
 
 void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
@@ -219,8 +269,12 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     static EntityState wStates[NPC_CENSUS_MAX];
     unsigned int wn = 0;
     bool wideTrunc = false;
+    // Fresh = SOME author's census is current. Per-body judgment below asks
+    // whether a current census actually lists the body (censusVouches), so one
+    // author going silent never lets another's rows stand in for it.
+    const unsigned long nowE = nowMs();
     bool censusFresh = censusRadius_ > 0.0f && censusRecvMs_ != 0 &&
-                       (nowMs() - censusRecvMs_) <= 5000;
+                       (nowE - censusRecvMs_) <= (unsigned long)CENSUS_FRESH_MS;
     if (censusFresh)
         wn = engine::listNpcsWide(gw, censusRadius_, wChars, wStates, NPC_CENSUS_MAX,
                                   &wideTrunc);
@@ -322,10 +376,12 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     // That misreading is the whole ghost mechanism: a legitimate local NPC in
     // a place only this client cares about, hidden because the other client
     // never mentioned it.
-    float rawAnch[12];
-    unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch);
-    float attnAnch[12];
-    unsigned int nAttnAnch = attentionAnchors(gw, rawAnch, nRawAnch, attnAnch);
+    float rawAnch[3 * engine::MAX_INTEREST_ANCHORS];
+    unsigned int nRawLeaders = 0;
+    unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch, &nRawLeaders);
+    float attnAnch[3 * engine::MAX_INTEREST_ANCHORS];
+    unsigned int nAttnAnch = attentionAnchors(gw, rawAnch, nRawAnch, nRawLeaders,
+                                              attnAnch);
     unsigned int authSkip = 0;   // bodies left alone because we author them
 
     // Prune counters for hands the enumeration no longer sees (left interest),
@@ -373,8 +429,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         // may drift, but it EXISTS; only census-absent ghosts get hidden. With
         // no fresh census (hatch off / host lagging) the legacy streamed-only
         // behavior stands.
-        bool exists = streamed ||
-                      (censusFresh && censusHands_.find(k) != censusHands_.end());
+        bool exists = streamed || (censusFresh && censusVouches(k, nowE));
         std::map<Key, Character*>::iterator s = suppressed_.find(k);
         AuthCount& ac = authCount_[k];
         // Dormant and census-absent: neither client is speaking for this
@@ -506,7 +561,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
                 continue;
             }
             if (driven && suppressed_.find(k) == suppressed_.end()) continue;
-            bool exists = censusHands_.find(k) != censusHands_.end() ||
+            bool exists = censusVouches(k, nowE) ||
                           keep.find(k) != keep.end() || driven;
             std::map<Key, Character*>::iterator s = suppressed_.find(k);
             AuthCount& ac = authCount_[k];
@@ -743,8 +798,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
                     // Ours to author - it is not a ghost for lacking a census
                     // row, because nobody but us was ever going to write one.
                     cls = "mine"; ++cMine;
-                } else if (censusFresh &&
-                           censusHands_.find(k) != censusHands_.end()) {
+                } else if (censusFresh && censusVouches(k, nowE)) {
                     cls = "cen"; ++cCen;
                 } else if (!observedAt(k, attnAnch, nAttnAnch,
                                        sts[i].x, sts[i].y, sts[i].z)) {
@@ -983,11 +1037,14 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
 // still, and 285 u of error once run_apart ran at 570 u/s. attnVetoMask_ carries
 // the full account.
 unsigned int Replicator::attentionAnchors(GameWorld* gw, const float* raw,
-                                          unsigned int nRaw, float* out) {
+                                          unsigned int nRaw, unsigned int nLeaders,
+                                          float* out) {
     if (!raw || !out) return 0;
     const unsigned long ATTN_VETO_MS  = 500;
     const float         ATTN_VETO_JUMP = 100.0f;
     unsigned long nowV = nowMs();
+    const unsigned int MAX_A = engine::MAX_INTEREST_ANCHORS;   // <= 32 mask bits
+    if (nRaw > MAX_A) nRaw = MAX_A;
     bool reuse = (attnVetoMs_ != 0) && ((nowV - attnVetoMs_) < ATTN_VETO_MS)
                  && (attnVetoRawN_ == nRaw);
     for (unsigned int a = 0; reuse && a < nRaw; ++a)
@@ -1002,7 +1059,7 @@ unsigned int Replicator::attentionAnchors(GameWorld* gw, const float* raw,
         keepMask = attnVetoMask_;
     } else {
         keepMask = 0;
-        for (unsigned int a = 0; a < nRaw && a < 8; ++a) {
+        for (unsigned int a = 0; a < nRaw; ++a) {
             const float* p = raw + a * 3;
             if (attentionRadius_ > 0.0f &&
                 !engine::isZoneLoadedAt(gw, p[0], p[1], p[2])) continue;
@@ -1011,12 +1068,12 @@ unsigned int Replicator::attentionAnchors(GameWorld* gw, const float* raw,
         attnVetoMs_   = nowV;
         attnVetoRawN_ = nRaw;
         attnVetoMask_ = keepMask;
-        for (unsigned int i = 0; i < nRaw * 3 && i < 12; ++i) attnVetoRaw_[i] = raw[i];
+        for (unsigned int i = 0; i < nRaw * 3; ++i) attnVetoRaw_[i] = raw[i];
     }
     unsigned int nOut = 0;
     unsigned int vetoMask = 0;   // which raw indices were dropped
-    for (unsigned int a = 0; a < nRaw && nOut < 4; ++a) {
-        if (a < 8 && !(keepMask & (1u << a))) { vetoMask |= (1u << a); continue; }
+    for (unsigned int a = 0; a < nRaw; ++a) {
+        if (!(keepMask & (1u << a))) { vetoMask |= (1u << a); continue; }
         const float* p = raw + a * 3;
         out[nOut * 3 + 0] = p[0];
         out[nOut * 3 + 1] = p[1];
@@ -1028,24 +1085,24 @@ unsigned int Replicator::attentionAnchors(GameWorld* gw, const float* raw,
         if (vetoLogMs == 0 || (nowV - vetoLogMs) >= 10000) {
             vetoLogMs = nowV;
             // WHICH anchor, and where. interestCenters fills tab leaders first
-            // and cameras after, so index 0-1 are leaders in this 2-player scope
-            // - and the difference matters completely. Dropping the PEER's tab
-            // leader is the veto working: on run_apart the join holds a driven
-            // copy of the host's leader 138,000 u away, in ground it has never
-            // loaded and cannot speak for. Dropping OUR OWN leader would mean
-            // the gate stopped reconciling a player's own surroundings, which is
-            // the failure dormPc exists to catch. The old line counted vetoes
-            // without saying which, so the two were indistinguishable.
-            char idx[72]; unsigned int w = 0;
-            for (unsigned int a = 0; a < nRaw && a < 8 && w + 16 < sizeof(idx); ++a) {
+            // and cameras after (nLeaders of them), and the difference matters
+            // completely. Dropping ANOTHER player's tab leader is the veto
+            // working: on run_apart the join holds a driven copy of the host's
+            // leader 138,000 u away, in ground it has never loaded and cannot
+            // speak for. Dropping OUR OWN leader would mean the gate stopped
+            // reconciling a player's own surroundings, which is the failure
+            // dormPc exists to catch. The old line counted vetoes without saying
+            // which, so the two were indistinguishable.
+            char idx[200]; unsigned int w = 0;
+            for (unsigned int a = 0; a < nRaw && w + 16 < sizeof(idx); ++a) {
                 if (!(vetoMask & (1u << a))) continue;
                 int k = _snprintf(idx + w, sizeof(idx) - w - 1, "%s%u%s",
-                                  w ? "," : "", a, a < 2 ? "(leader)" : "(cam)");
+                                  w ? "," : "", a, a < nLeaders ? "(leader)" : "(cam)");
                 if (k <= 0) break;
                 w += (unsigned int)k;
             }
             idx[w] = '\0';
-            char b[192]; _snprintf(b, sizeof(b) - 1,
+            char b[288]; _snprintf(b, sizeof(b) - 1,
                 "[attn] anchor veto %u/%u (zone not loaded here) dropped=%s",
                 nRaw - nOut, nRaw, idx[0] ? idx : "?");
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
@@ -1062,17 +1119,19 @@ void Replicator::rebuildClaimedCells() {
         u32 owner = it->first.first;
         std::map<std::pair<int, int>, u32>::iterator ex = claimedCells_.find(cell);
         if (ex == claimedCells_.end()) claimedCells_[cell] = owner;
-        else if (owner == (u32)CELL_OWNER_HOST) ex->second = owner;  // host wins ties
+        else if (owner < ex->second) ex->second = owner;  // lowest id (host) wins ties
     }
     // CO-LOCATION COLLAPSE. Splitting authorship by cell exists so the host does
     // not have to author bodies it cannot enumerate, which is a real problem
-    // only while the squads are apart. Standing in one camp, both clients have
+    // only while the squads are apart. Standing in one camp, the clients have
     // the same bodies loaded and the split just runs a contested boundary
-    // through the middle of the shared area - so hand the lot to the host and
-    // let the join drive, exactly as v0.46 did.
+    // through the middle of the shared area - so hand the lot to the lowest id
+    // standing there (the host, when it is one of them) and let the others
+    // drive, exactly as v0.46 did.
     //
     // The rewrite below covers the CLAIMED cells; authoritySrc short-circuits
-    // the rest while collapsed_ holds. Both are needed. Rewriting only the
+    // the rest while collapsed_ holds (and remaps vacated cells through
+    // collapseTo_ for a partial collapse). Both are needed. Rewriting only the
     // claimed map left the vacated ones (AUTHSRC_VACATE) still pointing at the
     // join, and a travelling pair leaves a trail of those behind it - so the
     // host went on deferring to the join for the ground they had just walked
@@ -1080,11 +1139,18 @@ void Replicator::rebuildClaimedCells() {
     // authored those bodies, and the host froze them as census-absent: 428
     // freezes in a session where the collapse was otherwise engaged 90% of the
     // time (manual session 2026-08-09 15:14).
-    collapsed_ = cellCollapse_ && claimsCoLocated();
+    collapseTo_.clear();
+    collapsed_ = cellCollapse_ && resolveCollapse();
     if (collapsed_) {
         for (std::map<std::pair<int, int>, u32>::iterator it = claimedCells_.begin();
              it != claimedCells_.end(); ++it) {
             it->second = (u32)CELL_OWNER_HOST;
+        }
+    } else if (cellCollapse_ && !collapseTo_.empty()) {
+        for (std::map<std::pair<int, int>, u32>::iterator it = claimedCells_.begin();
+             it != claimedCells_.end(); ++it) {
+            std::map<u32, u32>::const_iterator ct = collapseTo_.find(it->second);
+            if (ct != collapseTo_.end()) it->second = ct->second;
         }
     }
     // Remember it, so walking out of a cell does not hand it to the host.
@@ -1094,50 +1160,53 @@ void Replicator::rebuildClaimedCells() {
     }
 }
 
-bool Replicator::claimsCoLocated() const {
-    // Two passes over the slots rather than one, because "every peer claim is
-    // near SOME host claim" needs the host set complete before any peer claim
-    // can be judged.
-    std::vector<std::pair<int, int> > hostCells;
-    std::vector<std::pair<int, int> > peerCells;
+bool Replicator::resolveCollapse() {
+    // Each player's claimed cells, complete before any player is judged:
+    // "every cell o claims, m claims too" needs m's set whole.
+    std::map<u32, std::set<std::pair<int, int> > > cellsOf;
     for (std::map<std::pair<u32, u32>, CellClaim>::const_iterator it = claimSlots_.begin();
-         it != claimSlots_.end(); ++it) {
-        std::pair<int, int> cell(it->second.cx, it->second.cz);
-        if (it->first.first == (u32)CELL_OWNER_HOST) hostCells.push_back(cell);
-        else peerCells.push_back(cell);
-    }
-    // Silence from either side is not co-location. Before the host's first
+         it != claimSlots_.end(); ++it)
+        cellsOf[it->first.first].insert(std::make_pair(it->second.cx, it->second.cz));
+    // Silence from either side is not co-location. Before a player's first
     // claim arrives there is nothing to collapse ONTO, and collapsing anyway
-    // would hand the join's own cell to a host that has not spoken yet.
-    if (hostCells.empty() || peerCells.empty()) return false;
-    for (size_t p = 0; p < peerCells.size(); ++p) {
-        // NOT named 'near': MSVC still reserves it (with 'far') from the 16-bit
-        // memory-model keywords, and the parse failure it produces names the
-        // line after the declaration.
-        bool together = false;
-        for (size_t h = 0; h < hostCells.size() && !together; ++h) {
-            // THE SAME cell, not merely a touching one. Chebyshev 1 was tried
-            // first, on the reasoning that a camp straddling a boundary puts the
-            // two tabs in adjacent cells - and split_far2 refuted it on the
-            // first run: its two towns, a cross-country march apart, are cells
-            // 21,31 and 21,32. A cell is thousands of units wide, so "touching
-            // cells" says nothing about whether the squads can see each other,
-            // and the collapse stayed on through the entire separated leg the
-            // split exists to serve (gate 0/3, the join's own cell resolving to
-            // the host).
-            //
-            // Sharing a cell is a weaker statement than being in arm's reach,
-            // but it errs the safe way: a false negative is merely today's
-            // behaviour, while a false positive hands a whole region to a
-            // client that cannot enumerate it. The straddling camp is the
-            // accepted miss - the alternative, comparing squad POSITIONS,
-            // cannot be used here, because those differ per client and a
-            // threshold over them would flip independently on each side.
-            if (peerCells[p] == hostCells[h]) together = true;
+    // would hand another player's own cell to someone who has not spoken yet -
+    // so only players that HOLD claims take part, on both ends.
+    //
+    // THE SAME cell, not merely a touching one. Chebyshev 1 was tried first, on
+    // the reasoning that a camp straddling a boundary puts two tabs in adjacent
+    // cells - and split_far2 refuted it on the first run: its two towns, a
+    // cross-country march apart, are cells 21,31 and 21,32. A cell is thousands
+    // of units wide, so "touching cells" says nothing about whether the squads
+    // can see each other, and the collapse stayed on through the entire
+    // separated leg the split exists to serve (gate 0/3, the join's own cell
+    // resolving to the host).
+    //
+    // Sharing a cell is a weaker statement than being in arm's reach, but it
+    // errs the safe way: a false negative is merely today's behaviour, while a
+    // false positive hands a whole region to a client that cannot enumerate it.
+    // The straddling camp is the accepted miss - the alternative, comparing
+    // squad POSITIONS, cannot be used here, because those differ per client and
+    // a threshold over them would flip independently on each side. One
+    // straggler tab of o's is enough to keep o split.
+    bool total = cellsOf.find((u32)CELL_OWNER_HOST) != cellsOf.end();
+    bool anyOther = false;
+    for (std::map<u32, std::set<std::pair<int, int> > >::const_iterator o = cellsOf.begin();
+         o != cellsOf.end(); ++o) {
+        if (o->first == (u32)CELL_OWNER_HOST) continue;
+        anyOther = true;
+        bool placed = false;
+        // Ascending ids, so the first match is the LOWEST qualifying m.
+        for (std::map<u32, std::set<std::pair<int, int> > >::const_iterator m = cellsOf.begin();
+             m != cellsOf.end() && m->first < o->first && !placed; ++m) {
+            bool together = true;
+            for (std::set<std::pair<int, int> >::const_iterator c = o->second.begin();
+                 c != o->second.end() && together; ++c)
+                together = m->second.find(*c) != m->second.end();
+            if (together) { collapseTo_[o->first] = m->first; placed = true; }
         }
-        if (!together) return false;  // one straggler is enough to keep the split
+        if (!placed || collapseTo_[o->first] != (u32)CELL_OWNER_HOST) total = false;
     }
-    return true;
+    return total && anyOther;
 }
 
 u32 Replicator::authorityFor(GameWorld* gw, float x, float z) const {
@@ -1159,9 +1228,17 @@ u32 Replicator::authoritySrc(GameWorld* gw, float x, float z,
     std::pair<int, int> cell(*cx, *cz);
     std::map<std::pair<int, int>, u32>::const_iterator it = claimedCells_.find(cell);
     if (it != claimedCells_.end()) { *src = AUTHSRC_CLAIM; return it->second; }
-    // Nobody is standing here now; the last client that was still speaks for it.
+    // Nobody is standing here now; the last client that was still speaks for it
+    // - or, while that client stands together with a lower id (a partial
+    // collapse), the one it collapsed onto, for the same trail-of-vacated-cells
+    // reason as the total collapse above.
     std::map<std::pair<int, int>, u32>::const_iterator lo = cellLastOwner_.find(cell);
-    if (lo != cellLastOwner_.end()) { *src = AUTHSRC_VACATE; return lo->second; }
+    if (lo != cellLastOwner_.end()) {
+        std::map<u32, u32>::const_iterator ct = collapseTo_.find(lo->second);
+        if (ct != collapseTo_.end()) { *src = AUTHSRC_COLLAPSE; return ct->second; }
+        *src = AUTHSRC_VACATE;
+        return lo->second;
+    }
     *src = AUTHSRC_OPEN;
     return (u32)CELL_OWNER_HOST;
 }
@@ -1173,8 +1250,10 @@ bool Replicator::authorHoldsBody(GameWorld* gw, u32 localId, const Key& k,
     // Ours to author, or nobody's we have heard from: either way this body is
     // not ours to judge. The second case matters as much as the first - a cell
     // whose owner has sent no census is unspoken-for, not empty, and treating
-    // silence as absence is the whole ghost mechanism.
-    if (owner != localId && owner == censusOwner_) return false;
+    // silence as absence is the whole ghost mechanism. Asked of THAT owner's
+    // census (census_ holds one per sender): with several authors, "the last
+    // census we got" is usually somebody else's.
+    if (owner != localId && census_.find(owner) != census_.end()) return false;
     // INCUMBENT HOLDS. A body the peer's stream is already writing is the peer's,
     // whatever this cell verdict says, because the verdict is not a shared fact:
     // each side evaluates it against ITS OWN copy's position, and the two copies
@@ -1238,6 +1317,7 @@ void Replicator::syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ow
             claimSlots_.clear(); claimedCells_.clear(); cellLastOwner_.clear();
         }
         collapsed_ = false;   // no claims, nothing to collapse onto
+        collapseTo_.clear();
         return;
     }
     unsigned long now = nowMs();
@@ -1376,7 +1456,7 @@ unsigned int Replicator::peerAnchors(GameWorld* gw, float* out) {
     // TAB was 5200 u away, while the join went on attending it through its
     // local copy of the host's leader - and suppressed 26 real bodies against
     // the resulting silence.
-    for (unsigned int ci = 0; ci < ctnrs.size() && nOut < 3; ++ci) {
+    for (unsigned int ci = 0; ci < ctnrs.size() && nOut < MAX_PLAYERS; ++ci) {
         for (unsigned int i = 0; i < nSquad; ++i) {
             if (raw[i].hContainer != ctnrs[ci].first ||
                 raw[i].hContainerSerial != ctnrs[ci].second) continue;
@@ -1387,13 +1467,9 @@ unsigned int Replicator::peerAnchors(GameWorld* gw, float* out) {
             break;
         }
     }
-    float pc[3];
-    if (nOut < 4 && engine::peerCamAnchor(pc)) {
-        out[nOut * 3 + 0] = pc[0];
-        out[nOut * 3 + 1] = pc[1];
-        out[nOut * 3 + 2] = pc[2];
-        ++nOut;
-    }
+    // Every remote player's fresh camera hint (one each, ascending id).
+    nOut += engine::peerCamAnchors(out + nOut * 3,
+                                   engine::MAX_INTEREST_ANCHORS - nOut);
     return nOut;
 }
 
@@ -1557,22 +1633,28 @@ float Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Ke
     if (censusWalkDist_ > 0.0f && d <= censusWalkDist_) {
         CensusFix& f = censusFix_[k];
         // What the counterpart is doing, from the step between the last two
-        // census rows - the only thing the join can know about an unstreamed
-        // body's motion, since the census carries position and nothing else.
+        // census rows OF THE AUTHOR THAT LISTS IT - the only thing we can know
+        // about an unstreamed body's motion, since the census carries position
+        // and nothing else.
         float stepX = 0.0f, stepZ = 0.0f, hostSpd = 0.0f;
-        std::map<Key, CensusPos>::iterator pv = censusPrev_.find(k);
-        if (pv != censusPrev_.end() && censusPrevMs_ &&
-            censusRecvMs_ > censusPrevMs_) {
-            stepX = it->second.x - pv->second.x;
-            stepZ = it->second.z - pv->second.z;
-            float dt = (float)(censusRecvMs_ - censusPrevMs_) / 1000.0f;
-            // Converted OUT of world units per second and INTO the engine's
-            // speed scale: the step is real displacement and so already carries
-            // the game-speed multiplier, while walkTo commands a speed the
-            // multiplier is then applied to. Miss that and a 5x session orders
-            // five times the intended sprint.
-            float mult = (speedLastSet_ > 1.0f) ? speedLastSet_ : 1.0f;
-            hostSpd = std::sqrt(stepX * stepX + stepZ * stepZ) / dt / mult;
+        std::map<Key, u32>::const_iterator co = censusOwnerOf_.find(k);
+        std::map<u32, PeerCensus>::const_iterator pc =
+            (co != censusOwnerOf_.end()) ? census_.find(co->second) : census_.end();
+        if (pc != census_.end()) {
+            const PeerCensus& src = pc->second;
+            std::map<Key, CensusPos>::const_iterator pv = src.prev.find(k);
+            if (pv != src.prev.end() && src.prevMs && src.recvMs > src.prevMs) {
+                stepX = it->second.x - pv->second.x;
+                stepZ = it->second.z - pv->second.z;
+                float dt = (float)(src.recvMs - src.prevMs) / 1000.0f;
+                // Converted OUT of world units per second and INTO the engine's
+                // speed scale: the step is real displacement and so already
+                // carries the game-speed multiplier, while walkTo commands a
+                // speed the multiplier is then applied to. Miss that and a 5x
+                // session orders five times the intended sprint.
+                float mult = (speedLastSet_ > 1.0f) ? speedLastSet_ : 1.0f;
+                hostSpd = std::sqrt(stepX * stepX + stepZ * stepZ) / dt / mult;
+            }
         }
         // Walk to where the counterpart is GOING, not where it was. A census row
         // is already up to a second old when it arrives, so a body sent to the

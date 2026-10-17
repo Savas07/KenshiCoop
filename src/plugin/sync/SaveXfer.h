@@ -80,10 +80,12 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
 // lands in under 2 s without starving the live channels, which ride the same
 // CH_RELIABLE ordered stream) and finishes with the PKT_SAVE_DONE CRC table.
 
-// Snapshot save 'name' and queue the BEGIN. Returns false when the folder is
-// missing/empty (nothing is queued). One transfer at a time; a re-begin
-// abandons the previous one (the join drops stale xferIds).
-bool beginSend(NetLink& net, u32 localId, const std::string& name);
+// Snapshot save 'name' and queue the BEGIN to the joins in targetMask (bit =
+// player id; the whole transfer goes only to them). Returns false when the
+// folder is missing/empty (nothing is queued). One transfer at a time; a
+// re-begin abandons the previous one (the join drops stale xferIds).
+bool beginSend(NetLink& net, u32 localId, const std::string& name,
+               u32 targetMask = PEER_MASK_ALL);
 bool sending();
 // Pump the active transfer (call every main-loop tick; internally throttled).
 // Logs "[save] XFER-SENT ..." and returns true on the tick the DONE goes out.

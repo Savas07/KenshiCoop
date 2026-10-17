@@ -103,7 +103,16 @@ struct SessionController {
     DWORD        gameStartTick;    // GetTickCount at the gameplay-start edge
     bool         autoLoadDone;     // title auto-load fired (settle gate)
     DWORD        titleFirstTick;   // first title tick (settle gate base)
-    bool         peerPresent;      // a peer is connected right now
+    bool         peerPresent;      // at least one peer is connected right now
+    // Connected peers: on the host every welcomed join id; on a join the host
+    // (0) plus every other join the roster announced. peerPresent == !empty().
+    std::set<coop::u32> peers;
+    // Host: joins the in-flight connect-push bake is addressed to (bit = id).
+    coop::u32    bootstrapMask;
+    // Host: joins that NACKed the pending fallback transfer (bit = id).
+    coop::u32    loadXferMask;
+    // Host: the newest LOAD_GO id sent to each join (per-join stale-NACK guard).
+    std::map<coop::u32, coop::u32> goIdFor;
     // Coordinated save (protocol 31).
     std::string  savePending;      // host: save name awaiting quiescence
     coop::u32    saveReqId;        // join: monotonic PKT_SAVE_REQ counter
@@ -137,7 +146,7 @@ struct SessionController {
 
     SessionController()
       : gameStarted(false), gameStartTick(0), autoLoadDone(false),
-        titleFirstTick(0), peerPresent(false),
+        titleFirstTick(0), peerPresent(false), bootstrapMask(0), loadXferMask(0),
         saveReqId(0), bootstrapArmed(false),
         swapStartTick(0), swapHookTicks(0),
         loadSuppressOn(false), loadIdOut(0), loadIdSeen(0), loadReqId(0),
@@ -184,6 +193,9 @@ const DWORD     SCENARIO_HOLD_MS  = 4000; // hold synced state on screen for cap
 // the stat line at gameplay start. Keep the id in sync with Sid(4) in
 // tools/MultiplayerStartGen/Program.cs.
 const char* const WPX2_MARKER_SID = "4-KenshiCoop-MultiplayerStart.mod";
+// "Multiplayer+ (Wanderer x8)" marker: its squad-2 leader template. Keep in sync
+// with Sid(22) in tools/MultiplayerStartGen/Program.cs.
+const char* const WPX8_MARKER_SID = "22-KenshiCoop-MultiplayerStart.mod";
 const float       WPX2_STAT_LEVEL = 50.0f;
 
 // Test-scene setup (host-only): one-shot world spawn the user then saves.
@@ -240,8 +252,12 @@ void warnIfNoPortraits(const std::string& name) {
 // clearing the maps - else a reconnect leaves orphaned duplicates or bakes them
 // into the next save. Falls back to a plain map reset if no world has ticked yet.
 void sessionResetForUi() {
+    g_session.peers.clear();
+    g_session.goIdFor.clear();
+    g_session.bootstrapMask = 0;
+    g_session.loadXferMask  = 0;
     g_peerPresent = false;
-    if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
+    if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw, coop::OWNER_ID_ALL);
     else          g_repl.resetSession();
     g_inbound.flushWorldState();
     g_net.bumpSessionEpoch(); // v44: fence off any in-flight prior-session batch
@@ -260,18 +276,26 @@ void sessionResetForWorldReload() {
 }
 
 // Push-save-on-connect (host): bake a fresh save of the live world and arm the
-// bootstrap so driveSaveSync announces it to the join with a LOAD_GO once the
-// folder quiesces. Called for either connect ordering: a peer connecting while
-// the host is already in-game (processNetEvents), or the host's gameplay
-// starting with a peer already connected (mainLoop_hook gameplay-start edge).
-// Host + saveSync + in-game are the caller's responsibility.
-void armConnectPush() {
+// bootstrap so driveSaveSync announces it with a LOAD_GO - addressed only to
+// the joins in targetMask - once the folder quiesces. Joins that connect while
+// a bake is already running ride the same bake. Called for either connect
+// ordering: a peer connecting while the host is already in-game
+// (processNetEvents), or the host's gameplay starting with peers already
+// connected (mainLoop_hook gameplay-start edge). Host + saveSync + in-game are
+// the caller's responsibility.
+void armConnectPush(coop::u32 targetMask) {
+    if (g_bootstrapArmed) {
+        g_session.bootstrapMask |= targetMask;
+        coopLog("[boot] join connected during a bake - joining the same push");
+        return;
+    }
     char cur[64];
     cur[0] = '\0';
     coop::engine::saveInfo(cur, sizeof(cur), 0, 0);
     std::string name = cur[0] ? cur : "coopresume";
     g_bootstrapArmed = true;
     g_bootstrapName  = name;
+    g_session.bootstrapMask = targetMask;
     char b[144];
     _snprintf(b, sizeof(b) - 1,
               "[boot] baking save '%s' to push to join on connect", name.c_str());
@@ -280,66 +304,121 @@ void armConnectPush() {
         coopErr("[boot] connect-push save FAILED to issue");
 }
 
+// Bitmask of every connected join (host side).
+coop::u32 joinMask() {
+    coop::u32 m = 0;
+    for (std::set<coop::u32>::const_iterator it = g_session.peers.begin();
+         it != g_session.peers.end(); ++it)
+        if (*it != 0) m |= coop::peerBit(*it);
+    return m;
+}
+
+// Host squad ownership: tab 0 plus every squad tab no connected join holds, so
+// with fewer players than squads the host keeps controlling the spare squads
+// (player k takes over tab k when it joins and hands it back when it leaves).
+// An explicit env rank override is left alone.
+void applyHostRanks() {
+    if (!g_cfg.isHost || g_cfg.ownRanksFromEnv) return;
+    std::set<unsigned int> ranks;
+    ranks.insert(0u);
+    for (coop::u32 k = 1; k < coop::MAX_PLAYERS; ++k)
+        if (g_session.peers.find(k) == g_session.peers.end()) ranks.insert(k);
+    if (ranks == g_cfg.ownRanks) return;
+    g_cfg.ownRanks = ranks;
+    g_repl.setOwnRanks(ranks);
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "[coop] host owns %u squad tab(s) (%u player(s) connected)",
+              (unsigned)ranks.size(), (unsigned)g_session.peers.size());
+    b[sizeof(b) - 1] = '\0';
+    coopLog(b);
+}
+
 // Drain peer connect/leave events and surface a single game-thread confirmation
 // per event. The net thread already logs the handshake; this proves the event
 // reached the game thread cleanly (and is where later stages spawn/sweep).
+// Host: one edge per join. Join: id 0 = our link to the host; any other id is
+// another join the host's roster announced; OWNER_ID_ALL = the host is gone.
 void processNetEvents(GameWorld* gw) {
     std::deque<coop::u32> conns, leaves;
     g_inbound.drainConnects(conns);
     g_inbound.drainLeaves(leaves);
     for (std::deque<coop::u32>::iterator it = conns.begin(); it != conns.end(); ++it) {
+        const coop::u32 id = *it;
         char b[96];
         _snprintf(b, sizeof(b) - 1, "handshake: peer present id=%u (local id=%u)",
-                  (unsigned)*it, (unsigned)g_net.localId());
+                  (unsigned)id, (unsigned)g_net.localId());
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
+        const bool hostLink = !g_cfg.isHost && id == 0;
+        g_session.peers.insert(id);
+        g_peerPresent = true;
+        // The join learns its player id from WELCOME: own exactly that squad tab.
+        if (hostLink) {
+            coop::resolveOwnRanksForPlayer(g_cfg.ownRanks, g_net.localId(), g_cfg.ownRanksFromEnv);
+            g_repl.setOwnRanks(g_cfg.ownRanks);
+            char r[80];
+            _snprintf(r, sizeof(r) - 1, "[coop] player id=%u owns squad tab %u",
+                      (unsigned)g_net.localId(), (unsigned)g_net.localId());
+            r[sizeof(r) - 1] = '\0';
+            coopLog(r);
+        }
         // Connect-edge resync (protocol 30): re-announce placed buildings and
         // force an immediate resend pass across all change-gated channels, so
         // a late joiner / reconnector converges now instead of waiting out
         // per-channel safety resends (or never minting a pre-connect build).
+        // Runs for every arrival, including another join announced by the
+        // roster: our re-announcement reaches it through the host's relay.
         if (g_cfg.latejoinSync) g_repl.onPeerConnected(g_net, g_net.localId());
         else coopLog("[latejoin] connect edge seen, resync OFF (gate)");
-        g_peerPresent = true;
         // Coordinated save (protocol 31): while connected under save-sync,
         // the JOIN never writes a save locally - the host's save is
         // authoritative and a local save press forwards as PKT_SAVE_REQ.
-        if (!g_cfg.isHost && g_cfg.saveSync) {
+        if (hostLink && g_cfg.saveSync) {
             coop::engine::setSaveSuppress(true);
             coopLog("[save] JOIN save suppression ON (host save is authoritative)");
         }
         // Push-save-on-connect (host): if already in a game, bake+announce the
-        // live world so the join can enter it with no pre-shared save. If the
+        // live world to the NEW join so it can enter with no pre-shared save
+        // (joins already playing are not sent back through a load). If the
         // host is NOT yet in-game (title/loading), the gameplay-start edge in
         // mainLoop_hook arms this instead - covers either connect ordering.
         if (g_cfg.isHost && g_cfg.saveSync && g_gameStarted)
-            armConnectPush();
+            armConnectPush(coop::peerBit(id));
     }
     for (std::deque<coop::u32>::iterator it = leaves.begin(); it != leaves.end(); ++it) {
+        const coop::u32 id = *it;
         char b[64];
-        _snprintf(b, sizeof(b) - 1, "handshake: peer left id=%u", (unsigned)*it);
+        _snprintf(b, sizeof(b) - 1, "handshake: peer left id=%u", (unsigned)id);
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
         // Carried-body sync (protocol 18) + furniture occupancy (protocol 19):
         // the departed peer's stream will never author its drop/exit edges -
         // release any carry or occupancy its driven copies still hold.
-        if (gw && (g_cfg.carrySync || g_cfg.furnSync)) g_repl.sweepCarries(gw);
-        g_peerPresent = false;
-        // Coordinated save: disconnected = solo again; local saves must work.
-        if (!g_cfg.isHost && g_cfg.saveSync) {
+        if (gw && (g_cfg.carrySync || g_cfg.furnSync)) g_repl.sweepCarries(gw, id);
+        // Phase 2 crash hardening: a peer drop leaves this side's minted
+        // proxies standing AND its drive maps pointing at bodies with no fresh
+        // authority (the "join crash -> host follow-on crash" chain). Despawn
+        // the leaver's proxies and clear its maps - everyone's when the host
+        // itself is gone - while the remaining players keep streaming.
+        g_repl.clearPeerReplicationState(gw, id);
+        if (id == coop::OWNER_ID_ALL) {
+            g_session.peers.clear();
+            g_inbound.flushWorldState();
+        } else {
+            g_session.peers.erase(id);
+            g_inbound.purgeOwner(id);
+            g_session.goIdFor.erase(id);
+            g_session.bootstrapMask &= ~coop::peerBit(id);
+            g_session.loadXferMask  &= ~coop::peerBit(id);
+        }
+        // Coordinated save: lost the host = solo again; local saves must work.
+        if (!g_cfg.isHost && g_cfg.saveSync && id == coop::OWNER_ID_ALL) {
             coop::engine::setSaveSuppress(false);
             coopLog("[save] JOIN save suppression OFF (peer left)");
         }
     }
-    // Phase 2 crash hardening: a peer drop leaves this side's minted proxies
-    // standing AND its drive maps pointing at bodies with no fresh authority
-    // (the engine will eventually reap them, and the next drive touches a freed
-    // pointer - the "join crash -> host follow-on crash" chain). Despawn the
-    // minted proxies and clear the peer maps, mirroring coopUiDisconnect(). Runs
-    // once per leave batch (we support a single peer).
-    if (!leaves.empty()) {
-        g_repl.clearPeerReplicationState(gw);
-        g_inbound.flushWorldState();
-    }
+    g_peerPresent = !g_session.peers.empty();
+    applyHostRanks();
 }
 
 // SaveLoadCoordinator receive primitive (protocol 31): the join-side save-
@@ -467,7 +546,10 @@ void driveSaveSync() {
                     go.loadId      = ++g_loadIdOut;
                     go.fingerprint = coop::savexfer::folderFingerprint(g_bootstrapName);
                     strncpy(go.name, g_bootstrapName.c_str(), sizeof(go.name) - 1);
-                    g_net.queueLoadGo(go);
+                    g_net.queueLoadGo(go, g_session.bootstrapMask);
+                    for (coop::u32 k = 1; k < coop::MAX_PLAYERS; ++k)
+                        if (g_session.bootstrapMask & coop::peerBit(k)) g_session.goIdFor[k] = go.loadId;
+                    g_session.bootstrapMask = 0;
                     g_loadPumpArmTick = GetTickCount();
                     char b2[192];
                     _snprintf(b2, sizeof(b2) - 1,
@@ -479,7 +561,7 @@ void driveSaveSync() {
                     g_bootstrapName.clear();
                     g_savePending.clear();
                 } else if (g_peerPresent)
-                    coop::savexfer::beginSend(g_net, g_net.localId(), g_savePending);
+                    coop::savexfer::beginSend(g_net, g_net.localId(), g_savePending, joinMask());
                 else
                     coopLog("[save] no peer connected; transfer skipped");
             }
@@ -544,7 +626,10 @@ void driveLoadSync(GameWorld* gw) {
             go.loadId      = ++g_loadIdOut;
             go.fingerprint = coop::savexfer::folderFingerprint(name);
             strncpy(go.name, name.c_str(), sizeof(go.name) - 1);
-            g_net.queueLoadGo(go);
+            g_net.queueLoadGo(go, joinMask());
+            for (std::set<coop::u32>::const_iterator pit = g_session.peers.begin();
+                 pit != g_session.peers.end(); ++pit)
+                g_session.goIdFor[*pit] = go.loadId;
             g_loadPumpArmTick = GetTickCount();
             char b[160];
             _snprintf(b, sizeof(b) - 1,
@@ -610,10 +695,13 @@ void driveLoadSync(GameWorld* gw) {
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
             char b[176];
-            if (it->pkt.loadId != g_loadIdOut) {
+            std::map<coop::u32, coop::u32>::const_iterator sent =
+                g_session.goIdFor.find(it->pkt.ownerId);
+            const coop::u32 expect = (sent != g_session.goIdFor.end()) ? sent->second : g_loadIdOut;
+            if (it->pkt.loadId != expect) {
                 _snprintf(b, sizeof(b) - 1,
                           "[load] stale NACK id=%u (current %u) ignored",
-                          it->pkt.loadId, g_loadIdOut);
+                          it->pkt.loadId, expect);
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
                 continue;
             }
@@ -622,6 +710,7 @@ void driveLoadSync(GameWorld* gw) {
                       it->pkt.loadId, name, it->pkt.fingerprint);
             b[sizeof(b) - 1] = '\0'; coopLog(b);
             g_loadXferPending = name;
+            g_session.loadXferMask |= coop::peerBit(it->pkt.ownerId);
         }
         if (!g_loadXferPending.empty() && coop::engine::gameplayLive(gw) &&
             !coop::savexfer::sending()) {
@@ -630,8 +719,10 @@ void driveLoadSync(GameWorld* gw) {
                       "[load] starting fallback transfer name='%s'",
                       g_loadXferPending.c_str());
             b[sizeof(b) - 1] = '\0'; coopLog(b);
-            coop::savexfer::beginSend(g_net, g_net.localId(), g_loadXferPending);
+            coop::savexfer::beginSend(g_net, g_net.localId(), g_loadXferPending,
+                                      g_session.loadXferMask ? g_session.loadXferMask : joinMask());
             g_loadXferPending.clear();
+            g_session.loadXferMask = 0;
         }
         // The chunk pump normally lives in driveSaveSync; keep the fallback
         // transfer moving even when saveSync is gated off.
@@ -740,11 +831,22 @@ void driveLoadSync(GameWorld* gw) {
 // oracles. Both calls are SEH-guarded internally and touch only GUI + input, so
 // they are safe wherever the GUI stack is up - neither needs a world, which is
 // why this takes no GameWorld*. Driven from BOTH the in-game mainLoop_hook and
-// the title-screen titleUpdate_hook so a join can go ONLINE (and copy/paste
-// Steam IDs) straight from the main menu, and so the banner reports status there
-// too.
+// the title-screen titleUpdate_hook so a join can join a friend (or accept a
+// Steam invite) straight from the main menu, and so the banner reports status
+// there too.
 void coopPanelDrive() {
     if (!(g_cfg.scenario.empty() && g_cfg.testSeconds == 0)) return;
+
+    // Pump Steam callbacks (invites, lobby joins, P2P session requests) and keep
+    // the friend list fresh only while the panel is open to show it.
+    coop::steaminvite::watchFriends(coop::engine::coopPanelIsOpen());
+    coop::steaminvite::tick();
+    // Friends waiting in the host's lobby are let in only once the host's world
+    // is live - never at the menu or during character creation.
+    coop::steaminvite::setHostReady(g_gameStarted && g_lastGw &&
+                                    coop::engine::gameplayLive(g_lastGw));
+    const bool lobbyHosting = coop::steaminvite::hostingLobby();
+
     coop::engine::CoopPanelState ps;
     ps.selfSteamId  = (unsigned long long)coop::steamp2p::selfId();
     ps.peerSteamId  = g_cfg.steamPeer;
@@ -752,16 +854,28 @@ void coopPanelDrive() {
     ps.peerPresent  = g_peerPresent;
     ps.isHost       = g_cfg.isHost;
     ps.transportSel = (g_cfg.transport == "steam") ? 0 : 1;
+    ps.inWorld      = g_gameStarted;
+    ps.playerCount  = (int)g_session.peers.size() + 1;
+    ps.steamInvites = coop::steaminvite::ready();
+    ps.lobbyHosting = lobbyHosting;
+    ps.inviteStatus = coop::steaminvite::status();
     std::string detail;
     int ostate;
     if (g_peerPresent) {
-        detail = g_cfg.isHost ? "Connected - peer joined" : "Connected to host";
+        char pb[64];
+        _snprintf(pb, sizeof(pb) - 1, "%s - %d players",
+                  g_cfg.isHost ? "Connected - hosting" : "Connected to host", ps.playerCount);
+        pb[sizeof(pb) - 1] = '\0';
+        detail = pb;
         ostate = 2;
     } else if (g_net.isRunning()) {
         detail = g_cfg.isHost ? "Hosting - waiting for peer..." : "Connecting...";
         ostate = 1;
+    } else if (lobbyHosting) {
+        detail = "Open to friends - press F2 to invite one";
+        ostate = 1;
     } else {
-        detail = "Offline - press F2, then set Connection to ONLINE";
+        detail = "Offline - press F2 to host or join a friend";
         ostate = 0;
     }
     ps.detail = detail.c_str();
@@ -791,12 +905,30 @@ void coopPanelDrive() {
     }
     ps.transferDetail = transfer.empty() ? (const char*)0 : transfer.c_str();
 
-    // Still pump Steam callbacks so an inbound "Join Game" (a friend inviting
-    // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
-    coop::steaminvite::tick();
+    // Online friends for the Invite / Join lists (names point into the invite
+    // layer's cache, valid until its next refresh - i.e. for this tick).
+    static std::vector<coop::engine::CoopPanelFriend> s_friends;
+    s_friends.clear();
+    for (int i = 0; i < coop::steaminvite::friendCount(); ++i) {
+        coop::engine::CoopPanelFriend f;
+        f.id      = coop::steaminvite::friendId(i);
+        f.name    = coop::steaminvite::friendName(i);
+        f.state   = coop::steaminvite::friendState(i);
+        f.version = coop::steaminvite::friendVersion(i);
+        s_friends.push_back(f);
+    }
+    ps.friends     = s_friends.empty() ? 0 : &s_friends[0];
+    ps.friendCount = (int)s_friends.size();
 
-    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
-    coop::engine::coopOverlayTick(detail.c_str(), ostate, g_net.isRunning());
+    coop::engine::CoopPanelActions act;
+    act.connect    = &coopUiConnect;
+    act.disconnect = &coopUiDisconnect;
+    act.host       = &coop::steaminvite::hostLobby;
+    act.invite     = &coop::steaminvite::inviteFriend;
+    act.join       = &coop::steaminvite::joinFriend;
+
+    coop::engine::coopPanelTick(&ps, &act);
+    coop::engine::coopOverlayTick(detail.c_str(), ostate, g_net.isRunning() || lobbyHosting);
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.
@@ -1542,12 +1674,16 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         // the owner-authoritative stats channel (protocol 17). Solo at gameplay
         // start the write is purely local, and the join receives it as part of the
         // host's world through the connect-push below.
-        if (!g_peerPresent &&
-            coop::engine::playerSquadHasTemplate(gw, WPX2_MARKER_SID)) {
+        bool wpx2 = !g_peerPresent &&
+                    coop::engine::playerSquadHasTemplate(gw, WPX2_MARKER_SID);
+        bool wpx8 = !g_peerPresent && !wpx2 &&
+                    coop::engine::playerSquadHasTemplate(gw, WPX8_MARKER_SID);
+        if (wpx2 || wpx8) {
             unsigned int nb = coop::engine::buffAllPlayerStats(gw, WPX2_STAT_LEVEL);
             char b[128];
             _snprintf(b, sizeof(b) - 1,
-                      "[start] Multiplayer+ (Wanderer x2): raised %u PC(s) to %d in every stat",
+                      wpx2 ? "[start] Multiplayer+ (Wanderer x2): raised %u PC(s) to %d in every stat"
+                           : "[start] Multiplayer+ (Wanderer x8): raised %u PC(s) to %d in every stat",
                       nb, (int)WPX2_STAT_LEVEL);
             b[sizeof(b) - 1] = '\0'; coopLog(b);
         }
@@ -1556,7 +1692,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         // world yet). Now that gameplay is live, arm the connect-push so the
         // waiting join gets pulled into this world.
         if (g_cfg.isHost && g_cfg.saveSync && g_peerPresent)
-            armConnectPush();
+            armConnectPush(joinMask());
     }
 
     // Manual-validation helper (host only): KENSHICOOP_AUTORECRUIT=N seconds -
@@ -1802,6 +1938,16 @@ void startNetworking() {
         }
     }
 
+    // Player identity for the host's id reservation (reconnect = same squad
+    // tab). Steam's id when Steam is up, else none (lowest free id).
+    {
+        unsigned long long self = (unsigned long long)coop::steamp2p::selfId();
+        char idb[24] = "";
+        if (self != 0) { _snprintf(idb, sizeof(idb) - 1, "%llu", self); idb[sizeof(idb) - 1] = '\0'; }
+        g_net.setIdentity(idb);
+    }
+    g_repl.setHostRole(g_cfg.isHost);
+
     bool ok;
     if (g_cfg.isHost) {
         coopLog("KenshiCoop: starting as HOST");
@@ -1844,6 +1990,8 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     // squad, so that unit never moves on the client (unowned NPCs still sync).
     coop::resolveOwnRanks(g_cfg.ownRanks, isHost, g_cfg.ownRanksFromEnv);
     g_repl.setOwnRanks(g_cfg.ownRanks);
+    g_repl.setHostRole(isHost);
+    applyHostRanks();
 
     std::string ranks;
     for (std::set<unsigned int>::const_iterator it = g_cfg.ownRanks.begin();
@@ -1871,6 +2019,7 @@ void coopUiDisconnect() {
     // World stays live on a manual disconnect: despawn minted proxies before
     // clearing maps so nothing lingers as a duplicate or gets baked into a save.
     sessionResetForUi();
+    applyHostRanks(); // solo again: the host controls every squad
 }
 
 } // namespace
@@ -1945,6 +2094,8 @@ void configureReplicator() {
     // the shared squad chosen by save-stable hand-rank; it drives the peer's owned
     // members from their stream. Default leader-first: host {0}, join {1}.
     g_repl.setOwnRanks(g_cfg.ownRanks);
+    g_repl.setHostRole(g_cfg.isHost);
+    applyHostRanks();
     {
         std::string ranks;
         for (std::set<unsigned int>::const_iterator it = g_cfg.ownRanks.begin();
@@ -2386,7 +2537,7 @@ __declspec(dllexport) void startPlugin() {
     if (autoStart) {
         startNetworking();
     } else {
-        coopLog("KenshiCoop: session DEFERRED - press F2 in-game to pick role/transport, "
-                "enter the friend's Steam ID, and check CONNECTED");
+        coopLog("KenshiCoop: session DEFERRED - press F2 to host (Steam invite) or join a "
+                "hosting friend; Advanced keeps manual Steam ID / LAN");
     }
 }

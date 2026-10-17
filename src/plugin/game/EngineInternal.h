@@ -630,8 +630,11 @@ void logSeatResolveOnce(const char* side, int task, u32 npcIdx, u32 npcSer,
 bool isPlayerSquad(GameWorld* gw, RootObject* obj);
 // Live NON-player Faction* read off a nearby world NPC. Caller holds SEH.
 Faction* findNearbyNonPlayerFaction(GameWorld* gw);
-// Dual-interest centers (one per squad tab leader, up to two). Caller holds SEH.
-unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]);
+// Interest centers: one per squad-tab leader (up to MAX_PLAYERS) followed by
+// the camera anchors; outC must hold MAX_INTEREST_ANCHORS. nLeaders (optional)
+// receives the leader count. Caller holds SEH.
+unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[MAX_INTEREST_ANCHORS],
+                             unsigned int* nLeaders = 0);
 // Case-insensitive substring test on raw C strings (SEH legal).
 bool ciContains(const char* hay, const char* needle);
 // Template scans (reused g_dataScratch; main thread only).

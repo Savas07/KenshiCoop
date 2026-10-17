@@ -22,6 +22,8 @@
 #include <kenshi/gui/DataPanelLine.h>
 #include <mygui/MyGUI_Delegate.h> // MyGUI::newDelegate + CDelegate* (free-fn callbacks)
 #include <windows.h>
+#include <deque>
+#include <vector>
 
 #include "../core/SteamId.h" // parseSteamId64 (paste button) + maskSteamId64 (id rows)
 
@@ -150,23 +152,29 @@ void markerDestroy(void* label) {
     markerDestroySeh(g, (ScreenLabel*)label);
 }
 
-// ---- In-game co-op session panel (config-driven, spike-50 DatapanelGUI stack) -
-// A native DatapanelGUI window toggled with F2. The player picks role + transport
-// (toggle BUTTONS - the only DatapanelGUI control with a callable RVA callback;
+// ---- In-game co-op session panel (spike-50 DatapanelGUI stack) ---------------
+// A native DatapanelGUI window toggled with F2, built only from BUTTON and text
+// rows (buttons are the only DatapanelGUI control with a callable RVA callback;
 // MyGUI comboboxes/editboxes have no reachable getters and never receive keyboard
-// focus during gameplay) and connects/leaves via a bound checkbox. The friend code
-// (peer SteamID) + UDP endpoint come from coop_config.json and are shown READ-ONLY;
-// a "Copy my Steam ID" button puts the player's own id on the clipboard to share.
-// The GUI layer is session-agnostic: live status arrives via *st; the user's
-// actions leave via the onConnect/onDisconnect callbacks (the plugin root owns the
-// net/session/config wiring).
+// focus during gameplay). The simple view hosts / invites / joins through the
+// Steam lobby layer with no IDs; the advanced view keeps the manual Role /
+// Transport / Online toggles and the clipboard Steam-ID exchange. The GUI layer is
+// session-agnostic: live status arrives via *st; the user's actions leave via
+// *act (the plugin root owns the net/session/config/Steam wiring).
+//
+// Button callbacks run inside MyGUI's input dispatch, so they never act directly:
+// they queue a PanelAction that the next coopPanelTick executes. That keeps a
+// rebuild (which clears every row) from destroying the very button whose callback
+// is still on the stack.
 //
 // SEH discipline (spike 47/48): the mutation calls take std::string by const-ref
 // or PODs, so they all sit inside one __try, provided NO std::string temporary is
-// constructed in that frame. The one exception is createDatapanel's BY-VALUE
-// std::string 'layer' arg (an unwindable temporary => C2712), so the window is
-// created in the outer, non-SEH function; ::gui is verified non-null first and the
-// createScreenLabel/createFloatingLabel factory family is render-proven (46-48).
+// constructed in that frame. The rows are therefore described by a POD RowSpec
+// array whose strings are owned by the outer frame. The one exception is
+// createDatapanel's BY-VALUE std::string 'layer' arg (an unwindable temporary =>
+// C2712), so the window is created in the outer, non-SEH function; ::gui is
+// verified non-null first and the createScreenLabel/createFloatingLabel factory
+// family is render-proven (46-48).
 
 namespace {
 
@@ -233,30 +241,24 @@ bool clipboardGetText(std::string& out) {
 struct CoopPanelUi {
     DatapanelGUI* panel;
     bool          open, built;
-    bool          hostFlag;      // true = HOST role armed
-    bool          steamFlag;     // true = Steam transport armed (else UDP)
+    bool          advanced;      // advanced (manual Steam ID / LAN) view shown
+    bool          hostFlag;      // advanced: true = HOST role armed
+    bool          steamFlag;     // advanced: true = Steam transport armed (else UDP)
     bool          connectedFlag; // desired connection state (Online/Offline toggle)
     bool          lastConnected; // last observed st->running (external-change sync)
     bool          lastChkVal;    // last toggle value (connect/disconnect edge)
     bool          needsRebuild;
     bool          f2Down;        // F2 held last tick (rising-edge toggle)
-    std::string   lastStatus;    // last status text shown (refresh gate)
-    std::string   lastTransfer;  // last save-transfer line shown (refresh gate)
+    int           page;          // simple view: friend-list page
+    unsigned int  lastHash;      // fingerprint of everything the rows show (refresh gate)
     CoopPanelUi()
-        : panel(0), open(false), built(false), hostFlag(true), steamFlag(true),
-          connectedFlag(false), lastConnected(false), lastChkVal(false),
-          needsRebuild(false), f2Down(false) {}
+        : panel(0), open(false), built(false), advanced(false), hostFlag(true),
+          steamFlag(true), connectedFlag(false), lastConnected(false),
+          lastChkVal(false), needsRebuild(false), f2Down(false), page(0),
+          lastHash(0) {}
 };
 
 CoopPanelUi             g_panel;
-DataPanelLine_Button*   g_roleBtn      = 0;
-DataPanelLine_Button*   g_transBtn     = 0;
-DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
-DataPanelLine_Button*   g_copyIdBtn    = 0;
-DataPanelLine_Button*   g_pasteIdBtn   = 0; // "Paste friend's Steam ID" from clipboard
-DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
-DataPanelLine*          g_peerLine     = 0; // white "Friend's Steam ID" row
-DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
 std::string             g_selfIdStr;   // self SteamID as digits (set each tick; "" = none)
 
 // Friend's SteamID pasted in-panel this session (0 = none). Per-session by
@@ -266,9 +268,37 @@ std::string             g_selfIdStr;   // self SteamID as digits (set each tick;
 unsigned long long      g_pastedPeer   = 0;
 bool                    g_pasteFailed  = false; // last paste wasn't a valid Steam ID
 
-// Button callbacks (free functions - MyGUI::newDelegate wraps them without any
-// raw-MyGUI link). A press flips the armed flag and requests a rebuild so the
-// caption reflects the new choice on the next tick.
+// Simple-view button actions, queued by onActionBtn and run by coopPanelTick.
+enum PanelAction {
+    PA_NONE, PA_HOST, PA_INVITE, PA_JOIN, PA_LEAVE, PA_STOP_HOST,
+    PA_MORE, PA_ADVANCED, PA_SIMPLE
+};
+
+// Friend rows shown per page in the simple view (keeps the window a fixed size).
+const int FRIENDS_PER_PAGE = 6;
+
+// The live action buttons of the current build: the callback gets only the
+// DataPanelLine*, so it maps the pressed line back to its action + friend here.
+struct ButtonRow { DataPanelLine* line; int action; unsigned long long friendId; };
+const int          MAX_BUTTON_ROWS = 32;
+ButtonRow          g_btnRows[MAX_BUTTON_ROWS];
+int                g_btnRowN = 0;
+int                g_pendingAction = PA_NONE;
+unsigned long long g_pendingFriend = 0;
+
+void onActionBtn(DataPanelLine* line) {
+    for (int i = 0; i < g_btnRowN; ++i) {
+        if (g_btnRows[i].line == line) {
+            g_pendingAction = g_btnRows[i].action;
+            g_pendingFriend = g_btnRows[i].friendId;
+            return;
+        }
+    }
+}
+
+// Advanced-view button callbacks (free functions - MyGUI::newDelegate wraps them
+// without any raw-MyGUI link). A press flips the armed flag and requests a
+// rebuild so the caption reflects the new choice on the next tick.
 void onRoleBtn(DataPanelLine*) {
     g_panel.hostFlag = !g_panel.hostFlag;
     g_panel.needsRebuild = true;
@@ -280,7 +310,7 @@ void onTransBtn(DataPanelLine*) {
     coop::logLine(g_panel.steamFlag ? "[coop-ui] transport -> Steam" : "[coop-ui] transport -> UDP");
 }
 // Online/Offline toggle: flip the desired connection state. The connect/disconnect
-// edge (connectedFlag vs lastChkVal) is handled in coopPanelTick, same as before.
+// edge (connectedFlag vs lastChkVal) is handled in coopPanelTick.
 void onConnBtn(DataPanelLine*) {
     g_panel.connectedFlag = !g_panel.connectedFlag;
     g_panel.needsRebuild = true;
@@ -322,33 +352,65 @@ void onPasteIdBtn(DataPanelLine*) {
     g_panel.needsRebuild = true;
 }
 
-// POD-only pointer bundle so the row-build SEH frame constructs no std::string.
-struct PanelStrings {
-    const std::string *title, *roleKey, *roleCap, *transKey, *transCap;
-    const std::string *connKey, *connCap;
-    const std::string *dbgKey, *dbgVal;
-    const std::string *peerKey, *peerVal, *pasteKey, *pasteCap;
-    const std::string *selfKey, *selfVal, *copyKey, *copyCap;
-    const std::string *empty;
+// One panel row. POD so the build SEH frame holds no unwindable object; the
+// strings are owned by the outer frame's RowList.
+enum RowKind { ROW_BUTTON, ROW_LINE, ROW_SPACE };
+struct RowSpec {
+    int                kind;
+    const std::string* key;      // unique per panel (DatapanelGUI keys rows by it)
+    const std::string* val;      // button caption / line value
+    void             (*cb)(DataPanelLine*); // buttons only
+    int                action;   // onActionBtn rows: PanelAction
+    unsigned long long friendId; // PA_INVITE / PA_JOIN rows
+    bool               amber;    // lines only: tint the value amber (in progress)
+    DataPanelLine*     line;     // out: the created row
 };
 
-void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
+// Row storage for one build (outer frame). std::deque keeps string addresses
+// stable while rows are appended.
+struct RowList {
+    std::deque<std::string> strs;
+    std::vector<RowSpec>    rows;
+    const std::string* keep(const std::string& s) { strs.push_back(s); return &strs.back(); }
+    void add(int kind, const std::string& key, const std::string& val,
+             void (*cb)(DataPanelLine*), int action, unsigned long long fid, bool amber) {
+        RowSpec r;
+        r.kind = kind; r.key = keep(key); r.val = keep(val); r.cb = cb;
+        r.action = action; r.friendId = fid; r.amber = amber; r.line = 0;
+        rows.push_back(r);
+    }
+    void button(const std::string& key, const std::string& cap, void (*cb)(DataPanelLine*)) {
+        add(ROW_BUTTON, key, cap, cb, PA_NONE, 0, false);
+    }
+    void action(const std::string& key, const std::string& cap, int act, unsigned long long fid) {
+        add(ROW_BUTTON, key, cap, &onActionBtn, act, fid, false);
+    }
+    void line(const std::string& key, const std::string& val, bool amber) {
+        add(ROW_LINE, key, val, 0, PA_NONE, 0, amber);
+    }
+    void space() { add(ROW_SPACE, std::string(), std::string(), 0, PA_NONE, 0, false); }
+};
+
+struct PanelBuild {
+    const std::string* title;
+    const std::string* empty;
+    RowSpec*           rows;
+    int                count;
+};
+
+void panelBuildSeh(DatapanelGUI* p, PanelBuild* b) {
     __try {
         p->_NV_clear();
-        p->setCaption(*s->title);
-        g_roleBtn  = p->setLineButton(*s->roleKey,  *s->roleCap,  0);
-        g_transBtn = p->setLineButton(*s->transKey, *s->transCap, 0);
-        g_connBtn  = p->setLineButton(*s->connKey,  *s->connCap,  0);
-        p->addSpace(0, 0.35f);
-        // Connection-status debug line (coloured white below, outside SEH).
-        g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
-        p->addSpace(0, 0.35f);
-        // Friend's SteamID: pasted in-panel (Copy on their side -> Paste here).
-        g_peerLine = p->setLine(*s->peerKey, *s->peerVal, *s->empty, 0, false, true);
-        g_pasteIdBtn = p->setLineButton(*s->pasteKey, *s->pasteCap, 0);
-        p->addSpace(0, 0.35f);
-        g_selfLine = p->setLine(*s->selfKey, *s->selfVal, *s->empty, 0, false, true);
-        g_copyIdBtn = p->setLineButton(*s->copyKey, *s->copyCap, 0);
+        p->setCaption(*b->title);
+        for (int i = 0; i < b->count; ++i) {
+            RowSpec& r = b->rows[i];
+            if (r.kind == ROW_BUTTON)
+                r.line = p->setLineButton(*r.key, *r.val, 0);
+            else if (r.kind == ROW_LINE)
+                r.line = p->setLine(*r.key, *r.val, *b->empty, 0, false, true);
+            else
+                p->addSpace(0, 0.35f);
+        }
         p->_NV_update();
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -391,11 +453,289 @@ void panelDestroySeh(ForgottenGUI* g, DatapanelGUI* p) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// ---- Panel content ----------------------------------------------------------
+
+// FNV-1a over everything the rows display: the rows are rebuilt only when this
+// fingerprint moves, so an open panel costs no allocation on a quiet frame.
+unsigned int fnv(unsigned int h, const void* p, size_t n) {
+    const unsigned char* b = (const unsigned char*)p;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 16777619u; }
+    return h;
+}
+unsigned int fnvStr(unsigned int h, const char* s) {
+    if (!s) s = "";
+    return fnv(h, s, strlen(s) + 1); // include the terminator as a separator
+}
+
+unsigned int panelHash(const CoopPanelState* st) {
+    unsigned int h = 2166136261u;
+    bool flags[11] = { g_panel.advanced, g_panel.hostFlag, g_panel.steamFlag,
+                       g_panel.connectedFlag, g_pasteFailed, st->running,
+                       st->peerPresent, st->isHost, st->inWorld, st->steamInvites,
+                       st->lobbyHosting };
+    h = fnv(h, flags, sizeof(flags));
+    h = fnv(h, &g_panel.page, sizeof(g_panel.page));
+    h = fnv(h, &st->transportSel, sizeof(st->transportSel));
+    h = fnv(h, &st->playerCount, sizeof(st->playerCount));
+    h = fnv(h, &g_pastedPeer, sizeof(g_pastedPeer));
+    h = fnv(h, &st->selfSteamId, sizeof(st->selfSteamId));
+    h = fnv(h, &st->peerSteamId, sizeof(st->peerSteamId));
+    h = fnvStr(h, st->detail);
+    h = fnvStr(h, st->transferDetail);
+    h = fnvStr(h, st->inviteStatus);
+    for (int i = 0; i < st->friendCount; ++i) {
+        const CoopPanelFriend& f = st->friends[i];
+        h = fnv(h, &f.id, sizeof(f.id));
+        h = fnv(h, &f.state, sizeof(f.state));
+        h = fnv(h, &f.version, sizeof(f.version));
+        h = fnvStr(h, f.name);
+    }
+    return h;
+}
+
+// Which friend list the simple view shows: 0 none, 1 Invite (hosting, waiting
+// for friends, including while a session runs - more can still join), 2 Join
+// (idle). The advanced view and a join's live session show none.
+int listMode(const CoopPanelState* st) {
+    if (g_panel.advanced || !st->steamInvites) return 0;
+    if (st->lobbyHosting) return 1;
+    return st->running ? 0 : 2;
+}
+
+// Friends relevant to a list: everyone online for Invite, only hosts for Join.
+bool friendListed(const CoopPanelFriend& f, int mode) {
+    return mode == 1 || (mode == 2 && f.state == 3);
+}
+int listedCount(const CoopPanelState* st, int mode) {
+    int n = 0;
+    for (int i = 0; i < st->friendCount; ++i) if (friendListed(st->friends[i], mode)) ++n;
+    return n;
+}
+
+// Persona name as a caption: '#' starts a MyGUI colour tag, so it is doubled
+// (MyGUI's literal-'#' escape); long names are cut on a UTF-8 boundary.
+std::string displayName(const char* n) {
+    const size_t MAX_BYTES = 24;
+    size_t len = n ? strlen(n) : 0;
+    size_t cut = len;
+    if (len > MAX_BYTES) {
+        cut = MAX_BYTES;
+        while (cut > 0 && ((unsigned char)n[cut] & 0xC0) == 0x80) --cut;
+    }
+    std::string out;
+    for (size_t i = 0; i < cut; ++i) {
+        if (n[i] == '#') out += "##";
+        else out += n[i];
+    }
+    if (cut < len) out += "...";
+    if (out.empty()) out = "(unnamed)";
+    return out;
+}
+
+const char* stateLabel(int state) {
+    return state == 3 ? "hosting" : (state == 2 ? "in Kenshi" : "online");
+}
+
+// One page of Invite / Join buttons (+ a page cycler when they don't fit).
+void addFriendPage(RowList& rl, const CoopPanelState* st, int mode) {
+    int shown = 0, seen = 0;
+    const int first = g_panel.page * FRIENDS_PER_PAGE;
+    for (int i = 0; i < st->friendCount && shown < FRIENDS_PER_PAGE; ++i) {
+        const CoopPanelFriend& f = st->friends[i];
+        if (!friendListed(f, mode)) continue;
+        if (seen++ < first) continue;
+        char key[16];
+        _snprintf(key, sizeof(key) - 1, "friend%d", shown);
+        key[sizeof(key) - 1] = '\0';
+        std::string cap;
+        if (mode == 1) {
+            cap = std::string("Invite   ") + displayName(f.name) + "   (" + stateLabel(f.state) + ")";
+            rl.action(key, cap, PA_INVITE, f.id);
+        } else {
+            cap = std::string("Join   ") + displayName(f.name);
+            if (f.version < 0) cap += "   - different mod version";
+            rl.action(key, cap, PA_JOIN, f.id);
+        }
+        ++shown;
+    }
+    int total = listedCount(st, mode);
+    int pages = (total + FRIENDS_PER_PAGE - 1) / FRIENDS_PER_PAGE;
+    if (pages > 1) {
+        char cap[64];
+        _snprintf(cap, sizeof(cap) - 1, "More friends   (page %d of %d)", g_panel.page + 1, pages);
+        cap[sizeof(cap) - 1] = '\0';
+        rl.action("more", cap, PA_MORE, 0);
+    }
+}
+
+// Simple view: one status line, then Leave (live session) / Invite list + Stop
+// hosting (lobby open) / Host + Join list (idle), then the Advanced switch.
+// Text rows show only their value column, so each carries its own label.
+void buildSimpleRows(const CoopPanelState* st, RowList& rl, const std::string& transfer) {
+    std::string text;
+    bool amber = false;
+    if (!transfer.empty()) {
+        text = "World transfer:  " + transfer; amber = true;
+    } else if (st->running) {
+        char pc[96];
+        if (st->peerPresent)
+            _snprintf(pc, sizeof(pc) - 1, st->isHost ? "Status:  hosting - %d players in the game"
+                                                     : "Status:  connected - %d players in the game",
+                      st->playerCount);
+        else
+            _snprintf(pc, sizeof(pc) - 1, "%s", st->isHost ? "Status:  hosting - waiting for friends..."
+                                                           : "Status:  connecting to your friend...");
+        pc[sizeof(pc) - 1] = '\0';
+        text = pc;
+        amber = !st->peerPresent;
+    } else if (st->inviteStatus && st->inviteStatus[0]) {
+        text = std::string("Status:  ") + st->inviteStatus; amber = true;
+    } else if (st->lobbyHosting) {
+        text = "Status:  open to friends"; amber = true;
+    } else {
+        text = "Status:  not connected";
+    }
+    rl.line("status", text, amber);
+    rl.space();
+
+    int mode = listMode(st);
+    if (st->running) {
+        if (mode == 1) {
+            rl.line("invitehdr", "Invite more friends  (they get a Steam invite):", false);
+            if (listedCount(st, mode) == 0) rl.line("nofriends", "Nobody on your friends list is online", false);
+            else addFriendPage(rl, st, mode);
+            rl.space();
+        }
+        rl.action("leave", "Leave co-op session", PA_LEAVE, 0);
+    } else if (!st->steamInvites) {
+        rl.line("steam", "Steam invites unavailable - use Advanced below", false);
+    } else if (mode == 1) {
+        if (!st->inWorld)
+            rl.line("loadhint", "Next: start or load your game - friends get in once it's loaded", true);
+        rl.line("invitehdr", "Invite a friend  (they get a Steam invite):", false);
+        if (listedCount(st, mode) == 0) rl.line("nofriends", "Nobody on your friends list is online", false);
+        else addFriendPage(rl, st, mode);
+        rl.space();
+        rl.action("stophost", "Stop hosting", PA_STOP_HOST, 0);
+    } else {
+        rl.action("host", st->inWorld ? "Host co-op   -   open this game to friends"
+                                      : "Host co-op   -   invite friends, then start your game",
+                  PA_HOST, 0);
+        rl.space();
+        int hosts = listedCount(st, mode);
+        rl.line("joinhdr", hosts ? "Join a friend who is hosting:"
+                                 : "Join a friend:  nobody is hosting right now", false);
+        addFriendPage(rl, st, mode);
+    }
+    rl.space();
+    rl.action("adv", "Advanced   (Steam ID / LAN)", PA_ADVANCED, 0);
+}
+
+// Advanced view: the manual role/transport/online toggles + clipboard Steam-ID
+// exchange (LAN, or when Steam invites are unavailable).
+void buildAdvancedRows(const CoopPanelState* st, RowList& rl, const std::string& transfer) {
+    rl.action("back", "<<   Back", PA_SIMPLE, 0);
+    rl.space();
+    rl.button("role",  std::string("Role: ") + (g_panel.hostFlag ? "HOST" : "JOIN") + "    (switch)", &onRoleBtn);
+    rl.button("trans", std::string("Transport: ") + (g_panel.steamFlag ? "STEAM" : "UDP") + "    (switch)", &onTransBtn);
+    rl.button("conn",  std::string("Connection: ") + (g_panel.connectedFlag ? "ONLINE" : "OFFLINE") + "    (switch)", &onConnBtn);
+    rl.space();
+
+    // Describes the live connection state + type. Reflects the ACTUAL running
+    // session when online; the armed toggles when offline. A join streaming the
+    // host's world at the menu has no leader for the screen overlay, so the live
+    // progress replaces it (amber).
+    std::string transStr = (st->transportSel == 0) ? "Steam" : "UDP";
+    std::string dbgVal;
+    if (st->running) {
+        if (st->peerPresent)
+            dbgVal = (st->isHost ? std::string("Hosting") : std::string("Joining")) +
+                     " over " + transStr + " - peer connected";
+        else if (st->isHost)
+            dbgVal = std::string("Hosting over ") + transStr + " - waiting for peer...";
+        else
+            dbgVal = std::string("Joining over ") + transStr + " - connecting to host...";
+    } else {
+        dbgVal = std::string("Offline - will ") + (g_panel.hostFlag ? "host" : "join") +
+                 " over " + (g_panel.steamFlag ? "Steam" : "UDP") + " on Connect";
+    }
+    if (!transfer.empty()) rl.line("dbg", "World transfer:  " + transfer, true);
+    else                   rl.line("dbg", "Status:  " + dbgVal, false);
+    rl.space();
+
+    // Friend's SteamID: prefer the value pasted in-panel this session; fall back
+    // to the config (steamPeer). Both id rows show only the last 4 digits - the
+    // panel is often on screen while streaming. Nothing needs the full digits by
+    // eye: Copy puts the real id on the clipboard and Paste takes it back off.
+    std::string peerVal;
+    unsigned long long peerShown = g_pastedPeer ? g_pastedPeer : st->peerSteamId;
+    if (peerShown != 0)      peerVal = coop::maskSteamId64(peerShown);
+    else if (g_pasteFailed)  peerVal = "(clipboard was not a Steam ID - copy theirs and retry)";
+    else                     peerVal = "(click Paste friend's Steam ID)";
+    rl.line("peer", "Friend's Steam ID:  " + peerVal, false);
+    rl.button("pasteid", "Paste friend's Steam ID", &onPasteIdBtn);
+    rl.space();
+    rl.line("self", std::string("Your Steam ID:  ") +
+                    (st->selfSteamId ? coop::maskSteamId64(st->selfSteamId)
+                                     : std::string("(Steam not running)")), false);
+    rl.button("copyid", "Copy my Steam ID", &onCopyIdBtn);
+}
+
+// Execute the button press queued by onActionBtn (see the header note on why
+// callbacks never act directly).
+void runPendingAction(const CoopPanelActions* act) {
+    int a = g_pendingAction;
+    unsigned long long fid = g_pendingFriend;
+    g_pendingAction = PA_NONE;
+    g_pendingFriend = 0;
+    char b[96];
+    switch (a) {
+    case PA_HOST:
+        coop::logLine("[coop-ui] host -> open Steam lobby");
+        if (act->host) act->host();
+        break;
+    case PA_INVITE:
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] invite friend=%llu", fid);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+        if (act->invite) act->invite(fid);
+        break;
+    case PA_JOIN:
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] join friend=%llu", fid);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+        if (act->join) act->join(fid);
+        break;
+    case PA_LEAVE:
+        // The Online/Offline edge below performs the disconnect.
+        coop::logLine("[coop-ui] leave requested");
+        g_panel.connectedFlag = false;
+        break;
+    case PA_STOP_HOST:
+        coop::logLine("[coop-ui] stop hosting");
+        if (act->disconnect) act->disconnect();
+        break;
+    case PA_MORE:
+        ++g_panel.page;
+        break;
+    case PA_ADVANCED:
+        g_panel.advanced = true;
+        coop::logLine("[coop-ui] view -> advanced");
+        break;
+    case PA_SIMPLE:
+        g_panel.advanced = false;
+        coop::logLine("[coop-ui] view -> simple");
+        break;
+    default:
+        return;
+    }
+    g_panel.needsRebuild = true;
+}
+
 } // namespace
 
-void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect) {
-    if (!st) return;
+void coopPanelTick(const CoopPanelState* st, const CoopPanelActions* act) {
+    if (!st || !act) return;
     ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
     { static void* s_last = (void*)-1;
       if ((void*)g != s_last) { s_last = (void*)g;
@@ -422,15 +762,15 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             g_panel.connectedFlag = st->running;
             g_panel.lastConnected = st->running;
             g_panel.lastChkVal    = st->running;
+            g_panel.page          = 0;
             g_panel.open = true;
             g_panel.needsRebuild = true;
             coop::logLine("[coop-ui] panel opened");
         } else {
             panelDestroySeh(g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
-            g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
-            g_pasteIdBtn = 0;
-            g_debugLine = 0; g_peerLine = 0; g_selfLine = 0;
+            g_btnRowN = 0;
+            g_pendingAction = PA_NONE;
             g_panel.open = false;
             coop::logLine("[coop-ui] panel closed");
         }
@@ -440,9 +780,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     if (!g_panel.open) return;
 
     // Keep the Online/Offline toggle honest when the session state changes
-    // underneath us (a peer-driven connect, a failed connect that stopped, etc):
-    // resync the desired flag to the real state and rebuild so the button caption
-    // + debug line reflect it.
+    // underneath us (a lobby-driven connect, a failed connect that stopped, etc):
+    // resync the desired flag to the real state and rebuild so the rows reflect it.
     if (st->running != g_panel.lastConnected) {
         g_panel.lastConnected = st->running;
         g_panel.connectedFlag = st->running;
@@ -450,14 +789,18 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         g_panel.needsRebuild = true;
     }
 
-    std::string detail = st->detail ? std::string(st->detail) : std::string();
-    if (detail != g_panel.lastStatus) g_panel.needsRebuild = true;
+    runPendingAction(act);
 
-    // Join save-transfer line (throttled to whole-percent by the caller): rebuild
-    // when it changes so the "Streaming host world... NN%" line advances live.
-    std::string transfer = st->transferDetail ? std::string(st->transferDetail)
-                                               : std::string();
-    if (transfer != g_panel.lastTransfer) g_panel.needsRebuild = true;
+    // Friends come and go: keep the page inside the current list.
+    {
+        int mode = listMode(st);
+        int n = mode ? listedCount(st, mode) : 0;
+        int pages = n ? (n + FRIENDS_PER_PAGE - 1) / FRIENDS_PER_PAGE : 1;
+        if (g_panel.page >= pages) g_panel.page = 0;
+    }
+
+    unsigned int hash = panelHash(st);
+    if (hash != g_panel.lastHash) g_panel.needsRebuild = true;
 
     // Create the window once (outside SEH - see the header note on C2712).
     // Layer MUST be "Info": spike 48 proved createFloatingLabel renders non-null
@@ -465,7 +808,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     // and armed but attaches to nothing, so F2 logs open/close yet nothing draws.
     if (!g_panel.panel) {
         std::string layer = "Info";
-        g_panel.panel = g->createDatapanel(0.22f, 0.30f, 0.30f, 0.44f, false, layer, true);
+        g_panel.panel = g->createDatapanel(0.22f, 0.30f, 0.30f, 0.50f, false, layer, true);
         g_panel.built = false;
         if (!g_panel.panel) {
             coop::logErrLine("[coop-ui] createDatapanel FAILED");
@@ -476,90 +819,43 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
 
     // (Re)populate the rows when anything visible changed.
     if (g_panel.panel && (g_panel.needsRebuild || !g_panel.built)) {
-        std::string title    = "Co-op Session    -    F2 to close";
-        std::string roleKey  = "role";
-        std::string roleCap  = std::string("Role: ") + (g_panel.hostFlag ? "HOST" : "JOIN") + "    (switch)";
-        std::string transKey = "trans";
-        std::string transCap = std::string("Transport: ") + (g_panel.steamFlag ? "STEAM" : "UDP") + "    (switch)";
-        std::string connKey  = "conn";
-        std::string connCap  = std::string("Connection: ") + (g_panel.connectedFlag ? "ONLINE" : "OFFLINE") + "    (switch)";
+        std::string transfer = st->transferDetail ? std::string(st->transferDetail)
+                                                   : std::string();
+        RowList rl;
+        if (g_panel.advanced) buildAdvancedRows(st, rl, transfer);
+        else                  buildSimpleRows(st, rl, transfer);
+        std::string title = "Co-op Session    -    F2 to close";
+        std::string empty;
+        PanelBuild pb;
+        pb.title = &title;
+        pb.empty = &empty;
+        pb.rows  = rl.rows.empty() ? 0 : &rl.rows[0];
+        pb.count = (int)rl.rows.size();
+        g_btnRowN = 0;
+        panelBuildSeh(g_panel.panel, &pb);
 
-        // White debug line: describes the live connection state + type. Reflects
-        // the ACTUAL running session when online; the armed toggles when offline.
-        std::string transStr = (st->transportSel == 0) ? "Steam" : "UDP";
-        std::string dbgKey   = "Connection status";
-        std::string dbgVal;
-        if (st->running) {
-            if (st->peerPresent)
-                dbgVal = (st->isHost ? std::string("Hosting") : std::string("Joining")) +
-                         " over " + transStr + " - peer connected";
-            else if (st->isHost)
-                dbgVal = std::string("Hosting over ") + transStr + " - waiting for peer...";
-            else
-                dbgVal = std::string("Joining over ") + transStr + " - connecting to host...";
-        } else {
-            dbgVal = std::string("Offline - will ") + (g_panel.hostFlag ? "host" : "join") +
-                     " over " + (g_panel.steamFlag ? "Steam" : "UDP") + " on Connect";
-        }
-        // A join streaming the host's world at the menu has no leader for the
-        // screen overlay, so surface the live progress here instead (amber).
-        if (!transfer.empty()) { dbgVal = transfer; dbgKey = "World transfer"; }
-
-        // Friend's SteamID: prefer the value pasted in-panel this session; fall
-        // back to the config (steamPeer, mainly for advanced/back-compat use).
-        // Both id rows show only the last 4 digits - the panel is often on screen
-        // while streaming. Nothing needs the full digits by eye: Copy puts the
-        // real id on the clipboard and Paste takes it back off.
-        std::string peerKey = "Friend's Steam ID";
-        std::string peerVal;
-        unsigned long long peerShown = g_pastedPeer ? g_pastedPeer
-                                                     : (unsigned long long)st->peerSteamId;
-        if (peerShown != 0) {
-            peerVal = coop::maskSteamId64(peerShown);
-        } else if (g_pasteFailed) {
-            peerVal = "(clipboard was not a Steam ID - copy theirs and retry)";
-        } else {
-            peerVal = "(click Paste friend's Steam ID)";
-        }
-        std::string pasteKey = "pasteid";
-        std::string pasteCap = "Paste friend's Steam ID";
-
-        std::string selfKey  = "Your Steam ID";
-        std::string selfVal  = st->selfSteamId
-                                   ? coop::maskSteamId64((unsigned long long)st->selfSteamId)
-                                   : std::string("(Steam not running)");
-        std::string copyKey  = "copyid";
-        std::string copyCap  = "Copy my Steam ID";
-        std::string empty    = "";
-
-        PanelStrings ps;
-        ps.title = &title; ps.roleKey = &roleKey; ps.roleCap = &roleCap;
-        ps.transKey = &transKey; ps.transCap = &transCap;
-        ps.connKey = &connKey; ps.connCap = &connCap;
-        ps.dbgKey = &dbgKey; ps.dbgVal = &dbgVal;
-        ps.peerKey = &peerKey; ps.peerVal = &peerVal;
-        ps.pasteKey = &pasteKey; ps.pasteCap = &pasteCap;
-        ps.selfKey = &selfKey; ps.selfVal = &selfVal;
-        ps.copyKey = &copyKey; ps.copyCap = &copyCap;
-        ps.empty = &empty;
-        panelBuildSeh(g_panel.panel, &ps);
-
-        // Delegate assignment + white-colouring live OUTSIDE the SEH frame (pointer
+        // Delegate assignment + colouring live OUTSIDE the SEH frame (pointer
         // targets are valid post-build; assignment can't fault) so no delegate
         // temporary lands in it.
-        if (g_roleBtn)    g_roleBtn->callback    = MyGUI::newDelegate(&onRoleBtn);
-        if (g_transBtn)   g_transBtn->callback   = MyGUI::newDelegate(&onTransBtn);
-        if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
-        if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
-        if (g_pasteIdBtn) g_pasteIdBtn->callback = MyGUI::newDelegate(&onPasteIdBtn);
-        dbgColourSeh(g_debugLine, !transfer.empty()); // amber while streaming
-        dbgColourSeh(g_peerLine, false);
-        dbgColourSeh(g_selfLine, false);
+        for (int i = 0; i < pb.count; ++i) {
+            const RowSpec& r = rl.rows[i];
+            if (!r.line) continue;
+            if (r.kind == ROW_BUTTON && r.cb) {
+                r.line->callback = MyGUI::newDelegate(r.cb);
+                if (r.cb == &onActionBtn && g_btnRowN < MAX_BUTTON_ROWS) {
+                    g_btnRows[g_btnRowN].line     = r.line;
+                    g_btnRows[g_btnRowN].action   = r.action;
+                    g_btnRows[g_btnRowN].friendId = r.friendId;
+                    ++g_btnRowN;
+                }
+            } else if (r.kind == ROW_LINE) {
+                dbgColourSeh(r.line, r.amber);
+            }
+        }
 
         g_panel.built = true;
         g_panel.needsRebuild = false;
-        g_panel.lastStatus = detail;
-        g_panel.lastTransfer = transfer;
+        g_panel.lastHash = hash;
     }
 
     // Connect / disconnect on the Online/Offline toggle edge (edge, not level, so
@@ -575,13 +871,15 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                       g_panel.steamFlag ? "steam" : "udp");
             b[sizeof(b) - 1] = '\0';
             coop::logLine(b);
-            if (onConnect) onConnect(g_panel.hostFlag, g_panel.steamFlag, g_pastedPeer);
+            if (act->connect) act->connect(g_panel.hostFlag, g_panel.steamFlag, g_pastedPeer);
         } else if (!g_panel.connectedFlag && st->running) {
             coop::logLine("[coop-ui] DISCONNECT requested");
-            if (onDisconnect) onDisconnect();
+            if (act->disconnect) act->disconnect();
         }
     }
 }
+
+bool coopPanelIsOpen() { return g_panel.open; }
 
 // ---- Persistent co-op status overlay ----------------------------------------
 // A fixed banner in the top-left corner of the screen showing live session status

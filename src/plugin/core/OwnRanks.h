@@ -46,6 +46,17 @@ inline void resolveOwnRanks(std::set<unsigned int>& ranks, bool isHost, bool fro
     ranks.insert(isHost ? 0u : 1u);
 }
 
+// Once the host has assigned this client its player id (WELCOME), the client
+// owns exactly that squad tab: player k drives squad tab rank k (host 0, joins
+// 1..MAX_PLAYERS-1). Before WELCOME a join keeps the role default above. An
+// explicit env override still wins.
+inline void resolveOwnRanksForPlayer(std::set<unsigned int>& ranks, unsigned int playerId,
+                                     bool fromEnv) {
+    if (fromEnv) return;
+    ranks.clear();
+    ranks.insert(playerId);
+}
+
 } // namespace coop
 
 #endif // COOP_OWN_RANKS_H

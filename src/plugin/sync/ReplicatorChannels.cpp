@@ -358,9 +358,12 @@ void Replicator::applyTreatments(GameWorld* gw, Inbound& in) {
         // Only the AUTHORITY applies a treatment to the real body: the owner of
         // a squad member, or the host for a combat-scoped world NPC (medNpc_).
         // A delta for a body we aren't authoritative for is a partition error
-        // (log-visible, ignored).
+        // (log-visible, ignored). Protocol 56: the host relays treatments to
+        // every join, so this is also the relay filter - only the subject's
+        // owner passes, and a squad body (any player's) is never NPC-scoped.
         bool authority = ownHands_.find(k) != ownHands_.end() ||
-                         (streamNpcs_ && medNpc_.find(k) != medNpc_.end());
+                         (streamNpcs_ && medNpc_.find(k) != medNpc_.end() &&
+                          allSquad_.find(k) == allSquad_.end());
         if (!authority) continue;
         Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
         if (!c) continue;
@@ -420,6 +423,16 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
             char b[160]; _snprintf(b, sizeof(b) - 1,
                 "[combat] HIT RECV id=%u hand=%u,%u SKIP (own body)",
                 p.hitId, k.i, k.s);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+        // Protocol 56: another player's squad body. Its owner simulates it, and
+        // our copy is driven - wounding it here would be the PvP divergence
+        // this channel never models.
+        if (allSquad_.find(k) != allSquad_.end()) {
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[combat] HIT RECV id=%u hand=%u,%u from=%u SKIP (player squad body)",
+                p.hitId, k.i, k.s, (unsigned)it->ownerId);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             continue;
         }
@@ -531,6 +544,28 @@ void Replicator::applyStats(GameWorld* gw, Inbound& in) {
 // delta, so no per-path hooking is needed. poolSeen_ is updated on every write
 // we make ourselves, which is what keeps our own apply from being re-detected
 // as a fresh local change (the echo guard the sampled channels all need).
+//
+// Protocol 56 (N-player star): every join numbers its deltas from 1, so the
+// host keeps one ack per join (poolAckedBy_) and the total goes out as one
+// targeted PKT_MONEY per join carrying THAT join's ack, plus one ack=0 copy for
+// every join that has not had a delta folded yet. Each join therefore sees
+// exactly one total per publish and only its own ack. With a single join this
+// is the old broadcast: ack=0 to everyone until its first fold, then its ack.
+
+namespace {
+void queuePoolTotal(NetLink& net, MoneyPacket pkt, const std::map<u32, u32>& ackedBy) {
+    u32 rest = PEER_MASK_ALL;
+    for (std::map<u32, u32>::const_iterator it = ackedBy.begin(); it != ackedBy.end(); ++it) {
+        u32 bit = peerBit(it->first);
+        if (bit == 0) continue;
+        pkt.ackSeq = it->second;
+        net.queueMoney(pkt, bit);
+        rest &= ~bit;
+    }
+    pkt.ackSeq = 0;
+    net.queueMoney(pkt, rest);
+}
+} // namespace
 
 void Replicator::publishMoneyPool(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
@@ -576,7 +611,7 @@ void Replicator::publishMoneyPool(const SyncContext& ctx) {
         pkt.ownerId = ownerId;
         pkt.ackSeq  = poolAcked_;
         pkt.money   = poolTotal_;
-        net.queueMoney(pkt);
+        queuePoolTotal(net, pkt, poolAckedBy_);
         if (changed) { // resends stay silent; the change is the signal
             char b[112];
             _snprintf(b, sizeof(b) - 1, "[wallet] POOL SEND t=%d ack=%u",
@@ -618,7 +653,7 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
     const bool hostRole = isHostRole();
 
     if (hostRole) {
-        // Fold the join's deltas into the pool. Clamped at 0: both players can
+        // Fold each join's deltas into the pool. Clamped at 0: players can
         // commit purchases against the same cats before either delta lands, and
         // the goods are already handed over locally, so the pool absorbs the
         // shortfall rather than going negative.
@@ -626,7 +661,8 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
         for (std::deque<InboundMoneyDelta>::iterator it = deltas.begin();
              it != deltas.end(); ++it) {
             const MoneyDeltaPacket& p = it->pkt;
-            if (p.seq <= poolAcked_) continue; // already folded (defensive)
+            u32& acked = poolAckedBy_[it->ownerId]; // per-join seq space (protocol 56)
+            if (p.seq <= acked) continue;     // already folded (defensive)
             if (poolTotal_ < 0) {              // no seed yet - adopt the wallet first
                 int cur = -1;
                 if (!engine::readPlayerWallet(gw, &cur) || cur < 0) return;
@@ -642,6 +678,7 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
                 want = 0;
             }
             poolTotal_ = want;
+            acked      = p.seq;
             poolAcked_ = p.seq;
             moved = true;
             char b[144];
@@ -670,15 +707,21 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
         out.ownerId = ctx.localId;
         out.ackSeq  = poolAcked_;
         out.money   = poolTotal_;
-        net.queueMoney(out);
+        queuePoolTotal(net, out, poolAckedBy_);
         return;
     }
 
     // Join: adopt the newest authoritative total, then re-apply whatever the
     // host has not acked yet so a purchase made moments ago is not reverted for
     // a round trip and then re-applied.
-    if (totals.empty()) return;
-    const MoneyPacket& p = totals.back().pkt;
+    // Only the host's total is the pool. Joins never relay one, but a total
+    // from any other sender must not be adopted (protocol 56).
+    const MoneyPacket* newest = 0;
+    for (std::deque<InboundMoney>::reverse_iterator rt = totals.rbegin();
+         rt != totals.rend(); ++rt)
+        if (rt->ownerId == 0) { newest = &rt->pkt; break; }
+    if (!newest) return;
+    const MoneyPacket& p = *newest;
     if (p.money < 0) return;
     while (!poolPending_.empty() && poolPending_.front().seq <= p.ackSeq)
         poolPending_.pop_front();
@@ -768,8 +811,7 @@ void Replicator::applyFactions(const SyncContext& ctx) {
         const FactionPacket& p = it->pkt;
         if (p.sid[0] == '\0') continue;
         FacRow& fr = facRows_[std::string(p.sid)];
-        if (!sync::gateSeqAccept(fr.seqSeen, p.seq)) continue; // stale/dup row
-        fr.seqSeen = p.seq;
+        if (!fr.seqSeen.accept(it->ownerId, p.seq)) continue; // stale/dup row (per sender)
         float us = -999.0f, them = -999.0f;
         engine::readRelationBySid(gw, p.sid, &us, &them);
         // Updating the baseline FIRST is the echo guard: the local change this
@@ -859,8 +901,7 @@ void Replicator::applyDoors(const SyncContext& ctx) {
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
         DoorRow& dr = doorRows_[k];
-        if (!sync::gateSeqAccept(dr.seqSeen, p.seq)) continue; // stale/dup row
-        dr.seqSeen = p.seq;
+        if (!dr.seqSeen.accept(it->ownerId, p.seq)) continue; // stale/dup row (per sender)
         // Updating the baseline FIRST is the echo guard: the local change this
         // write causes must not be re-detected as ours next sample.
         dr.knownOpen = (int)p.open; dr.knownLocked = (int)p.locked;
@@ -986,8 +1027,7 @@ void Replicator::applyProd(const SyncContext& ctx) {
         Key wk; wk.t = p.key[0]; wk.c = p.key[1]; wk.cs = p.key[2];
         wk.i = p.key[3]; wk.s = p.key[4];
         ProdRow& pr = prodRows_[std::make_pair((int)p.keyKind, wk)];
-        if (!sync::gateSeqAccept(pr.seqSeen, p.seq)) continue; // stale/dup row
-        pr.seqSeen = p.seq;
+        if (!pr.seqSeen.accept(it->ownerId, p.seq)) continue; // stale/dup row (per sender)
         // Resolve the wire key to OUR machine's hand: baked hands resolve
         // directly; a placer key is either a building WE placed (our own
         // hand) or one we MINTED for the host's placement (translation map).
@@ -1006,11 +1046,10 @@ void Replicator::applyProd(const SyncContext& ctx) {
                 if (ob->second.removed) continue;
                 memcpy(hand, ob->second.hand, sizeof(hand));
             } else {
-                std::map<Key, PeerBuild>::iterator pb = peerBuilds_.find(wk);
-                if (pb == peerBuilds_.end() || pb->second.minted != 1 ||
-                    pb->second.removed)
+                const PeerBuild* pb = findPeerBuild(wk, it->ownerId);
+                if (!pb || pb->minted != 1 || pb->removed)
                     continue; // unknown / refused / tombstoned key
-                memcpy(hand, pb->second.localHand, sizeof(hand));
+                memcpy(hand, pb->localHand, sizeof(hand));
             }
         }
         engine::ProdRead cur;
@@ -1125,8 +1164,7 @@ void Replicator::applyResearch(const SyncContext& ctx) {
         sid[sizeof(sid) - 1] = '\0';
         if (!sid[0]) continue;
         ResearchRow& rr = researchRows_[std::string(sid)];
-        if (!sync::gateSeqAccept(rr.seqSeen, p.seq)) continue; // stale/dup row
-        rr.seqSeen = p.seq;
+        if (!rr.seqSeen.accept(it->ownerId, p.seq)) continue; // stale/dup row (per sender)
         if (rr.applied) continue; // landed earlier; resends are no-ops
         int known = -1, can = -1;
         int rc = engine::researchQueryBySid(gw, sid, &known, &can);
@@ -1284,8 +1322,7 @@ void Replicator::applyDeeds(const SyncContext& ctx) {
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
         DeedRow& dr = deedRows_[k];
-        if (!sync::gateSeqAccept(dr.seqSeen, p.seq)) continue; // stale/dup row
-        dr.seqSeen = p.seq;
+        if (!dr.seqSeen.accept(it->ownerId, p.seq)) continue; // stale/dup row (per sender)
         int want = p.owned ? 1 : 0;
         if (dr.applied && dr.knownOwned == want) continue; // converged; resend no-op
         engine::DeedRead cur;
@@ -1385,7 +1422,7 @@ void Replicator::applyFixtures(const SyncContext& ctx) {
         const FixturePacket& p = it->pkt;
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
-        FixtureRow& fr = fixtureMap_[k];
+        FixtureRow& fr = fixtureMap_[std::make_pair(it->ownerId, k)];
         if (!sync::gateSeqAccept(fr.seqSeen, p.seq)) continue; // stale/dup row
         fr.seqSeen = p.seq;
         if (fr.resolved) continue; // identity is permanent; resends are no-ops
@@ -1462,12 +1499,50 @@ void Replicator::unparkForNewFixture() {
     }
 }
 
-bool Replicator::localHandForFixtureKey(const Key& wire, unsigned int out[5]) const {
+bool Replicator::localHandForFixtureKey(const Key& wire, unsigned int out[5],
+                                        u32 preferSender) const {
     if (!out) return false;
-    std::map<Key, FixtureRow>::const_iterator it = fixtureMap_.find(wire);
-    if (it == fixtureMap_.end() || !it->second.resolved) return false;
-    memcpy(out, it->second.hand, sizeof(unsigned int) * 5);
-    return true;
+    typedef std::map<std::pair<u32, Key>, FixtureRow>::const_iterator FixIt;
+    // The sender whose hand space the key is in first; otherwise any sender's
+    // resolved pairing for the same key (ids ascending: the host's first).
+    if (preferSender != OWNER_ID_ALL) {
+        FixIt it = fixtureMap_.find(std::make_pair(preferSender, wire));
+        if (it != fixtureMap_.end() && it->second.resolved) {
+            memcpy(out, it->second.hand, sizeof(unsigned int) * 5);
+            return true;
+        }
+    }
+    for (u32 s = 0; s < MAX_PLAYERS; ++s) {
+        if (s == preferSender) continue;
+        FixIt it = fixtureMap_.find(std::make_pair(s, wire));
+        if (it == fixtureMap_.end() || !it->second.resolved) continue;
+        memcpy(out, it->second.hand, sizeof(unsigned int) * 5);
+        return true;
+    }
+    return false;
+}
+
+// Placed-build lookup for wire rows that carry no placer id. The preferred
+// placer (usually the row's sender) wins; otherwise the first placer, by id,
+// that announced this key.
+const Replicator::PeerBuild* Replicator::findPeerBuild(const Key& wire,
+                                                       u32 preferPlacer) const {
+    std::map<PeerBuildKey, PeerBuild>::const_iterator f;
+    if (preferPlacer != OWNER_ID_ALL) {
+        f = peerBuilds_.find(PeerBuildKey(preferPlacer, wire));
+        if (f != peerBuilds_.end()) return &f->second;
+    }
+    for (u32 s = 0; s < MAX_PLAYERS; ++s) {
+        if (s == preferPlacer) continue;
+        f = peerBuilds_.find(PeerBuildKey(s, wire));
+        if (f != peerBuilds_.end()) return &f->second;
+    }
+    return 0;
+}
+
+Replicator::PeerBuild* Replicator::findPeerBuild(const Key& wire, u32 preferPlacer) {
+    const Replicator* self = this;
+    return const_cast<PeerBuild*>(self->findPeerBuild(wire, preferPlacer));
 }
 
 // Build-site pose subject translation. A construction site is created at RUNTIME,
@@ -1491,7 +1566,8 @@ bool Replicator::buildKeyForLocalHand(const Key& local, Key& outWire) const {
     return false; // not a placed site (save-resident building) - no translation
 }
 
-bool Replicator::localHandForBuildKey(const Key& wire, unsigned int out[5]) const {
+bool Replicator::localHandForBuildKey(const Key& wire, unsigned int out[5],
+                                      u32 preferPlacer) const {
     if (!out) return false;
     std::map<Key, OwnBuild>::const_iterator ob = ownBuilds_.find(wire);
     if (ob != ownBuilds_.end()) {
@@ -1499,9 +1575,9 @@ bool Replicator::localHandForBuildKey(const Key& wire, unsigned int out[5]) cons
         memcpy(out, ob->second.hand, sizeof(unsigned int) * 5);
         return true;
     }
-    std::map<Key, PeerBuild>::const_iterator pb = peerBuilds_.find(wire);
-    if (pb != peerBuilds_.end() && pb->second.minted == 1 && !pb->second.removed) {
-        memcpy(out, pb->second.localHand, sizeof(unsigned int) * 5);
+    const PeerBuild* pb = findPeerBuild(wire, preferPlacer);
+    if (pb && pb->minted == 1 && !pb->removed) {
+        memcpy(out, pb->localHand, sizeof(unsigned int) * 5);
         return true;
     }
     return false; // unknown / refused / tombstoned key
@@ -1635,9 +1711,11 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         if (p.sid[0] == '\0') continue;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
-        if (peerBuilds_.find(k) != peerBuilds_.end())
+        // Keyed by the PLACER (the sender): two joins' runtime hands can collide.
+        PeerBuildKey pkey(it->ownerId, k);
+        if (peerBuilds_.find(pkey) != peerBuilds_.end())
             continue; // already minted (or mint already refused) - dedupe
-        PeerBuild& pb = peerBuilds_[k];
+        PeerBuild& pb = peerBuilds_[pkey];
         // Mint INCOMPLETE always: the placer's STATE rows drive progress from
         // here (a real UI placement starts at 0 anyway).
         int rc = engine::placeBuildingAt(gw, p.sid, p.x, p.y, p.z, p.yaw,
@@ -1665,7 +1743,8 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         const BuildStatePacket& p = it->pkt;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
-        std::map<Key, PeerBuild>::iterator f = peerBuilds_.find(k);
+        std::map<PeerBuildKey, PeerBuild>::iterator f =
+            peerBuilds_.find(PeerBuildKey(it->ownerId, k)); // sender = placer
         if (f == peerBuilds_.end() || !f->second.minted)
             continue; // mint refused or key unknown - skip silently
         PeerBuild& pb = f->second;
@@ -1708,7 +1787,8 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         const BuildRemovePacket& p = it->pkt;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
-        std::map<Key, PeerBuild>::iterator f = peerBuilds_.find(k);
+        std::map<PeerBuildKey, PeerBuild>::iterator f =
+            peerBuilds_.find(PeerBuildKey(it->ownerId, k)); // sender = placer
         if (f == peerBuilds_.end() || !f->second.minted || f->second.removed)
             continue; // never minted here or already gone - nothing to remove
         PeerBuild& pb = f->second;
@@ -1875,7 +1955,7 @@ void Replicator::publishBuildDoors(const SyncContext& ctx) {
     // hand) and minted proxies (wire key = the placer's, via the map key).
     for (int pass = 0; pass < 2; ++pass) {
         std::map<Key, OwnBuild>::iterator oit = ownBuilds_.begin();
-        std::map<Key, PeerBuild>::iterator pit = peerBuilds_.begin();
+        std::map<PeerBuildKey, PeerBuild>::iterator pit = peerBuilds_.begin();
         for (;;) {
             const Key* wireKey = 0;
             const unsigned int* localHand = 0;
@@ -1886,7 +1966,7 @@ void Replicator::publishBuildDoors(const SyncContext& ctx) {
             } else {
                 if (pit == peerBuilds_.end()) break;
                 if (!pit->second.minted || pit->second.removed) { ++pit; continue; }
-                wireKey = &pit->first; localHand = pit->second.localHand; ++pit;
+                wireKey = &pit->first.second; localHand = pit->second.localHand; ++pit;
             }
             for (unsigned int di = 0; di < MAX_DOORS_PER_BUILDING; ++di) {
                 engine::DoorRead dr;
@@ -1951,13 +2031,13 @@ void Replicator::applyBuildDoors(const SyncContext& ctx) {
         if (oit != ownBuilds_.end() && !oit->second.removed) {
             localHand = oit->second.hand;
         } else {
-            std::map<Key, PeerBuild>::iterator pit = peerBuilds_.find(k);
-            if (pit != peerBuilds_.end() && pit->second.minted && !pit->second.removed)
-                localHand = pit->second.localHand;
+            // The row names no placer: prefer the sender's own placement.
+            const PeerBuild* pb = findPeerBuild(k, it->ownerId);
+            if (pb && pb->minted && !pb->removed)
+                localHand = pb->localHand;
         }
         BdoorRow& row = bdoorRows_[std::make_pair(k, (int)p.doorIndex)];
-        if (!sync::gateSeqAccept(row.seqSeen, p.seq)) continue; // stale/dup row
-        row.seqSeen = p.seq;
+        if (!row.seqSeen.accept(it->ownerId, p.seq)) continue; // stale/dup row (per sender)
         // Updating the baseline FIRST is the echo guard: the local change this
         // write causes must not be re-detected as ours next sample.
         row.knownOpen = (int)p.open; row.knownLocked = (int)p.locked;
@@ -2205,6 +2285,84 @@ void Replicator::applyStealthFeedback(GameWorld* gw, Inbound& in) {
     }
 }
 
+// ---- Protocol 56: per-owner channel state (N-player star) --------------------
+
+// Fold every join's vote into the scalars the arbitration reads: the lowest
+// request (any join can pause, every join must agree to raise) and the OR of
+// the combat bits. No votes = -1 / false, exactly the "no peer yet" state.
+void Replicator::refreshPeerSpeedVotes() {
+    float req = -1.0f;
+    bool  cmb = false;
+    for (std::map<u32, SpeedVote>::const_iterator it = speedVotes_.begin();
+         it != speedVotes_.end(); ++it) {
+        if (it->second.req >= 0.0f && (req < 0.0f || it->second.req < req))
+            req = it->second.req;
+        if (it->second.combat) cmb = true;
+    }
+    speedPeerReq_    = req;
+    speedPeerCombat_ = cmb;
+}
+
+namespace {
+// Drop one sender's (or every sender's) stamp from a row map's SenderSeq.
+template <class RowMap>
+void forgetRowSeq(RowMap& rows, u32 id) {
+    for (typename RowMap::iterator it = rows.begin(); it != rows.end(); ++it) {
+        if (id == OWNER_ID_ALL) it->second.seqSeen.seen.clear();
+        else                    it->second.seqSeen.forget(id);
+    }
+}
+} // namespace
+
+void Replicator::forgetPeerChannels(u32 id) {
+    const bool all = (id == OWNER_ID_ALL);
+    if (all) {
+        speedVotes_.clear(); timePeers_.clear(); poolAckedBy_.clear();
+    } else {
+        speedVotes_.erase(id); timePeers_.erase(id); poolAckedBy_.erase(id);
+    }
+    // The departed join's vote no longer holds the session paused/slow.
+    refreshPeerSpeedVotes();
+    // Host clock brake: it only re-evaluates when a report arrives, so a brake
+    // engaged for a join that just left would hold forever. Release it; the
+    // next report from a remaining join re-engages it within ~1 s if needed.
+    if (isHostRole() && timeSlew_ < 0.999f) timeSlew_ = 1.0f;
+
+    // Per-sender row seq stamps: a reconnecting client may restart its
+    // counters, and its new rows must not be dropped as stale.
+    forgetRowSeq(facRows_, id);
+    forgetRowSeq(doorRows_, id);
+    forgetRowSeq(bdoorRows_, id);
+    forgetRowSeq(prodRows_, id);
+    forgetRowSeq(researchRows_, id);
+    forgetRowSeq(deedRows_, id);
+
+    // Fixture pairings live in the sender's hand space; a returning client
+    // re-announces (fresh instances, possibly fresh hands).
+    unsigned int nFix = 0;
+    for (std::map<std::pair<u32, Key>, FixtureRow>::iterator it = fixtureMap_.begin();
+         it != fixtureMap_.end(); ) {
+        if (all || it->first.first == id) { fixtureMap_.erase(it++); ++nFix; }
+        else ++it;
+    }
+    // Buildings the leaver placed stay in OUR world (the mints are real);
+    // only their STATE seq guard restarts so a returning placer is heard.
+    unsigned int nBuild = 0;
+    for (std::map<PeerBuildKey, PeerBuild>::iterator it = peerBuilds_.begin();
+         it != peerBuilds_.end(); ++it) {
+        if (!all && it->first.first != id) continue;
+        it->second.seqSeen = 0;
+        ++nBuild;
+    }
+    if (!all) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1,
+                  "[peer] FORGET channels id=%u fixtures=%u builds=%u",
+                  (unsigned)id, nFix, nBuild);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
                            bool isHost) {
     const unsigned long RESEND_MS        = 3000; // safety resend (late join / lost state)
@@ -2274,30 +2432,35 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    // Drain peer speed packets: the host keeps the join's latest REQUEST; the
-    // join applies the host's arbitrated SET. The reliable channel is ordered,
-    // but the seq guard keeps a (theoretical) stale packet from rolling back.
+    // Drain speed packets: the host keeps each join's latest REQUEST (one vote
+    // per join, each in its own seq space - protocol 56); a join applies the
+    // host's arbitrated SET. The reliable channel is ordered, but the seq guard
+    // keeps a (theoretical) stale packet from rolling back.
     std::deque<InboundSpeed> got;
     in.drainSpeed(got);
     for (std::deque<InboundSpeed>::iterator it = got.begin(); it != got.end(); ++it) {
         const SpeedPacket& p = it->pkt;
-        if (p.seq != 0 && speedSeqSeen_ != 0 && (long)(p.seq - speedSeqSeen_) <= 0)
-            continue;
-        speedSeqSeen_ = p.seq;
         bool pkPaused = (p.flags & SPEED_PAUSED) != 0 || p.speed <= EPS;
         if (p.type == (u8)PKT_SPEED_REQ && isHost) {
+            SpeedVote& v = speedVotes_[it->ownerId];
+            if (p.seq != 0 && v.seqSeen != 0 && (long)(p.seq - v.seqSeen) <= 0)
+                continue;
+            v.seqSeen = p.seq;
             float req = pkPaused ? 0.0f : p.speed;
             bool  cmb = (p.flags & SPEED_IN_COMBAT) != 0;
-            if (speedPeerReq_ < 0.0f || fabs(req - speedPeerReq_) > EPS ||
-                cmb != speedPeerCombat_) {
+            if (v.req < 0.0f || fabs(req - v.req) > EPS || cmb != v.combat) {
                 char b[112]; _snprintf(b, sizeof(b) - 1,
                     "[speed] REQ RECV owner=%u mult=%.2f paused=%d combat=%d",
                     (unsigned)it->ownerId, req, pkPaused ? 1 : 0, cmb ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
-            speedPeerReq_    = req;
-            speedPeerCombat_ = cmb;
+            v.req    = req;
+            v.combat = cmb;
         } else if (p.type == (u8)PKT_SPEED_SET && !isHost) {
+            if (it->ownerId != 0) continue; // only the host arbitrates
+            if (p.seq != 0 && speedSeqSeen_ != 0 && (long)(p.seq - speedSeqSeen_) <= 0)
+                continue;
+            speedSeqSeen_ = p.seq;
             // QUIET apply: drives the sim to the arbitrated effective without
             // touching the UI buttons - they keep showing this player's VOTE.
             // The clock slew (protocol 25) folds in here: the join's sim runs
@@ -2317,10 +2480,11 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
             }
         }
     }
+    if (isHost) refreshPeerSpeedVotes();
 
     if (isHost) {
-        // Arbitrate: effective = min(my request, peer request), capped at 1x
-        // while either player squad fights. The cap never force-unpauses -
+        // Arbitrate: effective = min(my request, every join's request), capped
+        // at 1x while any player squad fights. The cap never force-unpauses -
         // pause (0) is already below 1, so min semantics preserve it.
         float eff = (speedMyReq_ >= 0.0f) ? speedMyReq_ : 1.0f;
         if (speedPeerReq_ >= 0.0f && speedPeerReq_ < eff) eff = speedPeerReq_;
@@ -2439,18 +2603,38 @@ void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
         // join's, which is the same magnitude as the divergence the census park
         // and walk-converge bands spend the whole town correcting. A clock gap
         // is a position gap everywhere at once.
-        const TimePacket* jn = 0;
+        // Protocol 56: one report stream per join, each in its own seq space.
+        // The brake answers the join furthest BEHIND among those still
+        // reporting; a join that went quiet stops counting after
+        // TIME_PEER_FRESH_MS (with one join this is exactly its newest sample).
+        const unsigned long TIME_PEER_FRESH_MS = 5000;
+        bool fresh = false;
         for (std::deque<InboundTime>::iterator it = got.begin();
              it != got.end(); ++it) {
-            if (timeSeqSeen_ != 0 && (long)(it->pkt.seq - timeSeqSeen_) <= 0)
+            TimePeer& tp = timePeers_[it->ownerId];
+            if (tp.seqSeen != 0 && (long)(it->pkt.seq - tp.seqSeen) <= 0)
                 continue;
-            timeSeqSeen_ = it->pkt.seq;
-            jn = &it->pkt;
+            tp.seqSeen = it->pkt.seq;
+            tp.hours   = it->pkt.gameHours;
+            tp.recvMs  = now;
+            fresh = true;
         }
-        if (jn && timeBrake_) {
+        if (fresh && timeBrake_) {
             double localH = -1.0;
+            const TimePeer* worst = 0;
             if (engine::readGameClock(gw, &localH, 0) && localH >= 0.0) {
-                double lag = localH - jn->gameHours; // >0 = the join is BEHIND
+                // Lag against OUR clock at receipt (this tick) - a sample is
+                // never compared with a later local reading.
+                for (std::map<u32, TimePeer>::iterator tp = timePeers_.begin();
+                     tp != timePeers_.end(); ++tp) {
+                    TimePeer& t = tp->second;
+                    if (t.recvMs == now) t.lag = localH - t.hours;
+                    if (t.recvMs == 0 || (now - t.recvMs) > TIME_PEER_FRESH_MS) continue;
+                    if (!worst || t.lag > worst->lag) worst = &t;
+                }
+            }
+            if (worst) {
+                double lag = worst->lag; // >0 = that join is BEHIND
                 // How much catch-up the join can still muster on its own,
                 // computed rather than reported: its slew caps at 2x and
                 // slewedEffective clamps the product at 5x, so the consensus
@@ -2488,7 +2672,7 @@ void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
                     char b[176]; _snprintf(b, sizeof(b) - 1,
                         "[time] BRAKE lag=%.4fgh slew=%.2f head=%.2f eff=%.2f "
                         "local=%.5f join=%.5f",
-                        lag, timeSlew_, head, eff, localH, jn->gameHours);
+                        lag, timeSlew_, head, eff, localH, worst->hours);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 }
             }
@@ -2513,6 +2697,7 @@ void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
     // next 1 Hz sample re-measures what the slew achieved.
     const TimePacket* newest = 0;
     for (std::deque<InboundTime>::iterator it = got.begin(); it != got.end(); ++it) {
+        if (it->ownerId != 0) continue; // the host's clock only (protocol 56)
         if (timeSeqSeen_ != 0 && (long)(it->pkt.seq - timeSeqSeen_) <= 0) continue;
         timeSeqSeen_ = it->pkt.seq;
         newest = &it->pkt;

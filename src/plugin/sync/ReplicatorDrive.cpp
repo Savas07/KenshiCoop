@@ -50,17 +50,28 @@ void Replicator::applyTargets(GameWorld* gw) {
     // model. A body we stop driving drops out and takes local damage again.
     if (dmgGuard_) engine::clearDamageGuard();
     // Join-dealt damage report (protocol 45, JOIN only): keep the engine-side
-    // accumulator armed and refresh the ATTACKER set (our controllable squad) each
-    // tick, mirroring the guard-set rebuild. A guarded swing BY one of these bodies
-    // ON a driven copy is captured for publishCombatHits; the set rebuild handles
-    // recruit/roster churn. On the host reportCombat_ is false, so the accumulator
-    // stays disabled (host swings land natively on the NPCs it owns).
+    // accumulator armed and refresh the ATTACKER set (the bodies THIS client
+    // controls) each tick, mirroring the guard-set rebuild. A guarded swing BY
+    // one of these bodies ON a driven copy is captured for publishCombatHits;
+    // the set rebuild handles recruit/roster churn. On the host reportCombat_ is
+    // false, so the accumulator stays disabled (host swings land natively on
+    // the NPCs it owns). Only OWNED bodies (ownHands_) count: the player-squad
+    // list also holds our driven copies of the other players' characters, and
+    // their cosmetic swings would be reported on top of their owners' own
+    // reports - the same wound applied twice.
     if (reportCombat_) {
         engine::setCombatReport(true);
         engine::clearReportAttackers();
         Character* pcs[64];
         unsigned int np = engine::listPlayerChars(gw, pcs, 64);
-        for (unsigned int i = 0; i < np; ++i) engine::addReportAttacker(pcs[i]);
+        for (unsigned int i = 0; i < np; ++i) {
+            unsigned int h[5];
+            if (!engine::readObjectHand(reinterpret_cast<RootObject*>(pcs[i]), h))
+                continue;
+            Key pk; pk.t = h[0]; pk.c = h[1]; pk.cs = h[2]; pk.i = h[3]; pk.s = h[4];
+            if (ownHands_.find(pk) == ownHands_.end()) continue;
+            engine::addReportAttacker(pcs[i]);
+        }
     }
     // Driven-body pointer set rebuilds per tick too: enforceHostAuthority uses it
     // to recognise a streamed body whose LOCAL hand key changed (combat detach
@@ -210,6 +221,7 @@ void Replicator::applyTargets(GameWorld* gw) {
             if (spawnSync_) {
                 UnresolvedHand& u = unresolvedHands_[it->first];
                 u.x = out.x; u.y = out.y; u.z = out.z;
+                u.target = d.author;   // ask about it of whoever streams it
             }
             continue;
         }
@@ -233,14 +245,14 @@ void Replicator::applyTargets(GameWorld* gw) {
                 tb[sizeof(tb) - 1] = '\0'; coop::logLine(tb);
             }
         }
-        // The host half of the tie-break. The publish-side echo guards make the
-        // JOIN stop speaking for bodies the host owns; this stops the host
-        // LISTENING about bodies it owns. Without both halves the host still
-        // drove its own authored body from whatever the join had said about it
-        // while continuing to publish it, so the join followed the host, the
-        // host followed the join, and the same NPC wore a green DRV label on
-        // both screens (observed 2026-08-08, run 215534: one Holy Sentinel over
-        // two consecutive dumps).
+        // The refusing half of the tie-break. The publish-side echo guards make
+        // a lower-priority player stop speaking for bodies a higher-priority one
+        // streams; this stops US LISTENING to lower-priority players about bodies
+        // we author. Without both halves the host still drove its own authored
+        // body from whatever the join had said about it while continuing to
+        // publish it, so the join followed the host, the host followed the join,
+        // and the same NPC wore a green DRV label on both screens (observed
+        // 2026-08-08, run 215534: one Holy Sentinel over two consecutive dumps).
         //
         // Asymmetric on purpose, and this is the whole reason it is safe. The
         // symmetric version of this check - both sides refusing streams for
@@ -248,16 +260,19 @@ void Replicator::applyTargets(GameWorld* gw) {
         // straddling a boundary sits in "our" cell on BOTH clients at once, so
         // both refused, both fell back to local AI, and the copies drifted apart
         // with nothing left to pull them together (world-NPC position parity
-        // 0.751 -> 0.389, combat 0.51 -> 0.069). With only the host refusing,
-        // the join always has someone to follow, so a contested body converges
-        // on the host's copy instead of diverging.
+        // 0.751 -> 0.389, combat 0.51 -> 0.069). Generalised to N players as the
+        // same TOTAL ORDER the yield uses: we refuse a sample only from an author
+        // with a HIGHER id than ours (the host refuses everyone, nobody refuses
+        // the host), so of any two contenders exactly one refuses and the other
+        // follows it - a contested body converges on the lower id's copy instead
+        // of diverging. With two players this is the old host-only refusal.
         //
         // Judged on where OUR copy stands, not on the streamed position: the
         // sample is interpolated and can extrapolate across a boundary, and the
         // question being asked is about the body we are about to move.
-        // Proxies are exempt: a minted body exists only because the peer streams
-        // it and has no local AI to fall back on, so refusing to drive one just
-        // strands it wherever it was minted.
+        // Proxies are exempt: a minted body exists only because its author
+        // streams it and has no local AI to fall back on, so refusing to drive
+        // one just strands it wherever it was minted.
         //
         // d.fresh is deliberately left ALONE. enforceHostAuthority builds its
         // 'keep' set from it, and keep is what stops a body being suppressed -
@@ -265,8 +280,8 @@ void Replicator::applyTargets(GameWorld* gw) {
         // authors and is simulating (run 220905: 'Holy Sentinel' missing from
         // 52 of the join's samples). Not driving a body and not knowing about it
         // are different statements; only the first one is meant here.
-        if (cellAuth_ && localId_ == (u32)CELL_OWNER_HOST && !viaProxy &&
-            !engine::isLocalPlayerChar(gw, c)) {
+        if (cellAuth_ && localId_ != 0xFFFFFFFFu && d.author != AUTHOR_NONE &&
+            d.author > localId_ && !viaProxy && !engine::isLocalPlayerChar(gw, c)) {
             float hx = 0.0f, hy = 0.0f, hz = 0.0f;
             if (engine::readPos(c, &hx, &hy, &hz) &&
                 weAuthor(gw, localId_, hx, hz)) {
@@ -758,8 +773,28 @@ void Replicator::applyTargets(GameWorld* gw) {
                 bool downish = coop::bodyDownNotCrawling(out.bodyState) ||
                                d.koLatched || d.deathLatched ||
                                coop::bodyDownNotCrawling(engine::readBodyState(c));
+                // N players under presence authority: several clients run world
+                // sims (streamNpcs_), so only ONE may author this edge - the
+                // authority of the cell our copy stands in. When that authority
+                // is the occupant's own author (its cell, where it cannot see the
+                // third-party action), the host stands in for it, or - for the
+                // host's own body - every other client may (duplicate ENTERs are
+                // idempotent on the receiver). With two players every case
+                // resolves to "author it", exactly as before.
+                bool mayAuthorEnter = true;
+                if (cellAuth_ && d.author != AUTHOR_NONE) {
+                    u32 cellOwner = authorityFor(gw, haveActual ? ax : out.x,
+                                                 haveActual ? az : out.z);
+                    mayAuthorEnter = cellOwner == localId_ ||
+                        (cellOwner == d.author &&
+                         (localId_ == (u32)CELL_OWNER_HOST ||
+                          d.author == (u32)CELL_OWNER_HOST));
+                }
                 if (streamNpcs_ && isSquad && downish) {
-                    if (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS) {
+                    // Not ours to author: another world authority is (or will
+                    // be) sending it, so only HOLD the self-heal exit below.
+                    if (mayAuthorEnter &&
+                        (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS)) {
                         d.furnPeerTick = now;
                         PendFurnEnter pe;
                         pe.occ = keyOf(out);
@@ -2099,17 +2134,21 @@ void Replicator::ageOutStaleTargets(unsigned long now) {
     // on the join that never gets hidden" bug.
 }
 
-void Replicator::sweepCarries(GameWorld* gw) {
+void Replicator::sweepCarries(GameWorld* gw, u32 leaverId) {
     if (!carrySync_ && !furnSync_) return;
-    // The departed peer's stream will never author its drop/exit edges, so any
-    // driven (non-owned) copy still carrying gets a local ragdoll drop here
-    // (the carried body then returns to the ordinary KO/down channels), and
-    // any driven copy still occupying furniture (protocol 19) gets a local
-    // release the same way.
+    // The departed player's stream will never author its drop/exit edges, so
+    // any driven (non-owned) copy IT authored still carrying gets a local
+    // ragdoll drop here (the carried body then returns to the ordinary KO/down
+    // channels), and any such copy still occupying furniture (protocol 19)
+    // gets a local release the same way. Bodies other players stream keep
+    // their state - their authors are still here to end it. OWNER_ID_ALL (a
+    // join that lost the host) sweeps every driven copy.
+    const bool all = (leaverId == OWNER_ID_ALL);
     for (std::map<Key, Driven>::iterator it = targets_.begin();
          it != targets_.end(); ++it) {
         const Key& k = it->first;
         if (ownHands_.find(k) != ownHands_.end()) continue;
+        if (!all && it->second.author != leaverId) continue;
         Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
         if (!c) continue;
         if (carrySync_) {

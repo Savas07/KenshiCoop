@@ -5,7 +5,7 @@
 // broadcast).
 //
 // Shared hubs: writes ownHands_/tabRank_ (per-tick owned set), midCursor_;
-// reads canonicalOf_ (stamped by the drive TU), censusHands_.
+// reads canonicalOf_ (stamped by the drive TU), census_ (via censusVouches).
 // Must NOT: change any log string - log phrasing is the API consumed by the
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
@@ -14,7 +14,7 @@
 namespace coop {
 
 void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
-    localId_ = ownerId;   // the drive path reads it; see the host-side guard
+    localId_ = ownerId;   // the drive path reads it; see its refusal guard
     // Capture the OWNED squad subset first, then (Stage 4) the nearby world NPCs.
     // The net layer chunks the whole vector into datagram-sized batches, so the
     // count is only bounded by MAX_PUBLISH (a bar holds well under that).
@@ -25,9 +25,9 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // identical on each. Capture the WHOLE squad, then partition it by SQUAD TAB:
     // a Kenshi squad tab is a Platoon, and a member's tab identity is carried in its
     // hand's CONTAINER (hContainer,hContainerSerial). Rank the DISTINCT containers
-    // (sorted -> the same ordering on both machines, save-stable), and own a member
-    // iff its tab's rank is in ownRanks_. So each player owns WHOLE squad tabs (host
-    // tab 0, join tab 1 by default) and the streams are disjoint (Doctrine 8).
+    // (sorted -> the same ordering on every machine, save-stable), and own a member
+    // iff its tab's rank is in ownRanks_. So each player owns WHOLE squad tabs (player
+    // k owns tab k) and the streams are disjoint (Doctrine 8).
     // On a single-tab save only rank 0 exists, so the join owns nothing and the prior
     // one-directional behaviour is preserved exactly. ownHands_ records owned keys
     // for the drive-exclusion guard.
@@ -233,28 +233,29 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         // because those are the peer's window into what we are DOING and it must
         // never depend on where their camera happens to point.
         if (cellAuth_) {
-            float peerAnch[12];
+            float peerAnch[3 * engine::MAX_INTEREST_ANCHORS];
             unsigned int nPeerAnch = peerAnchors(gw, peerAnch);
             unsigned long cNow = nowMs();
             unsigned int kept = 0;
             for (unsigned int i = 0; i < got; ++i) {
                 if (!weAuthor(gw, ownerId, buf[n + i].x, buf[n + i].z)) continue;
-                // The peer's census is the other half of incumbent-holds. weAuthor
+                // A peer's census is the other half of incumbent-holds. weAuthor
                 // asks a question about OUR copy's position, and two copies of one
                 // fighting NPC drift apart far enough to answer it differently on
                 // each side (163 u across a cell boundary, measured), so a cell
-                // verdict alone cannot keep us to one writer. A census row is the
-                // peer stating they author that body - and since the census now
-                // covers everything they author, its silence is meaningful too.
-                // Believing them costs nothing if they are wrong (the body simply
-                // goes unpublished for a beat) where disbelieving them costs two
-                // writers on one Character.
+                // verdict alone cannot keep us to one writer. A census row is its
+                // author stating they author that body - and since a census
+                // covers everything its author authors, its silence is meaningful
+                // too. Believing them costs nothing if they are wrong (the body
+                // simply goes unpublished for a beat) where disbelieving them
+                // costs two writers on one Character.
                 // Only while it is current, and only its PRESENCE is trusted: a
                 // census we have stopped receiving says nothing about who authors
                 // what now, and reading its silence as "they gave this up" would
-                // have us start writing bodies they are still driving.
-                if (censusRecvMs_ != 0 && (cNow - censusRecvMs_) <= 5000 &&
-                    censusHands_.find(keyOf(buf[n + i])) != censusHands_.end())
+                // have us start writing bodies they are still driving. Checked
+                // per sender (censusVouches), so one author's stale rows never
+                // ride on another author's freshness.
+                if (censusVouches(keyOf(buf[n + i]), cNow))
                     continue;
                 // Echo guard (2026-08-08, the dual-drive fix). captureNpcs
                 // returns every local NPC in the bubble, and a MINTED PROXY is
@@ -266,18 +267,19 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 // were both cases where the join had no native body at all
                 // (lifecycle: DISCOVERED reason=census-miss, "no local body").
                 //
-                // Anything the peer is streaming to us right now is, by that
-                // fact, theirs to write - whatever our cell map says. This
-                // subsumes the census hold above with a 20 Hz signal instead of
-                // a 1 Hz one, but does not replace it: the census also speaks
+                // Anything a higher-priority player is streaming to us right now
+                // is, by that fact, theirs to write - whatever our cell map says.
+                // This subsumes the census hold above with a 20 Hz signal instead
+                // of a 1 Hz one, but does not replace it: the census also speaks
                 // for bodies too far out to stream.
                 //
-                // Only the JOIN yields, matching rebuildClaimedCells' host-wins
-                // rule. A symmetric guard would let both sides go quiet at once
+                // Yield only to a LOWER id (the host always wins), matching
+                // rebuildClaimedCells' lowest-id-wins rule and the drive-side
+                // refusal. A symmetric guard would let two sides go quiet at once
                 // on a contested body and then both resume when the streams went
                 // stale, oscillating; with a fixed winner the loop just stops.
-                if (ownerId != (u32)CELL_OWNER_HOST &&
-                    peerStreamFresh(keyOf(buf[n + i]), cNow)) {
+                // Two players: only the join yields, to the host, as before.
+                if (yieldsToStream(keyOf(buf[n + i]), ownerId, cNow)) {
                     ++cellYields_;
                     if (cellYieldLogged_.insert(keyOf(buf[n + i])).second) {
                         const Key yk = keyOf(buf[n + i]);
@@ -867,7 +869,7 @@ void Replicator::notePlatoons(GameWorld* gw, const EntityState* sts,
     if (!sts) return;
     unsigned long now = nowMs();
     if (platoonT0_ == 0) platoonT0_ = now;
-    float anch[12];
+    float anch[3 * engine::MAX_INTEREST_ANCHORS];
     unsigned int nAnch = engine::interestAnchors(gw, anch);
     for (unsigned int i = 0; i < n; ++i) {
         std::pair<unsigned int, unsigned int> p(sts[i].hContainer,
@@ -946,7 +948,7 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // and now lives on the stream instead (see the captureNpcs gate); the history
     // of trying to put it here is in the loop comment, along with the measurement
     // that settled it.
-    float rawAnch[12];
+    float rawAnch[3 * engine::MAX_INTEREST_ANCHORS];
     unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch);
     // A proxy's own hand is one WE minted and no other client has ever heard of,
     // so censusing it under that hand vouches for nothing: the peer looks for the
@@ -1004,8 +1006,7 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         // Census is meant to be a superset of what we stream, so anything
         // dropped here must also be dropped there - it is, by the guard in
         // publishOwned, which is keyed on the same question about the same hand.
-        if (cellAuth_ && ownerId != (u32)CELL_OWNER_HOST &&
-            peerStreamFresh(k, nowMs())) {
+        if (cellAuth_ && yieldsToStream(k, ownerId, nowMs())) {
             ++nNotMine;
             ++cellYields_;
             continue;
@@ -1041,7 +1042,7 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         // Attention, for MEMBERSHIP (not for the distance tiering above): the
         // mid band exists purely to spend bandwidth driving far bodies, so it is
         // the clearest case of work worth skipping when the peer is not watching.
-        float peerAnch[12];
+        float peerAnch[3 * engine::MAX_INTEREST_ANCHORS];
         unsigned int nPeerAnch = peerAnchors(gw, peerAnch);
         midBand_.clear();
         for (unsigned int i = 0; i < n; ++i) {
@@ -1231,16 +1232,22 @@ void Replicator::syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 owner
         net.queueCamHint(p);
     }
 
-    // Drain received hints (latest wins) into peerCam_ + staleness stamp, and
-    // publish a FRESH hint to the engine's interest layer. A stale hint
-    // (silent peer > 3 s: alt-tabbed, loading, disconnecting) drops out of the
-    // anchor set rather than pinning interest forever.
+    // Drain received hints (latest wins PER SENDER) into peerCams_ + staleness
+    // stamps, and publish every FRESH hint to the engine's interest layer. A
+    // stale hint (silent player > 3 s: alt-tabbed, loading, disconnecting)
+    // drops out of the anchor set rather than pinning interest forever, and one
+    // player's hint never overwrites another's.
     std::deque<InboundCamHint> got;
     in.drainCamHints(got);
     if (!got.empty()) {
+        for (std::deque<InboundCamHint>::const_iterator it = got.begin();
+             it != got.end(); ++it) {
+            if (it->ownerId == ownerId) continue;   // our own hint, echoed back
+            CamHint& h = peerCams_[it->ownerId];
+            h.x = it->pkt.x; h.y = it->pkt.y; h.z = it->pkt.z;
+            h.ms = now;
+        }
         const CamHintPacket& p = got.back().pkt;
-        peerCam_[0] = p.x; peerCam_[1] = p.y; peerCam_[2] = p.z;
-        peerCamMs_ = now;
         static unsigned long logTick = 0; // main-thread only
         if (logTick == 0 || (now - logTick) >= 5000) {
             logTick = now;
@@ -1250,8 +1257,17 @@ void Replicator::syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 owner
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
-    bool fresh = (peerCamMs_ != 0) && (now - peerCamMs_) <= 3000;
-    engine::setPeerCamHint(fresh, peerCam_[0], peerCam_[1], peerCam_[2]);
+    float fresh[3 * (MAX_PLAYERS - 1)];
+    unsigned int nFresh = 0;
+    for (std::map<u32, CamHint>::const_iterator it = peerCams_.begin();
+         it != peerCams_.end() && nFresh < MAX_PLAYERS - 1; ++it) {
+        if (it->second.ms == 0 || (now - it->second.ms) > 3000) continue;
+        fresh[nFresh * 3 + 0] = it->second.x;
+        fresh[nFresh * 3 + 1] = it->second.y;
+        fresh[nFresh * 3 + 2] = it->second.z;
+        ++nFresh;
+    }
+    engine::setPeerCamHints(fresh, nFresh);
 }
 
 

@@ -25,7 +25,17 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 55;
+const u16 PROTOCOL_VERSION = 56;
+
+// Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
+// 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
+// join-authored state to the other joins. A player's id is also its squad rank
+// (squad tab index): player k drives squad tab k.
+const u32 MAX_PLAYERS = 8;
+
+// Per-peer target masks for host -> join sends (bit k = player id k).
+const u32 PEER_MASK_ALL = 0xFFFFFFFFu;
+inline u32 peerBit(u32 id) { return id < 32u ? (1u << id) : 0u; }
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -76,7 +86,8 @@ enum PacketType {
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
-    PKT_FIXTURE          = 48 // RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_PEER_STATE       = 49 // RELIABLE roster edge: another join arrived/left (host -> joins, protocol 56); PeerStatePacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -124,8 +135,8 @@ enum EventType {
     EVT_SQUAD_MOVE = 11
 };
 
-// Sentinel ownerId meaning "all remote peers" (used on local disconnect to sweep
-// every driven body at once).
+// Sentinel ownerId meaning "all remote peers" (a join's lost host connection
+// sweeps every driven body at once; a host-side leave carries the leaver's id).
 const u32 OWNER_ID_ALL = 0xFFFFFFFFu;
 
 #pragma pack(push, 1)
@@ -133,14 +144,28 @@ const u32 OWNER_ID_ALL = 0xFFFFFFFFu;
 struct HelloPacket {
     u8  type;    // = PKT_HELLO
     u16 version; // = PROTOCOL_VERSION
-    u8  nameLen; // bytes of name following this struct (0..63)
-    // char name[nameLen] follows
+    u8  nameLen; // bytes of identity token following this struct (0..63)
+    // char name[nameLen] follows: the player's stable identity (steamid64 as
+    // decimal when Steam is up). The host reserves the assigned playerId for
+    // that token for the rest of its session, so a reconnecting player gets
+    // the same id - and therefore the same squad tab - back.
 };
 
 struct WelcomePacket {
     u8  type;     // = PKT_WELCOME
     u16 version;  // host's PROTOCOL_VERSION (client re-checks)
-    u32 playerId; // id the host assigned to this client
+    u32 playerId; // id the host assigned to this client (= its squad rank)
+};
+
+// Roster edge (protocol 56, host -> joins). Joins only hear the host's
+// connection, so the host tells every join when ANOTHER join is welcomed
+// (present=1; the newcomer also gets one per join already present) or leaves
+// (present=0). Receivers re-announce their own state to a newcomer and purge
+// a leaver's proxies, exactly as they do for the host's own edges.
+struct PeerStatePacket {
+    u8  type;    // = PKT_PEER_STATE
+    u32 peerId;  // the join that arrived / left
+    u8  present; // 1 = arrived, 0 = left
 };
 
 // A reliable one-shot transition. 'subject' is the hand the event happened TO; the

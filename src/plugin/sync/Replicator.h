@@ -28,12 +28,18 @@
 #include "../net/NetLink.h"
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "SyncTuning.h"  // Phase 6d: owned per-channel send-cadence tunables
+#include "ChangeGate.h"  // protocol 56: sync::SenderSeq (per-sender row seq guard)
 
 class GameWorld;
 class Character;
 class RootObject;
 
 namespace coop {
+
+// "No known author" for a stream-keyed record (a Driven placeholder an event
+// created before any sample, a spawn REQ with no recorded target). Never a
+// player id: ids are 0..MAX_PLAYERS-1.
+const u32 AUTHOR_NONE = 0xFFFFFFFFu;
 
 class Replicator {
 public:
@@ -76,12 +82,27 @@ public:
     void setStarveHold(unsigned long ms) { starveHoldMs_ = ms; }
 
     // Bidirectional presence: the SQUAD-TAB ranks (distinct hand-containers, sorted)
-    // this client OWNS (controls locally + streams). The peer owns the other tabs and
-    // we drive those from its stream. Host defaults to {0}, join to {1}. Runs on BOTH
-    // clients now, so each streams a disjoint set of squad tabs from the one shared
-    // squad. On a single-tab save only rank 0 exists -> the join owns nothing and the
-    // prior one-directional behaviour is preserved.
-    void setOwnRanks(const std::set<unsigned int>& r) { ownRanks_ = r; }
+    // this client OWNS (controls locally + streams). Every other tab is owned by the
+    // player whose id equals its rank (player k drives squad tab k) and we drive it
+    // from that player's stream. Plugin installs {localId} once the id is known
+    // (host {0}). Runs on ALL clients, so each streams a disjoint set of squad tabs
+    // from the one shared squad. On a single-tab save only rank 0 exists -> the
+    // joins own nothing and the one-directional behaviour is preserved.
+    // A CHANGED rank set (the join learns its id from WELCOME after a default was
+    // installed) re-decides the save's own tabs on the next publish; verdicts on
+    // tabs appended mid-session are pin-derived and survive.
+    void setOwnRanks(const std::set<unsigned int>& r) {
+        if (r == ownRanks_) return;
+        ownRanks_ = r;
+        for (std::map<std::pair<u32, u32>, TabOwner>::iterator it = tabOwned_.begin();
+             it != tabOwned_.end(); ) {
+            if (it->second.seeded) tabOwned_.erase(it++); else ++it;
+        }
+    }
+
+    // The session role, installed by Plugin (true on the host). Used to be derived
+    // from ownRanks_ containing 0, which an env rank override could mislabel.
+    void setHostRole(bool isHost) { hostRole_ = isHost; }
 
     // Cross-owner trade veto classifier (engine InvOwnerClassFn). Given a
     // save-stable owner hand (readObjectHand layout [type,container,
@@ -142,10 +163,12 @@ public:
     // native on each machine's local pair. KENSHICOOP_CARRY_SYNC=0 disables.
     void setCarrySync(bool v) { carrySync_ = v; }
 
-    // Peer-left sweep (carried-body sync): any driven (peer-owned) copy still
-    // carrying a body after its owner disconnected gets a local drop, so the
-    // carried body is released back to the ordinary KO/down channels.
-    void sweepCarries(GameWorld* gw);
+    // Peer-left sweep (carried-body sync): any driven copy still carrying a body
+    // after its AUTHOR disconnected gets a local drop, so the carried body is
+    // released back to the ordinary KO/down channels. leaverId scopes the sweep
+    // to bodies whose stream that player authored; OWNER_ID_ALL (a join that
+    // lost the host) sweeps every driven copy.
+    void sweepCarries(GameWorld* gw, u32 leaverId);
 
     // Furniture occupancy sync (protocol 19, default ON): reliable enter/exit
     // edges + self-healing BODY_IN_BED/BODY_IN_CAGE state, executed engine-
@@ -660,15 +683,33 @@ public:
     void resetSession();
 
     // Peer-leave cleanup (Phase 2 crash hardening): called from the transport
-    // leave edge when the OTHER player disconnects mid-session (distinct from a
+    // leave edge when a remote player disconnects mid-session (distinct from a
     // world-reload). resetSession() clears proxyByKey_ but never DESTROYS the
     // minted bodies, and the leave handler previously did neither - so after a
     // peer drop the survivor kept its minted proxies standing AND kept driving
-    // them off stale maps (the "join crash -> host follow-on crash" chain). This
-    // despawns every minted proxy body FIRST (SEH-guarded), then resetSession()
-    // to clear the maps that referenced them. Safe if reconnect follows: the new
-    // session re-censuses and re-mints from scratch.
-    void clearPeerReplicationState(GameWorld* gw);
+    // them off stale maps (the "join crash -> host follow-on crash" chain).
+    //
+    // leaverId == OWNER_ID_ALL (a join that lost the host - every remote player
+    // is gone): despawns every minted proxy body FIRST (SEH-guarded), then
+    // resetSession() to clear the maps that referenced them. Safe if reconnect
+    // follows: the new session re-censuses and re-mints from scratch.
+    //
+    // Any other id purges ONLY what that player authored - its minted proxies,
+    // the drive targets its stream wrote, its world-item proxies, census, camera
+    // hint, cell claims, pins, tab verdicts and clock - remaps the cells it last
+    // owned to the host, and forgets its channel state (forgetPeerChannels). The
+    // other players' state is untouched.
+    void clearPeerReplicationState(GameWorld* gw, u32 leaverId);
+
+    // ---- N-player channel state (ReplicatorChannels.cpp, protocol 56) ----
+    // Drop everything the CHANNELS keep per remote owner for a departed join:
+    // its speed vote, its time-sync lag/seq, its money-pool ack, its per-sender
+    // stamps in every row seq guard (faction/door/bdoor/prod/research/deed),
+    // its fixture pairings, and the STATE seq of the buildings it placed (the
+    // minted buildings themselves stay in the world). OWNER_ID_ALL forgets every
+    // owner. Called by clearPeerReplicationState for the leaver and by
+    // resetSession with OWNER_ID_ALL.
+    void forgetPeerChannels(u32 id);
 
     // AFTER engine: sample + apply the interpolated pose for every tracked entity.
     void applyTargets(GameWorld* gw);
@@ -695,19 +736,21 @@ public:
     // positional stream bubble. No-op unless streamNpcs_ and censusRadius_ > 0.
     void publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId);
 
-    // JOIN: drain received censuses into the latest-wins existence set
-    // (censusHands_) consumed by enforceHostAuthority's wide-radius pass.
+    // Drain EVERY received census into its sender's slot of census_ (one
+    // latest-wins existence set per owner) and refresh the merged views
+    // (censusHands_/censusPos_) consumed by enforceHostAuthority's passes.
     // gw is for the per-row ownership check (see the definition): a census row
     // only speaks for a cell the SENDER owns, judged against OUR map.
     void applyNpcCensus(GameWorld* gw, Inbound& in);
 
     // Camera hint channel (protocol 43, camera-anchored interest). SYMMETRIC:
     // each side reads its local camera center (engine::cameraCenter), publishes
-    // it as a local anchor, ships it to the peer at ~1 Hz (PKT_CAM_HINT,
-    // unreliable latest-wins), and drains the peer's into peerCam_/peerCamMs_
-    // for engine::setPeerCamHint. Was join -> host only until the attention
-    // gate: dormancy is a predicate both clients must agree on, so neither
-    // camera can stay private.
+    // it as a local anchor, ships it to the other players at ~1 Hz
+    // (PKT_CAM_HINT, unreliable latest-wins; the host relays join hints), and
+    // drains every remote player's hint into peerCams_ for
+    // engine::setPeerCamHints. Was join -> host only until the attention gate:
+    // dormancy is a predicate every client must agree on, so no camera can
+    // stay private.
     void syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId);
 
     // KENSHICOOP_CENSUS_RADIUS: wide-radius existence culling reach (units);
@@ -816,6 +859,12 @@ private:
         unsigned int walkStallF;     // consecutive frames the ordered body advanced ~nothing
         bool         suppressed;     // NPC pulled off the local AI update list
         unsigned long lastSeenMs;    // last ingest for this hand (stale-entry pruning)
+        // N-player (protocol 56): WHO streams this hand - the ownerId of the newest
+        // ingested sample (AUTHOR_NONE until one arrives: an event placeholder).
+        // Answers "whose stream drives this body" for the yield/refusal total
+        // order, owner-scoped leave purges and spawn REQ targeting.
+        u32           author;
+        unsigned long authorSinceMs; // when the current author's first sample landed
         // Stage 5 rest-pose reproduction.
         u16          issuedTask;     // task we last committed (TASK_NONE = none)
         bool         taskApplied;    // a fixture-resolved pose is currently held
@@ -944,7 +993,7 @@ private:
         unsigned long midSeenMs;
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0), walkHalted(false), walkStallF(0),
-                   suppressed(false), lastSeenMs(0),
+                   suppressed(false), lastSeenMs(0), author(AUTHOR_NONE), authorSinceMs(0),
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
                    taskTick(0), taskRetries(0), fixtureXlateLogged(false),
                    taskNoneTick(0), detached(false), downApplied(false),
@@ -1080,26 +1129,28 @@ private:
     std::map<Key, AuthCount>  authCount_;
     unsigned long             authSuppresses_; // churn counters (split_interest metric)
     unsigned long             authRestores_;
-    // NPC existence census (protocol 36): the host's 1 Hz wide-radius hand
-    // list. On the join, censusHands_ is the latest received existence set and
-    // censusRecvMs_ its arrival time - enforceHostAuthority culls local NPCs
-    // OUTSIDE the stream bubble that are absent from it (with the same
-    // hysteresis), but only while the census is FRESH (staleness disables
-    // wide culling rather than mass-suppressing on a silent host).
+    // NPC existence census (protocol 36): each author's 1 Hz wide-radius hand
+    // list. census_ (below, next to CensusPos) keeps one latest-wins set per
+    // sender; censusHands_ is the MERGED view (every sender's latest rows) and
+    // censusRecvMs_ the newest arrival from anyone - enforceHostAuthority culls
+    // local NPCs OUTSIDE the stream bubble that no FRESH census lists (with the
+    // same hysteresis), but only while some census is FRESH (staleness disables
+    // wide culling rather than mass-suppressing on a silent author).
     float                     censusRadius_;  // 0 = census disabled
     unsigned long             censusSendMs_;  // host: last census publish
-    unsigned long             censusRecvMs_;  // join: last census arrival
-    // Camera hint channel (protocol 43): join sends its camera center at
-    // ~1 Hz; the host keeps the latest hint + arrival stamp (stale hints are
-    // dropped from the anchor set rather than pinning interest forever).
-    unsigned long             camHintSendMs_; // join: last hint send
-    float                     peerCam_[3];    // host: latest peer camera center
-    unsigned long             peerCamMs_;     // host: its arrival time (0 = none)
-    std::set<Key>             censusHands_;   // join: latest existence set
-    // Whose claim censusHands_ is. Under presence authority a census only
-    // speaks for the cells its sender owns, so enforcement has to know who
-    // sent it. Defaults to the host, which is who it always was.
-    u32                       censusOwner_;
+    unsigned long             censusRecvMs_;  // newest census arrival (any owner)
+    // Camera hint channel (protocol 43): every player sends its camera center at
+    // ~1 Hz; we keep the latest hint + arrival stamp PER remote player (stale
+    // hints are dropped from the anchor set rather than pinning interest
+    // forever, and one player's hint never overwrites another's).
+    unsigned long             camHintSendMs_; // last hint send
+    struct CamHint {
+        float x, y, z;
+        unsigned long ms;     // arrival time
+        CamHint() : x(0), y(0), z(0), ms(0) {}
+    };
+    std::map<u32, CamHint>    peerCams_;      // remote ownerId -> latest hint
+    std::set<Key>             censusHands_;   // merged existence set (all senders)
     unsigned long             censusCulls_;   // join: wide-radius suppress count
     // Rows dropped because OUR map does not put the sender's cell in the
     // sender's hands. A steady nonzero here is the two maps disagreeing, which
@@ -1112,14 +1163,14 @@ private:
     unsigned long             cellYields_;
     std::set<Key>             cellYieldLogged_;   // one [cell] yield line per hand
     // Our own owner id, latched by publishOwned (which is handed it every frame
-    // and runs before applyTargets in the tick). The drive path needs to know
-    // whether it is the host to apply the host half of the tie-break, and has no
-    // NetLink of its own to ask. 0xFFFFFFFF until the first publish, which keeps
-    // the guard inert rather than letting a join mistake itself for the host.
+    // and runs before applyTargets in the tick). The drive path needs it for its
+    // half of the tie-break (refusing samples from lower-priority authors for
+    // cells we author), and has no NetLink of its own to ask. 0xFFFFFFFF until
+    // the first publish, which keeps the guard inert.
     u32                       localId_;
-    // Peer samples the host declined because the body stands in a cell the host
-    // authors - the host half of the tie-break. Pairs with cellYields_, which
-    // counts the join half.
+    // Samples declined because the body stands in a cell WE author and the
+    // sample's author ranks below us (higher id) - the refusing half of the
+    // tie-break. Pairs with cellYields_, which counts the yielding half.
     unsigned long             hostDriveRefusals_;
     // How long a peer sample keeps a hand "theirs" for the echo guard. Two net
     // ticks (50 ms each) plus slack: long enough that a single dropped snapshot
@@ -1167,19 +1218,37 @@ private:
     // enforceHostAuthority parks a local copy that diverged past
     // censusParkDist_ back onto the host's spot (0 disables).
     struct CensusPos { float x, y, z; };
-    std::map<Key, CensusPos>  censusPos_;     // join: host pos per census row
+    // MERGED census positions (every sender's latest rows; the lowest owner id
+    // wins a hand two senders both list). Rebuilt by rebuildCensusUnion.
+    std::map<Key, CensusPos>  censusPos_;     // census author's pos per row
     std::map<Key, CensusPos>  proxyDriftPrev_; // join: census pos at the last [proxy]
                                               //   drift sweep (owner-motion estimate)
     float                     censusParkDist_;
     unsigned long             censusParks_;   // join: divergence-park count
     std::map<Key, unsigned long> parkMs_;     // join: per-key park cooldown
-    // The census rows from the PREVIOUS packet, and when they arrived. Two
-    // consecutive rows are the only measure of the host copy's pace the join
-    // has for a body outside the stream bubble - the census carries position
-    // and nothing else - and the walk-converge band needs it to pick a speed
-    // that out-paces what it is chasing.
-    std::map<Key, CensusPos>  censusPrev_;
-    unsigned long             censusPrevMs_;
+    // One sender's census (N-player, protocol 56). hands/pos are its latest
+    // packet, prev/prevMs the rows of the PREVIOUS packet and when they
+    // arrived: two consecutive rows from the SAME author are the only measure of
+    // its copy's pace for a body outside the stream bubble - the census carries
+    // position and nothing else - and the walk-converge band needs it to pick a
+    // speed that out-paces what it is chasing. Keeping the pairs per sender is
+    // what stops two authors' rows being differenced against each other.
+    struct PeerCensus {
+        std::set<Key>            hands;
+        std::map<Key, CensusPos> pos;
+        std::map<Key, CensusPos> prev;
+        unsigned long            recvMs;
+        unsigned long            prevMs;
+        PeerCensus() : recvMs(0), prevMs(0) {}
+    };
+    std::map<u32, PeerCensus> census_;        // sender ownerId -> its census
+    std::map<Key, u32>        censusOwnerOf_; // merged view: which sender lists a hand
+    // Rebuild censusHands_/censusPos_/censusOwnerOf_ from census_.
+    void rebuildCensusUnion();
+    // Does any CURRENT census list this hand? With one sender this is exactly
+    // the legacy "census fresh && hand in censusHands_".
+    bool censusVouches(const Key& k, unsigned long now) const;
+    enum { CENSUS_FRESH_MS = 5000 };
     // Per-key state for the two ways a census row can correct its local body:
     // the walk that converges it, and the teleport of last resort.
     //
@@ -1216,8 +1285,8 @@ private:
     // attention: a body no interest anchor is within attentionRadius_ of is
     // DORMANT, and neither side speaks for it - the host omits it from the
     // census, the join never suppresses it for being census-absent. Anchors
-    // are the same four interestCenters both clients compute (both tab
-    // leaders, own camera, peer camera hint), so the two sides evaluate the
+    // are the same interestCenters every client computes (every tab leader, own
+    // camera, every remote camera hint), so the sides evaluate the
     // predicate on near-identical inputs. attnObs_ carries the per-hand
     // hysteresis bit; both roles use it, pruned against each tick's
     // enumeration.
@@ -1239,15 +1308,21 @@ private:
     // independently on each side. A discrete label has no such window, and a
     // published claim needs a small enumerable token to key a map on anyway.
     bool cellAuth_;   // off => authorityFor is always the host (fail-open)
-    // Co-location collapse: while the squads stand together, hand every cell to
-    // the host. See claimsCoLocated() for why the split stops paying when both
-    // clients already have the same bodies loaded.
+    // Co-location collapse: while squads stand together, hand their cells to
+    // the lowest-id player among them (the host when it is there). See
+    // resolveCollapse() for why the split stops paying when the clients already
+    // have the same bodies loaded.
     bool cellCollapse_;
     // The resolved verdict, recomputed by rebuildClaimedCells whenever a claim
     // moves. Stored rather than derived per query because authorityFor is on the
     // hot path and, more importantly, because every reader must see the SAME
-    // verdict within a tick.
+    // verdict within a tick. collapsed_ = the TOTAL collapse (every claiming
+    // player collapses onto the host - the two-player verdict, under which the
+    // host authors every cell); collapseTo_ = the per-player partial collapse
+    // (owner -> the lower id it stands together with) for the N-player cases the
+    // total verdict cannot express.
     bool collapsed_;
+    std::map<u32, u32> collapseTo_;
     struct CellClaim {
         int          cx, cz;
         u32          seq;
@@ -1257,8 +1332,9 @@ private:
     // cell supersedes its own claim, which is why there is no release message.
     std::map<std::pair<u32, u32>, CellClaim> claimSlots_;
     // Derived from claimSlots_ every time one changes: cell -> owning player.
-    // Host wins a contested cell (two tabs in one cell is the players standing
-    // together, where host-wins is the right answer anyway).
+    // The LOWEST player id wins a contested cell (two tabs in one cell is the
+    // players standing together; with the host there that is host-wins, which is
+    // the right answer anyway). Explicit min, not map iteration order.
     std::map<std::pair<int, int>, u32> claimedCells_;
     // Cells that have EVER been claimed, and by whom last. A claim is a tab's
     // current position, so a tab walking out of a town drops that cell out of
@@ -1331,7 +1407,9 @@ private:
     // ages slowly, since zones are 4608 u across and the jump check bounds how
     // far an anchor can drift before we ask again.
     unsigned long             attnVetoMs_;     // last query stamp (0 = never)
-    float                     attnVetoRaw_[12];// anchors the verdict was for
+    // Sized for engine::MAX_INTEREST_ANCHORS (= 2 * MAX_PLAYERS: every tab
+    // leader plus every camera) x,y,z triples; the mask holds one bit per anchor.
+    float                     attnVetoRaw_[3 * 2 * MAX_PLAYERS];
     unsigned int              attnVetoRawN_;
     unsigned int              attnVetoMask_;   // bit a = raw anchor a survived
     bool                      auditRows_;     // travel_parity worldstate rows
@@ -1446,6 +1524,10 @@ private:
     struct WorldTrack {
         u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen;
         char stringID[48]; u32 itemType; u16 quantity; u16 quality; bool baseline;
+        // Protocol 56: the real item was already destroyed for a first claim, so
+        // a later claim on the same netId (a second picker) loses: it must not
+        // erase the track before the cull reaches the remaining peers.
+        bool claimed;
     };
     // `hand` is the proxy's engine identity, captured (and round-trip verified) at
     // mint. The engine owns the object's lifetime: when the block it stands in
@@ -1632,6 +1714,13 @@ private:
         bool          srcPeer;   // we latched src (it is peer-authored)
         bool          dstPeer;
         unsigned long sentMs;
+        // Protocol 56: whose verdict counts for each peer end - the owner of
+        // that container (InvRecv::ownerId), OWNER_ID_ALL when unknown (any ack
+        // settles it, the two-player behaviour). A bystander's ack is ignored.
+        u32           srcAcker;
+        u32           dstAcker;
+        bool          srcSettled; // that end's owner has answered
+        bool          dstSettled;
     };
     std::map<u32, XferOut>                    xferOut_;
     // Undo one intent's contribution to a peer end's reconcile-suppression
@@ -1943,6 +2032,13 @@ private:
     u32  poolSeq_;
     u32  poolAcked_;
     std::deque<PoolDelta> poolPending_;
+    // Protocol 56, HOST: per-join highest delta seq folded into the pool. Each
+    // join numbers its deltas from 1, so one shared ack would drop a second
+    // join's deltas as "already folded" (free purchases) and pop its pending
+    // deltas on another join's ack. Each join gets its own ack in a targeted
+    // PKT_MONEY; poolAcked_ stays the last folded seq (log value, and the
+    // join's own received ack on a join).
+    std::map<u32, u32> poolAckedBy_;
     bool moneySync_;
     // Protocol 24 faction-relation sync state, per faction sid.
     // known      = our current baseline (seeded on first sight, updated on every
@@ -1953,8 +2049,8 @@ private:
     // seqSeen    = newest per-sender seq applied (stale-row guard).
     struct FacRow {
         float known; float lastSendVal; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
-        FacRow() : known(0), lastSendVal(0), lastSendMs(0), seqSeen(0), seeded(false) {}
+        sync::SenderSeq seqSeen; bool seeded;
+        FacRow() : known(0), lastSendVal(0), lastSendMs(0), seeded(false) {}
     };
     std::map<std::string, FacRow> facRows_;
     u32           facSeqOut_;
@@ -1966,9 +2062,9 @@ private:
     // seqSeen = stale-row guard).
     struct DoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
+        sync::SenderSeq seqSeen; bool seeded;
         DoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                    seqSeen(0), seeded(false) {}
+                    seeded(false) {}
     };
     std::map<Key, DoorRow> doorRows_;
     u32           doorSeqOut_;
@@ -2005,7 +2101,15 @@ private:
         PeerBuild() : minted(0), seqSeen(0), removed(false) { memset(localHand, 0, sizeof(localHand)); }
     };
     std::map<Key, OwnBuild>  ownBuilds_;
-    std::map<Key, PeerBuild> peerBuilds_;
+    // Keyed (placer id, placer key): runtime hands are allocated per client, so
+    // two joins' placements can carry the same 5-tuple. Rows whose wire packet
+    // names no placer (prod, inventory, build doors, poses) resolve through
+    // findPeerBuild, which prefers a given placer and otherwise takes the first
+    // placer that has the key.
+    typedef std::pair<u32, Key> PeerBuildKey;
+    std::map<PeerBuildKey, PeerBuild> peerBuilds_;
+    PeerBuild*       findPeerBuild(const Key& wire, u32 preferPlacer);
+    const PeerBuild* findPeerBuild(const Key& wire, u32 preferPlacer) const;
     // Reverse translation (protocol 28): local minted building hand -> the
     // placer's wire key. Lets the door sampler express a MINTED proxy's door
     // in the placer's key space, and the protocol-26 filter recognize placed
@@ -2023,7 +2127,8 @@ private:
     //   localHandForBuildKey - APPLY: wire key -> the hand that site has HERE,
     //     whether we placed it (ownBuilds_) or minted it (peerBuilds_).
     bool buildKeyForLocalHand(const Key& local, Key& outWire) const;
-    bool localHandForBuildKey(const Key& wire, unsigned int out[5]) const;
+    bool localHandForBuildKey(const Key& wire, unsigned int out[5],
+                              u32 preferPlacer = 0) const;
     u32           buildSeqOut_;
     unsigned long buildSampleMs_;
     bool          buildSync_;
@@ -2031,9 +2136,9 @@ private:
     // index) - the protocol-26 DoorRow shape on the translated identity.
     struct BdoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
+        sync::SenderSeq seqSeen; bool seeded;
         BdoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                     seqSeen(0), seeded(false) {}
+                     seeded(false) {}
     };
     std::map<std::pair<Key, int>, BdoorRow> bdoorRows_;
     u32           bdoorSeqOut_;
@@ -2051,10 +2156,10 @@ private:
         int qOut; int qIn0; int qIn1;          // quantized amounts (x100)
         int qGrown; int qDied; int qGrowStart; int qHarv;
         unsigned long lastSendMs;
-        u32 seqSeen; bool sent;
+        sync::SenderSeq seqSeen; bool sent;
         ProdRow() : knownPower(-2), knownState(-2), qOut(-200), qIn0(-200),
                     qIn1(-200), qGrown(-200), qDied(-200), qGrowStart(-200),
-                    qHarv(-200), lastSendMs(0), seqSeen(0), sent(false) {}
+                    qHarv(-200), lastSendMs(0), sent(false) {}
     };
     std::map<std::pair<int, Key>, ProdRow> prodRows_;
     u32           prodSeqOut_;
@@ -2067,10 +2172,10 @@ private:
     // stop re-applying.
     struct ResearchRow {
         unsigned long lastSendMs;
-        u32  seqSeen;
+        sync::SenderSeq seqSeen;
         bool sent;
         bool applied;
-        ResearchRow() : lastSendMs(0), seqSeen(0), sent(false), applied(false) {}
+        ResearchRow() : lastSendMs(0), sent(false), applied(false) {}
     };
     std::map<std::string, ResearchRow> researchRows_;
     u32           researchSeqOut_;
@@ -2089,11 +2194,11 @@ private:
     // zero-initialized, and a garbage latch flag cost a debugging session.
     struct DeedRow {
         unsigned long lastSendMs;
-        u32  seqSeen;
+        sync::SenderSeq seqSeen;
         bool sent;
         bool applied;
         int  knownOwned;
-        DeedRow() : lastSendMs(0), seqSeen(0), sent(false), applied(false),
+        DeedRow() : lastSendMs(0), sent(false), applied(false),
                     knownOwned(-1) {}
     };
     std::map<Key, DeedRow> deedRows_;
@@ -2126,13 +2231,19 @@ private:
         }
     };
     std::map<Key, FixOut>     fixtureOut_;
-    std::map<Key, FixtureRow> fixtureMap_;
+    // Keyed (announcing sender, sender's hand): every client instantiates its
+    // own fixture hands, so each sender is its own key space.
+    std::map<std::pair<u32, Key>, FixtureRow> fixtureMap_;
     u32           fixtureSeqOut_;
     unsigned long fixtureSampleMs_;
     bool          fixtureSync_;
     // Translate a peer fixture key to the local hand for the same object.
     // False when we have no pairing (yet) - the caller keeps the raw hand.
-    bool localHandForFixtureKey(const Key& wire, unsigned int out[5]) const;
+    // preferSender = the client whose hand space `wire` is in (the snapshot's
+    // InvRecv::ownerId); OWNER_ID_ALL = unknown, first sender with a resolved
+    // pairing wins (ids ascending, so the host's pairing first).
+    bool localHandForFixtureKey(const Key& wire, unsigned int out[5],
+                                u32 preferSender = OWNER_ID_ALL) const;
     // Release the taskBad park on driven bodies after a new pairing lands, so a
     // pose that failed while the fixture was unpaired gets one more chance.
     void unparkForNewFixture();
@@ -2142,23 +2253,42 @@ private:
     // where using the key verbatim reads and writes nothing. Keys WE author are
     // already local and are never translated, so an unlucky collision between
     // our hand for one fixture and the peer's for another cannot bite.
-    void handForContainerKey(const Key& k, unsigned int out[5]) const {
+    void handForContainerKey(const Key& k, unsigned int out[5],
+                             u32 sender = OWNER_ID_ALL) const {
         if (ownedContainers_.count(k) == 0 && ownHands_.count(k) == 0 &&
-            localHandForFixtureKey(k, out))
+            localHandForFixtureKey(k, out, sender))
             return;
         out[0] = k.t; out[1] = k.c; out[2] = k.cs; out[3] = k.i; out[4] = k.s;
+    }
+    // Protocol 56: which player authors a container we do NOT author - the
+    // sender of its latest snapshot (InvRecv::ownerId). OWNER_ID_ALL = unknown
+    // (no snapshot yet). Used to pick the fixture hand space and the expected
+    // acker of a cross-owner transfer.
+    u32 peerContainerOwner(const Key& k) const {
+        std::map<Key, InvRecv>::const_iterator it = invRecv_.find(k);
+        return (it != invRecv_.end()) ? it->second.ownerId : OWNER_ID_ALL;
+    }
+    // The player who authors container `k` from THIS client's view: localId
+    // for our own (squad hands, registered and host-censused containers), the
+    // snapshot sender for a peer's, OWNER_ID_ALL when unknown.
+    u32 containerAuthor(const Key& k, u32 localId) const {
+        if (ownedContainers_.count(k) != 0 || ownHands_.count(k) != 0 ||
+            censusContainers_.count(k) != 0)
+            return localId;
+        return peerContainerOwner(k);
     }
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the
     // tab-rank partition. pinOwned_ = hands WE authored (our recruits, our
     // squad moves): publishOwned streams them regardless of which tab rank
-    // their container maps to. pinPeer_ = hands the PEER authored (learned
-    // from EVT_RECRUIT / EVT_SQUAD_MOVE): never publish them even if a local
-    // census would rank them into a tab we own. This is how an appended
-    // (mid-session) tab inherits its authoring side's ownership.
+    // their container maps to. pinPeer_ = hands ANOTHER player authored
+    // (learned from EVT_RECRUIT / EVT_SQUAD_MOVE) -> that player's id: never
+    // publish them even if a local census would rank them into a tab we own.
+    // This is how an appended (mid-session) tab inherits its authoring side's
+    // ownership, and the id is what an owner-scoped leave purges by.
     std::set<Key> pinOwned_;
-    std::set<Key> pinPeer_;
+    std::map<Key, u32> pinPeer_;
     // Roster edges WE caused. insertPeerMember re-containers a peer's body into
     // our squad so we can drive it, and the engine cannot tell that apart from
     // the user dragging a member between tabs - so publishSquadMoves echoed the
@@ -2191,14 +2321,22 @@ private:
     // Per-TAB ownership verdict, keyed on the container hand and decided ONCE
     // when the tab is first seen. The rank latch above stops ranks reshuffling,
     // but ownership was still read as "is my rank in ownRanks_", and ownRanks_
-    // only ever holds 0 (host) or 1 (join) - so a tab appended mid-session got
+    // only ever holds our own rank - so a tab appended mid-session got
     // rank 2+ and belonged to NOBODY. Measured 2026-08-03: the join latched
     // rank 2 and rank 3, published neither, and was left with no controllable
     // character. The per-hand pins were supposed to cover this ("an appended tab
     // inherits its authoring side's ownership"), but a pin is per HAND and an
     // EVT_SQUAD_MOVE exit CLEARS it - after which the body fell back to the
     // rank rule and was orphaned. A verdict on the CONTAINER outlives the pins.
-    std::map<std::pair<u32, u32>, bool> tabOwned_;
+    // owner = the player who drives the tab (seeded tab rank r -> player r;
+    // appended tab -> its pin author, else the host); mine = owner is us.
+    struct TabOwner {
+        u32  owner;
+        bool mine;
+        bool seeded;   // decided by the rank rule (a save tab), not by pins
+        TabOwner() : owner(0), mine(false), seeded(false) {}
+    };
+    std::map<std::pair<u32, u32>, TabOwner> tabOwned_;
     // Number of tabs present at session-start seeding, i.e. the length of the
     // rank prefix that means the same thing on both clients. Ranks past it are
     // assigned in local first-seen order and DIVERGE (measured: host rank 2 =
@@ -2212,40 +2350,51 @@ private:
     unsigned int tabRankFor(const std::pair<u32, u32>& key,
                             const std::vector<std::pair<u32, u32> >& ctnrs) const;
     // Decide (once per container) who owns each tab in this tick's census.
-    // Session-start tabs use the historical rank rule so the standard two-tab
-    // save behaves exactly as before; a tab that appears LATER is attributed to
-    // whichever side authored the bodies in it, and falls back to the host so
-    // that no tab is ever ownerless.
+    // Session-start tabs use the rank rule (our ranks are ours, rank r belongs
+    // to player r) so the standard two-tab save behaves exactly as before; a
+    // tab that appears LATER is attributed to whichever player authored the
+    // bodies in it, and falls back to the host so that no tab is ever ownerless.
     void decideTabs(const EntityState* raw, unsigned int nSquad,
                     const std::vector<std::pair<u32, u32> >& ctnrs);
     bool ownsTab(const std::pair<u32, u32>& key, unsigned int rank) const;
+    // Who drives this tab: us (localId_) when ownsTab, else the player id the
+    // verdict recorded (rank r -> player r before a verdict exists).
+    u32 tabOwnerOf(const std::pair<u32, u32>& key, unsigned int rank) const;
     // Is this rank the same tab on both clients? Only true inside the seeded
     // prefix (see tabsSeeded_).
     bool rankIsShared(unsigned int rank) const {
         return tabsSeeded_ != 0 && rank < tabsSeeded_;
     }
-    // Replicator carries no role flag - the role IS the ownership partition
-    // Plugin.cpp installs (host {0}, join {1}), so owning rank 0 is being host.
-    bool isHostRole() const {
-        return ownRanks_.empty() || ownRanks_.count(0u) != 0;
-    }
+    // The session role Plugin installed via setHostRole (defaults to host, the
+    // historical answer for an unconfigured partition).
+    bool hostRole_;
+    bool isHostRole() const { return hostRole_; }
     // Shared EVT_RECRUIT / EVT_SQUAD_MOVE receive half: pin the new hand as
-    // peer-authored and re-key our local copy of the old hand onto it in
-    // proxyByKey_ (restoring it first if host-authority had suppressed it).
-    // tag selects the log prefix ("recruit" / "squad").
+    // authored by `author` (the event's sender) and re-key our local copy of the
+    // old hand onto it in proxyByKey_ (restoring it first if host-authority had
+    // suppressed it). tag selects the log prefix ("recruit" / "squad").
     void rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
-                       const char* tag);
+                       const char* tag, u32 author);
     // Phase 1b (cross-game recruit membership): insert the re-keyed body 'c'
     // into THIS client's player squad at the tab named by newK's container, so a
     // recruit/transfer shows in the panel on the PEER too. ownIt selects the
     // ownership pin for the body's ACTUAL local hand: false (default) pins it
-    // PEER-owned so control stays with the author (fresh recruit / move into the
-    // peer's tab); true pins it OWNED so THIS client controls + streams it (a
-    // transfer INTO a tab we own - the control hand-off). Idempotent + tab-aware
-    // (a squad-move re-containers an existing member). Shared by the recruit ok=1
-    // path, the ok=0 post-mint drain, and the control-flip transfer.
+    // to `author` so control stays with the author (fresh recruit / move into
+    // the author's tab); true pins it OWNED so THIS client controls + streams it
+    // (a transfer INTO a tab we own - the control hand-off). Idempotent + tab-
+    // aware (a squad-move re-containers an existing member). Shared by the
+    // recruit ok=1 path, the ok=0 post-mint drain, and the control-flip transfer.
     void insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
-                          const char* tag, bool ownIt = false);
+                          const char* tag, u32 author, bool ownIt = false);
+    // Reliable-event dedupe (N-player relay): (ownerId, eventId) pairs already
+    // applied, a bounded recent window per sender. Ids are per-sender monotonic
+    // but restart with the sender's process, so a window - not a high-water mark.
+    struct EventSeen {
+        std::set<u32>   ids;
+        std::deque<u32> order;   // FIFO for eviction
+    };
+    std::map<u32, EventSeen> eventSeen_;
+    enum { EVENT_SEEN_WINDOW = 1024 };
     // Hard-snap attribution diagnostics (rubber-banding investigation): one
     // throttled [snap] line per applyRaw teleport with everything needed to
     // classify the cause (gap, source speed+velocity, game speed, slew,
@@ -2383,13 +2532,17 @@ private:
     // today's behaviour - the degradation is toward doing what we did before,
     // not toward silence.
     //
-    // Writes up to four centers into out[12]; returns the count.
+    // Writes up to engine::MAX_INTEREST_ANCHORS centers into out (3 floats
+    // each); returns the count. nLeaders = how many of raw's leading entries
+    // are squad-tab leaders (the rest are cameras) - only used to label the
+    // veto log line.
     unsigned int attentionAnchors(GameWorld* gw, const float* raw,
-                                  unsigned int nRaw, float* out);
+                                  unsigned int nRaw, unsigned int nLeaders,
+                                  float* out);
     // Attention gate predicate: is anyone watching (x,y,z)? True if any
     // interest anchor is within attentionRadius_. Anchors come from the
     // caller because they are computed once per tick (engine::interestAnchors
-    // writes up to four centers into a float[12]).
+    // writes up to engine::MAX_INTEREST_ANCHORS centers).
     //
     // Hysteresis is asymmetric and latched per hand in attnObs_: a body
     // becomes observed at attentionRadius_ but stays observed out to
@@ -2412,11 +2565,12 @@ private:
     bool observedIn(std::map<Key, bool>& obs, bool countFlips, const Key& k,
                     const float* anchors, unsigned int nAnchor,
                     float x, float y, float z);
-    // Where the PEER is: one center per squad tab we do NOT own, plus their
-    // camera hint. No zone veto - the veto asks "can I enumerate here", and by
-    // the time this is consulted we have already enumerated the body. Writes up
-    // to four centers into out[12]; returns the count. Zero means we know
-    // nothing about the peer, and every caller must fail OPEN on that.
+    // Where the OTHER players are: every squad-tab leader, plus every fresh
+    // remote camera hint. No zone veto - the veto asks "can I enumerate here",
+    // and by the time this is consulted we have already enumerated the body.
+    // Writes up to engine::MAX_INTEREST_ANCHORS centers (3 floats each) into
+    // out; returns the count. Zero means we know nothing about the others, and
+    // every caller must fail OPEN on that.
     unsigned int peerAnchors(GameWorld* gw, float* out);
 public:
     // Presence authority (protocol 49). Publish a claim for each cell our own
@@ -2446,7 +2600,7 @@ public:
         AUTHSRC_CLAIM  = 1,   // a tab is standing there now
         AUTHSRC_VACATE = 2,   // cellLastOwner_: claimed once, since left
         AUTHSRC_OPEN   = 3,   // never claimed by anyone - fail-open to host
-        AUTHSRC_COLLAPSE = 4, // squads share a cell - the host authors everything
+        AUTHSRC_COLLAPSE = 4, // squads share a cell - the lowest id among them authors
         AUTHSRC_N      = 5
     };
     u32 authoritySrc(GameWorld* gw, float x, float z,
@@ -2456,36 +2610,60 @@ public:
     bool weAuthor(GameWorld* gw, u32 localId, float x, float z) const {
         return authorityFor(gw, x, z) == localId;
     }
-    // Is the PEER currently writing this hand to us? A fresh entry in targets_
-    // is the strongest available statement that they consider the body theirs -
+    // Who is currently writing this hand to us? A fresh entry in targets_ is the
+    // strongest available statement that its author considers the body theirs -
     // stronger than a census row, because it is the 20 Hz channel that actually
-    // drives the body rather than the 1 Hz one that merely lists it.
-    bool peerStreamFresh(const Key& k, unsigned long now) const {
+    // drives the body rather than the 1 Hz one that merely lists it. Returns the
+    // author's id, or AUTHOR_NONE when nobody streamed it within
+    // PEER_STREAM_FRESH_MS.
+    u32 peerStreamAuthor(const Key& k, unsigned long now) const {
         std::map<Key, Driven>::const_iterator it = targets_.find(k);
-        if (it == targets_.end() || it->second.lastSeenMs == 0) return false;
-        return (now - it->second.lastSeenMs) <= (unsigned long)PEER_STREAM_FRESH_MS;
+        if (it == targets_.end() || it->second.lastSeenMs == 0) return AUTHOR_NONE;
+        if ((now - it->second.lastSeenMs) > (unsigned long)PEER_STREAM_FRESH_MS)
+            return AUTHOR_NONE;
+        return it->second.author;
     }
+    // The yield half of the tie-break, as a deterministic TOTAL ORDER: we stand
+    // down from authoring a body only while a HIGHER-priority player (lower id;
+    // the host, id 0, always wins) is streaming it. A symmetric "yield to any
+    // fresh stream" lets two players go quiet on one contested body at once and
+    // resume together when both streams go stale - the oscillation the publish
+    // echo guard warns about. With a fixed winner the loop stops.
+    bool yieldsToStream(const Key& k, u32 localId, unsigned long now) const {
+        u32 a = peerStreamAuthor(k, now);
+        return a != AUTHOR_NONE && a != localId && a < localId;
+    }
+    // Who streams this hand to us, fresh or not (AUTHOR_NONE if nobody ever
+    // has). The owner a targeted reply / owner-scoped purge is about.
+    u32 ownerOfDriven(const Key& k) const;
 private:
-    // Recompute claimedCells_ from claimSlots_. Host wins a contested cell.
+    // Recompute claimedCells_ from claimSlots_. The lowest player id wins a
+    // contested cell; then the co-location collapse is applied.
     void rebuildClaimedCells();
-    // Are the squads standing together? True when the host holds at least one
-    // claim, the peer holds at least one, and every peer claim names a cell
-    // some host claim also names.
+    // Are squads standing together? Fills collapseTo_ (player -> the lowest id
+    // it collapses onto) and returns the TOTAL verdict (every claiming player
+    // collapses onto the host). Player o collapses onto the lowest m < o such
+    // that both hold claims and every cell o claims, m also claims. With two
+    // players this is exactly the old rule: the host holds at least one claim,
+    // the join holds at least one, and every join claim names a cell some host
+    // claim also names.
     //
     // Reads claimSlots_ rather than claimedCells_ on purpose: the latter has
-    // already resolved a shared cell to the host, which would erase the very
-    // fact being measured. Slots are one per tab, so the nested scan is over a
-    // handful of entries.
+    // already resolved a shared cell to the lowest id, which would erase the
+    // very fact being measured. Slots are one per tab, so the nested scan is
+    // over a handful of entries.
     //
-    // PURE FUNCTION of claimSlots_, and it has to stay one. Both clients
-    // converge on the same slot set, so both derive the same verdict and the
-    // same map - the property that already makes host-wins-ties safe. That is
-    // also why there is no hysteresis: a remembered "currently collapsed" bit
+    // PURE FUNCTION of claimSlots_, and it has to stay one. All clients
+    // converge on the same slot set, so all derive the same verdict and the
+    // same map - the property that already makes lowest-id-wins ties safe. That
+    // is also why there is no hysteresis: a remembered "currently collapsed" bit
     // is path-dependent, and two clients reaching one slot set by different
     // routes would disagree about authorship indefinitely. Flapping is damped
     // upstream instead, by the CELL_DWELL_N sample dwell a claim must clear
-    // before it moves at all.
-    bool claimsCoLocated() const;
+    // before it moves at all. Choosing the LOWEST qualifying m makes every
+    // mapping land directly on its root: if m itself collapses onto m' < m then
+    // m's cells are m''s cells, so o qualifies for m' too.
+    bool resolveCollapse();
     // Should enforcement leave this body alone? True when we author its cell,
     // or when its author has sent us no census to judge against. Restores the
     // body first if a previous author's verdict had it hidden. Always false
@@ -2516,16 +2694,25 @@ private:
     // can pause, both must raise"). -1 = not yet known.
     float         speedLastApplied_;   // what WE last wrote (own-write vs user-click detector)
     float         speedMyReq_;         // this client's current request
-    float         speedPeerReq_;       // host only: the join's latest request (-1 = none yet)
+    float         speedPeerReq_;       // host only: lowest join request (-1 = none yet)
     bool          speedCombatCap_;     // false = do NOT pin to 1x while fighting
     bool          speedMyCombat_;      // own-squad in-combat flag (~1 Hz sample)
-    bool          speedPeerCombat_;    // host only: the join's reported combat bit
+    bool          speedPeerCombat_;    // host only: OR of the joins' combat bits
     float         speedLastSet_;       // host: last broadcast effective; join: last received
     u32           speedSeqOut_;        // per-sender monotonic seq for REQ/SET we send
-    u32           speedSeqSeen_;       // newest seq accepted from the peer (stale guard)
+    u32           speedSeqSeen_;       // join: newest host SET seq accepted (stale guard)
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
     unsigned long speedCombatHoldMs_;  // last time own-squad combat read TRUE (cap hysteresis)
+    // Protocol 56, HOST: one vote per join (keyed by ownerId; each join has its
+    // own REQ seq space). speedPeerReq_/speedPeerCombat_ above are the fold over
+    // this map (min request / OR combat), recomputed by refreshPeerSpeedVotes.
+    struct SpeedVote {
+        float req; bool combat; u32 seqSeen;
+        SpeedVote() : req(-1.0f), combat(false), seqSeen(0) {}
+    };
+    std::map<u32, SpeedVote> speedVotes_;
+    void refreshPeerSpeedVotes();
 
     // Protocol 25 game-clock sync state. timeSlew_ is the join's correction
     // multiplier (1.0 = no correction); the speed layer applies effective *
@@ -2535,7 +2722,14 @@ private:
     float         timeSlew_;          // local slew: join >= 1 (catch up),
                                       //   host <= 1 (be caught)
     u32           timeSeqOut_;        // monotonic seq for the PKT_TIME we send
-    u32           timeSeqSeen_;       // newest peer sample seq applied
+    u32           timeSeqSeen_;       // join: newest host sample seq applied
+    // Protocol 56, HOST: per-join clock report (own seq space per join). The
+    // brake follows the LARGEST lag among joins that reported recently.
+    struct TimePeer {
+        u32 seqSeen; double lag; double hours; unsigned long recvMs;
+        TimePeer() : seqSeen(0), lag(0.0), hours(0.0), recvMs(0) {}
+    };
+    std::map<u32, TimePeer> timePeers_;
     unsigned long timeLastSendMs_;    // last clock broadcast/report
     unsigned long timeLastLogMs_;     // offset/brake log throttle
     // The engine speed the slewed value was derived from; lets the enforcement
@@ -2611,8 +2805,16 @@ private:
         // hands). Without this the runtime recruit defers forever behind a
         // same-template twin (recruit_sync run 094401).
         bool forceReq;
+        // N-player (protocol 56): the player the REQ is ABOUT - the hand's
+        // stream author, the census owner that vouched for it, or the sender
+        // of the recruit/move edge. Every client answers every (relayed) REQ,
+        // so only this player's found=0 is a denial, and only its description
+        // is minted from. AUTHOR_NONE = unknown: any reply counts (the legacy
+        // single-peer behaviour).
+        u32 target;
         SpawnReqState() : lastSendMs(0), sends(0), deniedMs(0), farMs(0),
-                          fromCensus(false), firstMissMs(0), forceReq(false) {}
+                          fromCensus(false), firstMissMs(0), forceReq(false),
+                          target(AUTHOR_NONE) {}
     };
     std::map<Key, SpawnReqState> spawnReq_;
     // JOIN: hands applyTargets failed to resolve this tick, with the streamed
@@ -2627,7 +2829,9 @@ private:
         // Phase 1b: force-REQ recruit/move hand (reliable-edge correlated) -
         // skips the mint-side same-template dupe guard.
         bool forceReq;
-        UnresolvedHand() : x(0), y(0), z(0), fromCensus(false), forceReq(false) {}
+        u32 target;   // see SpawnReqState::target
+        UnresolvedHand() : x(0), y(0), z(0), fromCensus(false), forceReq(false),
+                           target(AUTHOR_NONE) {}
     };
     std::map<Key, UnresolvedHand> unresolvedHands_;
     // JOIN: recruited/re-keyed hands whose rekeyPeerBody landed ok=0 (no local
@@ -2637,7 +2841,8 @@ private:
     // spawn REQ regardless of the send-side proximity gate (a far recruit is
     // still streamed as a host-owned member, so it must resolve). Entries clear
     // once the hand binds a proxy or resolves to a real local body.
-    std::set<Key> forceReqHands_;
+    // Value = the player whose edge proved it (the REQ's target).
+    std::map<Key, u32> forceReqHands_;
     // JOIN: census-mint reach (see setSpawnMintRadius) + the census-missing
     // scan throttle (the resolve sweep over censusHands_ runs at ~0.5 Hz, not
     // per tick).

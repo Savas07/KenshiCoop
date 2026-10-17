@@ -118,8 +118,9 @@ public:
     void queueStats(const StatsPacket& pkt);
 
     // MAIN thread: queue the reliable host-authoritative money-pool total
-    // (protocol 52, host -> join). Change-gated by the caller.
-    void queueMoney(const MoneyPacket& pkt);
+    // (protocol 52, host -> joins). Change-gated by the caller. targetMask
+    // (bit = player id) addresses it, e.g. to the one join whose delta it acks.
+    void queueMoney(const MoneyPacket& pkt, u32 targetMask = PEER_MASK_ALL);
 
     // MAIN thread: queue a reliable money-pool delta (protocol 52, join ->
     // host). Emitted once per observed local change; ordered delivery is what
@@ -172,22 +173,24 @@ public:
 
     // MAIN thread: coordinated-save packets (protocol 31). REQ join -> host
     // (a suppressed local save forwarded for arbitration); BEGIN/FILE/DONE
-    // host -> join (the paced folder transfer; FILE is variable-length:
-    // header + relative path + payload, serialized by the net thread); ACK
-    // join -> host (staged save verified + committed). All CH_RELIABLE - the
-    // ordered stream is what makes the chunk protocol stateless per chunk.
+    // host -> joins in targetMask (the paced folder transfer; FILE is
+    // variable-length: header + relative path + payload, serialized by the net
+    // thread); ACK join -> host (staged save verified + committed). All on the
+    // ordered CH_BULK stream that makes the chunk protocol stateless per chunk.
     void queueSaveReq(const SaveReqPacket& pkt);
-    void queueSaveBegin(const SaveBeginPacket& pkt);
+    void queueSaveBegin(const SaveBeginPacket& pkt, u32 targetMask = PEER_MASK_ALL);
     void queueSaveFile(const SaveFileHeader& hdr, const char* relPath,
-                       const unsigned char* data, unsigned int dataLen);
-    void queueSaveDone(const SaveDoneHeader& hdr, const u32* crcs, unsigned int count);
+                       const unsigned char* data, unsigned int dataLen,
+                       u32 targetMask = PEER_MASK_ALL);
+    void queueSaveDone(const SaveDoneHeader& hdr, const u32* crcs, unsigned int count,
+                       u32 targetMask = PEER_MASK_ALL);
     void queueSaveAck(const SaveAckPacket& pkt);
 
-    // MAIN thread: coordinated-load packets (protocol 32). GO host -> join
-    // (load this save now, fingerprint attached); REQ join -> host (a
-    // suppressed local load forwarded for arbitration); NACK join -> host
-    // (copy missing/diverged - answer with a SaveXfer). All CH_RELIABLE.
-    void queueLoadGo(const LoadGoPacket& pkt);
+    // MAIN thread: coordinated-load packets (protocol 32). GO host -> joins in
+    // targetMask (load this save now, fingerprint attached); REQ join -> host
+    // (a suppressed local load forwarded for arbitration); NACK join -> host
+    // (copy missing/diverged - answer with a SaveXfer). All on CH_BULK.
+    void queueLoadGo(const LoadGoPacket& pkt, u32 targetMask = PEER_MASK_ALL);
     void queueLoadReq(const LoadReqPacket& pkt);
     void queueLoadNack(const LoadNackPacket& pkt);
 
@@ -203,6 +206,12 @@ public:
     // hooks installed on the net thread; MTU clamped to Steam's 1200-byte
     // unreliable ceiling). Must be called before startHost/startClient. 0 = UDP.
     void setSteamTransport(unsigned long long peerSteamId);
+
+    // Client: the stable player identity token sent in HELLO (steamid64 as
+    // decimal; empty = none). The host keeps the id it assigns reserved for
+    // that token, so a reconnect lands on the same player id / squad tab.
+    // Must be called before startClient.
+    void setIdentity(const std::string& identity) { identity_ = identity; }
 
     // MAIN thread: advance this peer's session epoch (protocol 44). Called on
     // every session-reset edge (coordinated world reload, connect/disconnect
@@ -292,8 +301,10 @@ private:
     std::vector<SpeedPacket>     outSpeed_;
     // Reliable character-stats snapshots (protocol 17). Guarded by outCs_.
     std::vector<StatsPacket>     outStats_;
-    // Reliable money-pool totals + join deltas (protocol 52). Guarded by outCs_.
-    std::vector<MoneyPacket>     outMoney_;
+    // Reliable money-pool totals + join deltas (protocol 52). A total may be
+    // addressed to one join (its own ack) via mask. Guarded by outCs_.
+    struct OutMoney { MoneyPacket pkt; u32 mask; };
+    std::vector<OutMoney>        outMoney_;
     std::vector<MoneyDeltaPacket> outMoneyDelta_;
     std::vector<FactionPacket>   outFaction_;
     std::vector<TimePacket>      outTime_;
@@ -321,18 +332,41 @@ private:
     std::vector<SpawnInfoPacket> outSpawnInfo_;
     // Reliable coordinated-save packets (protocol 31). FILE carries its
     // variable tail (relative path + payload) pre-flattened; DONE carries its
-    // CRC table. Guarded by outCs_.
-    struct OutSaveFile { SaveFileHeader hdr; std::vector<u8> tail; };
-    struct OutSaveDone { SaveDoneHeader hdr; std::vector<u32> crcs; };
+    // CRC table. Host -> join packets carry a target mask (bit = player id).
+    // Guarded by outCs_.
+    struct OutSaveBegin { SaveBeginPacket pkt; u32 mask; };
+    struct OutSaveFile  { SaveFileHeader hdr; std::vector<u8> tail; u32 mask; };
+    struct OutSaveDone  { SaveDoneHeader hdr; std::vector<u32> crcs; u32 mask; };
     std::vector<SaveReqPacket>   outSaveReq_;
-    std::vector<SaveBeginPacket> outSaveBegin_;
+    std::vector<OutSaveBegin>    outSaveBegin_;
     std::vector<OutSaveFile>     outSaveFile_;
     std::vector<OutSaveDone>     outSaveDone_;
     std::vector<SaveAckPacket>   outSaveAck_;
     // Reliable coordinated-load packets (protocol 32). Guarded by outCs_.
-    std::vector<LoadGoPacket>    outLoadGo_;
+    struct OutLoadGo { LoadGoPacket pkt; u32 mask; };
+    std::vector<OutLoadGo>       outLoadGo_;
     std::vector<LoadReqPacket>   outLoadReq_;
     std::vector<LoadNackPacket>  outLoadNack_;
+
+    // NET thread: hand one packet to its recipients and take ownership of it.
+    // Host: every welcomed join whose bit is in targetMask, except 'except';
+    // client: the host. Destroyed when nobody could take it.
+    void sendOut(ENetPacket* out, enet_uint8 ch, u32 targetMask = PEER_MASK_ALL,
+                 ENetPeer* except = 0);
+    // NET thread (host): re-send a join-authored packet verbatim (same channel,
+    // same reliability) to every OTHER welcomed join.
+    void relay(const ENetEvent& ev);
+    // NET thread (host): tell joins about a roster edge (see PeerStatePacket).
+    void sendPeerState(u32 peerId, bool present, u32 targetMask);
+
+    // Player identity token sent in HELLO (client; set before launch).
+    std::string identity_;
+    // Host-side player-id bookkeeping (NET thread only; reset per launch).
+    // idInUse_[k]: a connected peer holds id k. idByIdentity_: the id each
+    // identity token was given this session, reserved for its reconnect.
+    bool                     idInUse_[MAX_PLAYERS];
+    std::map<std::string, u32> idByIdentity_;
+    u32 allocPlayerId(const std::string& identity);
 
     HANDLE        thread_;
     volatile LONG running_;

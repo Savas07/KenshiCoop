@@ -190,7 +190,7 @@ void Replicator::applyInventories(GameWorld* gw) {
         // the node's building, which names nothing here - reconciling it
         // verbatim was a silent no-op, so the mine's output never crossed.
         unsigned int cHand[5];
-        handForContainerKey(k, cHand);
+        handForContainerKey(k, cHand, it->second.ownerId);
         const InvItemEntry* items = it->second.items.empty() ? 0 : &it->second.items[0];
         unsigned int n = (unsigned int)it->second.items.size();
         // Protocol 37 (the race that blinded the detector in run 141024): if this
@@ -446,12 +446,39 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 continue;
             }
             // A drop from a PEER-owned squad copy is the peer's to author (it streams
-            // its own drop); authoring it here too would duplicate the proxy. World
-            // NPC (class 0) and our own squad (class 1) drops still stream.
-            if (ownerClassForHand(de[i].ownerHand) == 2) continue;
+            // its own drop); authoring it here too would duplicate the proxy. Our own
+            // squad (class 1) drops still stream, and so do world NPC (class 0) drops
+            // from a body WE simulate. Protocol 56: an NPC we only DRIVE from another
+            // player's stream is that player's to author - every client running a copy
+            // sees the copy drop, and one author per drop is what keeps it one proxy.
+            // Track it as a never-stream baseline so the spatial scan below skips it.
+            int ocls = ownerClassForHand(de[i].ownerHand);
+            if (ocls == 2) continue;
             Key k; k.t = de[i].itemHand[0]; k.c = de[i].itemHand[1]; k.cs = de[i].itemHand[2];
             k.i = de[i].itemHand[3]; k.s = de[i].itemHand[4];
             if (worldTrack_.find(k) != worldTrack_.end()) continue; // already tracked
+            if (ocls == 0) {
+                Character* oc = engine::resolveCharByHand(de[i].ownerHand[3], de[i].ownerHand[4],
+                                                          de[i].ownerHand[0], de[i].ownerHand[1],
+                                                          de[i].ownerHand[2]);
+                if (oc && (drivenChars_.count(oc) != 0 || drivenSeen_.count(oc) != 0)) {
+                    WorldTrack t; memset(&t, 0, sizeof(t));
+                    t.netId = nextWorldNetId_++;
+                    t.x = de[i].x; t.y = de[i].y; t.z = de[i].z; t.seen = true;
+                    t.baseline = true; // the NPC's authority streams this drop
+                    strncpy(t.stringID, de[i].stringID, sizeof(t.stringID) - 1);
+                    t.stringID[sizeof(t.stringID) - 1] = '\0';
+                    t.itemType = de[i].itemType; t.quantity = de[i].quantity;
+                    t.quality = de[i].quality;
+                    worldTrack_[k] = t;
+                    if (dumpWi) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[wi] DROP-NPC-SKIP sid='%s' qty=%u pos=%.2f,%.2f,%.2f (driven NPC; "
+                        "its authority authors the drop)",
+                        t.stringID, t.quantity, t.x, t.y, t.z);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                    continue;
+                }
+            }
             WorldTrack t; memset(&t, 0, sizeof(t));
             t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
             t.x = de[i].x; t.y = de[i].y; t.z = de[i].z; t.seen = true;
@@ -730,6 +757,15 @@ void Replicator::applyWorldClaims(GameWorld* gw, Inbound& in, u32 localId) {
                     *id, b->ownerId); b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
                 continue;
             }
+            if (tit->second.claimed) {
+                // Protocol 56: a second picker lost the race - the first claim already
+                // destroyed the real item. Keep the track, so the ordinary cull still
+                // reaches every peer (including the loser, whose copy came from a proxy).
+                char b2[160]; _snprintf(b2, sizeof(b2) - 1,
+                    "[wi] CLAIM-DUP netId=%u from=%u (an earlier claim already won)",
+                    *id, b->ownerId); b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
+                continue;
+            }
             unsigned int ihand[5] = { tit->first.t, tit->first.c, tit->first.cs,
                                       tit->first.i, tit->first.s };
             RootObject* ro = engine::resolveObjectByHand(ihand);
@@ -744,6 +780,7 @@ void Replicator::applyWorldClaims(GameWorld* gw, Inbound& in, u32 localId) {
             // erase here - otherwise we would keep streaming an item the claimer already
             // took, and it would re-spawn as a fresh proxy (the duplicate we are fixing).
             if (!destroyed) worldTrack_.erase(tit);
+            else            tit->second.claimed = true;
         }
     }
 }
@@ -1505,7 +1542,7 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
 
 void Replicator::xferRebase(GameWorld* gw, const Key& k) {
     unsigned int cHand[5];
-    handForContainerKey(k, cHand);
+    handForContainerKey(k, cHand, peerContainerOwner(k));
     std::map<XKey, int>& base = xferBase_[k];
     base.clear();
     if (engine::resolveObjectByHand(cHand) != 0) {
@@ -1585,7 +1622,7 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     std::map<Key, std::map<XKey, int> > cur;
     for (std::set<Key>::iterator it = tracked.begin(); it != tracked.end(); ++it) {
         unsigned int cHand[5];
-        handForContainerKey(*it, cHand);
+        handForContainerKey(*it, cHand, peerContainerOwner(*it));
         if (engine::resolveObjectByHand(cHand) == 0) continue;
         std::map<XKey, int>& tot = cur[*it];
         unsigned int n = engine::captureContainerContents(gw, cHand, items, 64, 0);
@@ -1721,6 +1758,10 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
             XferOut o;
             o.src = f.src; o.dst = f.dst; o.key = f.key; o.qty = f.qty;
             o.srcPeer = !srcOwn; o.dstPeer = !dstOwn; o.sentMs = now;
+            // Protocol 56: only the owner of a peer end may settle it.
+            o.srcAcker = o.srcPeer ? peerContainerOwner(f.src) : OWNER_ID_ALL;
+            o.dstAcker = o.dstPeer ? peerContainerOwner(f.dst) : OWNER_ID_ALL;
+            o.srcSettled = !o.srcPeer; o.dstSettled = !o.dstPeer;
             xferOut_[pkt.xferId] = o;
             char b[240]; _snprintf(b, sizeof(b) - 1,
                 "[xfer] SEND id=%u sid='%s' type=%u qty=%d src=%u,%u,%u,%u,%u(%s) dst=%u,%u,%u,%u,%u(%s)",
@@ -1753,9 +1794,28 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         sk.i = p.sIndex; sk.s = p.sSerial;
         Key dk; dk.t = p.dType; dk.c = p.dContainer; dk.cs = p.dContainerSerial;
         dk.i = p.dIndex; dk.s = p.dSerial;
+        // Protocol 56: the host relays every intent to every join. Act where this
+        // client authors an end, or where no end is known to be a THIRD player's
+        // (the author's own ends are only our cosmetic copies - the two-player
+        // case, unchanged). A bystander relocating its copies of two other
+        // players' containers would fabricate into bags it does not own and
+        // answer a verdict nobody is waiting for.
+        u32 sAuth = containerAuthor(sk, localId);
+        u32 dAuth = containerAuthor(dk, localId);
+        bool mine = (sAuth == localId) || (dAuth == localId);
+        bool thirdParty =
+            (sAuth != OWNER_ID_ALL && sAuth != localId && sAuth != p.ownerId) ||
+            (dAuth != OWNER_ID_ALL && dAuth != localId && dAuth != p.ownerId);
+        if (!mine && thirdParty) {
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[xfer] SKIP id=%u from=%u sid='%s' (bystander: src owner=%d dst owner=%d)",
+                p.xferId, p.ownerId, p.stringID, (int)sAuth, (int)dAuth);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
         // Either end may be a mine the peer emptied, whose hand is its own.
-        unsigned int sHand[5]; handForContainerKey(sk, sHand);
-        unsigned int dHand[5]; handForContainerKey(dk, dHand);
+        unsigned int sHand[5]; handForContainerKey(sk, sHand, peerContainerOwner(sk));
+        unsigned int dHand[5]; handForContainerKey(dk, dHand, peerContainerOwner(dk));
         // Relocate OUR copy of the real item between the same two containers - the
         // conservation move (never fabricates or destroys), so gear survives.
         int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
@@ -1835,7 +1895,22 @@ void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
         if (a.xferOwnerId != localId) continue;      // not answering us (relay safety)
         std::map<u32, XferOut>::iterator o = xferOut_.find(a.xferId);
         if (o == xferOut_.end()) continue;           // already settled or swept
-        const XferOut& x = o->second;
+        XferOut& x = o->second;
+        // Protocol 56: the verdict for a peer end is its OWNER's (it alone knows
+        // whether its copy held the item). With several joins the first ack can
+        // come from anyone, so each end settles only on its own owner's answer;
+        // an end whose owner was unknown at send time takes any answer.
+        bool takeSrc = x.srcPeer && !x.srcSettled &&
+                       (x.srcAcker == OWNER_ID_ALL || x.srcAcker == a.ownerId);
+        bool takeDst = x.dstPeer && !x.dstSettled &&
+                       (x.dstAcker == OWNER_ID_ALL || x.dstAcker == a.ownerId);
+        if (!takeSrc && !takeDst) {
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[xfer] ACK-IGNORED id=%u from=%u (not an end owner)",
+                a.xferId, a.ownerId);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
         // Back out this intent's latch contribution, and do it for EVERY
         // verdict - the latch exists only to bridge the window where the
         // receiver had not answered yet, and the answer has arrived:
@@ -1850,8 +1925,8 @@ void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
         //              the owner sees it; that is the rollback, through the
         //              reconcile path rather than a second mutation that could
         //              itself dupe.
-        if (x.srcPeer) releaseXferLatch(x.src, x.key, +x.qty);
-        if (x.dstPeer) releaseXferLatch(x.dst, x.key, -x.qty);
+        if (takeSrc) { releaseXferLatch(x.src, x.key, +x.qty); x.srcSettled = true; }
+        if (takeDst) { releaseXferLatch(x.dst, x.key, -x.qty); x.dstSettled = true; }
         const char* vn = (a.verdict == XFER_ACK_ACCEPT)  ? "accept"
                        : (a.verdict == XFER_ACK_PARTIAL) ? "partial" : "reject";
         char b[224]; _snprintf(b, sizeof(b) - 1,
@@ -1859,7 +1934,7 @@ void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
             a.xferId, a.ownerId, vn, (unsigned)a.applied, (unsigned)a.requested,
             now - x.sentMs, x.key.first.c_str());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        xferOut_.erase(o);
+        if (x.srcSettled && x.dstSettled) xferOut_.erase(o);
         (void)gw;
     }
     // Sweep intents nobody answered. The latches themselves already expire on

@@ -370,6 +370,8 @@ struct InboundCellClaim {
 // clear (flush) - so the push/drain methods below are unchanged.
 struct IClearableQueue {
     virtual void clearQueue() = 0;
+    // Drop only the entries a departed peer authored (owner-scoped leave).
+    virtual void eraseOwner(u32 ownerId) = 0;
     virtual ~IClearableQueue() {}
 };
 
@@ -390,6 +392,12 @@ public:
     }
     operator std::deque<T>&() { return q_; }
     virtual void clearQueue() { q_.clear(); }
+    virtual void eraseOwner(u32 ownerId) {
+        std::deque<T> keep;
+        for (typename std::deque<T>::const_iterator it = q_.begin(); it != q_.end(); ++it)
+            if (it->ownerId != ownerId) keep.push_back(*it);
+        q_.swap(keep);
+    }
 private:
     std::deque<T> q_;
     size_t        cap_;
@@ -419,7 +427,7 @@ public:
         // carry a drop-oldest cap so a stalled main thread cannot grow them
         // without bound. ent_ = ~12 s of a 20 Hz * 17-entity stream; stealth/cam
         // are ~1 Hz refreshes. Every other queue is reliable and stays unbounded.
-        ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
+        ent_(worldReset_, 4096 * (MAX_PLAYERS - 1)),  evt_(worldReset_),        inv_(worldReset_),
         wi_(worldReset_),         wir_(worldReset_),        wic_(worldReset_),
         npcCensus_(worldReset_),
         wd_(worldReset_),         invXfer_(worldReset_),    invXferAck_(worldReset_),
@@ -848,6 +856,15 @@ public:
         // spawn) or a scenario may arm again.
         sawRemote_ = false;
         ++generation_;
+        LeaveCriticalSection(&cs_);
+    }
+
+    // MAIN thread: one join left while others stay - drop just its queued
+    // world-state packets (the other peers' traffic and the session keep going).
+    void purgeOwner(u32 ownerId) {
+        EnterCriticalSection(&cs_);
+        for (size_t i = 0; i < worldReset_.size(); ++i)
+            worldReset_[i]->eraseOwner(ownerId);
         LeaveCriticalSection(&cs_);
     }
 

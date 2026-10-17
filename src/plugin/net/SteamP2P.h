@@ -12,13 +12,18 @@
 // via enet_set_socket_hooks() (patch 0002), so every ENet datagram rides one
 // unreliable Steam P2P packet on channel 0. UDP stays the default transport.
 //
-// Two-player assumption (mirrors NetLink): ONE tunnel peer, configured up front
-// with the other player's steamid64 (two-code exchange; sending to a SteamID
-// implicitly accepts its inbound session, so no Steam callback plumbing needed).
+// Peers: a client tunnels to ONE peer (the host); a host to one peer per join
+// (up to MAX_TUNNEL_PEERS). Each peer owns a slot whose fabricated ENet address
+// ("1.0.<slot>.1") lets ENet route per peer; slot 0 is "1.0.0.1", the address a
+// client connects to. Sending to a SteamID implicitly accepts its inbound
+// session, and peers are pre-accepted when added, so no Steam callback plumbing
+// is needed by the tunnel itself.
 //
 // Threading: init()/setPeer()/setPingPeer() are called on the main thread before
-// the net thread launches; the ENet hooks and tick() run on the net thread. The
-// flat ISteamNetworking calls are thread-safe (IPC into the Steam client).
+// the net thread launches; addPeer() on the main thread while it runs (aligned
+// 64-bit slot stores, read lock-free by the hooks); the ENet hooks and tick()
+// run on the net thread. The flat ISteamNetworking calls are thread-safe (IPC
+// into the Steam client).
 
 #ifndef KENSHICOOP_STEAMP2P_H
 #define KENSHICOOP_STEAMP2P_H
@@ -28,6 +33,9 @@ namespace steamp2p {
 
 typedef unsigned long long SteamId; // steamid64
 
+// Max tunnel peers: a host + 7 joins = 8 players.
+const int MAX_TUNNEL_PEERS = 8;
+
 // Resolve the flat API from the game's already-loaded steam_api64.dll and log
 // "[steam] id=<steamid64> loggedOn=<0|1> iface=<version>". Idempotent; returns
 // false (and logs why) when Steam isn't available.
@@ -35,13 +43,18 @@ bool init();
 bool ready();
 SteamId selfId();
 
-// Configure the single tunnel peer. Proactively accepts its inbound session
-// and allows Valve-relay fallback. Call before the net thread starts.
+// Reset the tunnel to a single peer in slot 0 (the host for a client, the first
+// join for a host). Pre-accepts its inbound session and allows Valve-relay
+// fallback. Call before the net thread starts.
 void setPeer(SteamId id);
+
+// Host: admit one more join while the session runs (next free slot; no-op if
+// already admitted). Returns false when every slot is taken.
+bool addPeer(SteamId id);
 
 // Accept an inbound P2P session from a specific SteamID. Used by the Steam
 // invite layer's P2PSessionRequest_t callback so a session opens even if the
-// request arrives before setPeer() pre-accepts it. No-op until init() succeeds.
+// request arrives before the peer is added. No-op until init() succeeds.
 void accept(SteamId id);
 
 // Spike harness (KENSHICOOP_STEAM_PING=<steamid64>): ping/echo on P2P channel 1
@@ -59,7 +72,7 @@ void tick();
 bool installEnetHooks(int port);
 void removeEnetHooks();
 
-// Close the P2P sessions (peer + ping peer).
+// Close every P2P session (peers + ping peer) and clear the peer slots.
 void shutdown();
 
 } // namespace steamp2p

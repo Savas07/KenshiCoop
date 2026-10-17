@@ -166,6 +166,7 @@ unsigned __int64      g_sendTotalBytes = 0;
 unsigned __int64      g_sendSentBytes  = 0;
 unsigned long         g_sendStartTick  = 0;
 unsigned long         g_sendLastBurst  = 0;
+u32                   g_sendMask       = PEER_MASK_ALL; // joins receiving this transfer
 
 void sendCloseFile() {
     if (g_sendHandle != INVALID_HANDLE_VALUE) {
@@ -393,7 +394,8 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
 // ---- Sender (host) -------------------------------------------------------------
 #ifndef KENSHICOOP_PROTOTEST
 
-bool beginSend(NetLink& net, u32 localId, const std::string& name) {
+bool beginSend(NetLink& net, u32 localId, const std::string& name, u32 targetMask) {
+    g_sendMask = targetMask;
     sendCloseFile();
     g_sendFiles.clear();
     g_sendCrcs.clear();
@@ -438,7 +440,7 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
     strncpy(bp.name, name.c_str(), sizeof(bp.name) - 1);
     bp.fileCount  = (u16)g_sendFiles.size();
     bp.totalBytes = g_sendTotalBytes;
-    net.queueSaveBegin(bp);
+    net.queueSaveBegin(bp, g_sendMask);
 
     char b[192];
     _snprintf(b, sizeof(b) - 1,
@@ -492,7 +494,7 @@ bool tickSend(NetLink& net, u32 localId) {
         fh.pathLen = (u16)xf.rel.size();
         fh.offset  = (u32)g_sendOffset;
         fh.dataLen = (u16)got;
-        net.queueSaveFile(fh, xf.rel.c_str(), buf, (unsigned int)got);
+        net.queueSaveFile(fh, xf.rel.c_str(), buf, (unsigned int)got, g_sendMask);
 
         g_sendOffset    += got;
         g_sendSentBytes += got;
@@ -510,7 +512,7 @@ bool tickSend(NetLink& net, u32 localId) {
         dh.xferId    = g_sendXferId;
         dh.fileCount = (u16)g_sendFiles.size();
         net.queueSaveDone(dh, g_sendCrcs.empty() ? 0 : &g_sendCrcs[0],
-                          (unsigned int)g_sendCrcs.size());
+                          (unsigned int)g_sendCrcs.size(), g_sendMask);
         char b[176];
         _snprintf(b, sizeof(b) - 1,
                   "[save] XFER-SENT id=%u files=%u bytes=%I64u ms=%lu",

@@ -495,6 +495,7 @@ static void testRoundTrips() {
     roundTrip<ResearchPacket>("ResearchPacket", (u8)PKT_RESEARCH);
     roundTrip<DeedPacket>("DeedPacket", (u8)PKT_DEED);
     roundTrip<FixturePacket>("FixturePacket", (u8)PKT_FIXTURE);
+    roundTrip<PeerStatePacket>("PeerStatePacket", (u8)PKT_PEER_STATE);
     roundTrip<CellClaimPacket>("CellClaimPacket", (u8)PKT_CELL_CLAIM);
     roundTrip<InvXferAckPacket>("InvXferAckPacket", (u8)PKT_INV_XFER_ACK);
 
@@ -1730,6 +1731,18 @@ static void testChangeGate() {
     CHECK("seq accept newer",         gateSeqAccept(5, 6));
     CHECK("seq drop equal",          !gateSeqAccept(5, 5));
     CHECK("seq drop older",          !gateSeqAccept(5, 4));
+
+    // --- SenderSeq (protocol 56): the seq guard is per (sender, row). ---
+    {
+        SenderSeq ss;
+        CHECK("sseq first sight",               ss.accept(1, 40));
+        CHECK("sseq other sender low seq kept", ss.accept(2, 3));  // not starved by 1's counter
+        CHECK("sseq drop own dup",             !ss.accept(1, 40));
+        CHECK("sseq drop own older",           !ss.accept(2, 2));
+        CHECK("sseq accept own newer",          ss.accept(2, 4));
+        ss.forget(1);
+        CHECK("sseq forgotten sender restarts", ss.accept(1, 1));
+    }
 
     // --- gateShouldSend, MONEY flavor (minSend=1000, resend=5000, unsent=1) ---
     // A never-sent row streams once even unchanged (no silent seed).

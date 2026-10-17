@@ -180,6 +180,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         for (std::set<Key>::iterator it = censusHands_.begin();
              it != censusHands_.end(); ++it) {
             const Key& k = *it;
+            // The merged view keeps every sender's latest rows; only a CURRENT
+            // census may vouch for a mint (with one sender the gate above
+            // already guarantees it).
+            if (!censusVouches(k, now)) continue;
             if (proxyByKey_.find(k) != proxyByKey_.end()) continue;
             if (ownHands_.find(k) != ownHands_.end()) continue;
             // Phase 1b (phantom fix): a hand we PIN owned is ours - a census
@@ -230,6 +234,12 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             }
             UnresolvedHand& u = unresolvedHands_[k];
             u.fromCensus = true;
+            {
+                // Ask about it of the author whose census vouched for it.
+                std::map<Key, u32>::const_iterator co = censusOwnerOf_.find(k);
+                if (co != censusOwnerOf_.end() && u.target == AUTHOR_NONE)
+                    u.target = co->second;
+            }
             lifeSet(k, LIFE_DISCOVERED, "census-miss");
             if (spawnLogged_.insert(k).second) {
                 char b[144]; _snprintf(b, sizeof(b) - 1,
@@ -263,7 +273,17 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         const SpawnInfoPacket& p = it->pkt;
         Key k; k.t = p.hType; k.c = p.hContainer; k.cs = p.hContainerSerial;
         k.i = p.hIndex; k.s = p.hSerial;
-        SpawnReqState& rq = spawnReq_[k];
+        // N-player relay: every client answers every REQ, and the host relays
+        // all of the answers to every join. Only a reply to a question WE asked
+        // is ours to act on - minting off another player's REQ would stand up a
+        // body nothing streams here - and only the player the question was
+        // about may deny it or describe it: the host's found=0 for a body
+        // another join authors used to put the hand into the long denial
+        // cooldown before its real author could answer.
+        std::map<Key, SpawnReqState>::iterator rqi = spawnReq_.find(k);
+        if (rqi == spawnReq_.end() || rqi->second.lastSendMs == 0) continue;
+        SpawnReqState& rq = rqi->second;
+        if (rq.target != AUTHOR_NONE && it->ownerId != rq.target) continue;
         if (!p.found) {
             rq.deniedMs = now;
             char b[128]; _snprintf(b, sizeof(b) - 1,
@@ -599,8 +619,12 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         // member on this client too (same as the ok=1 path) and retire the
         // force-REQ. Only force-REQ hands become members: an ordinary world-NPC
         // census mint must NOT be dropped into the player squad.
-        if (forceReqHands_.erase(k))
-            insertPeerMember(gw, proxy, k, "recruit");
+        std::map<Key, u32>::iterator fr = forceReqHands_.find(k);
+        if (fr != forceReqHands_.end()) {
+            u32 edgeAuthor = fr->second;
+            forceReqHands_.erase(fr);
+            insertPeerMember(gw, proxy, k, "recruit", edgeAuthor);
+        }
     }
 
     // Force-REQ injection (protocol 23 interest-split recruit fix): a recruit/
@@ -610,9 +634,9 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     // bypassed) every pass until they bind a proxy or resolve locally, so the
     // recruited body appears regardless of distance.
     if (!forceReqHands_.empty()) {
-        for (std::set<Key>::iterator it = forceReqHands_.begin();
+        for (std::map<Key, u32>::iterator it = forceReqHands_.begin();
              it != forceReqHands_.end(); ) {
-            const Key& k = *it;
+            const Key& k = it->first;
             bool bound = proxyByKey_.find(k) != proxyByKey_.end();
             Character* local = bound ? 0
                 : engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
@@ -620,6 +644,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             UnresolvedHand& uh = unresolvedHands_[k];
             uh.fromCensus = true; // bypass send-side proximity
             uh.forceReq   = true; // correlated by the reliable edge: skip dupe guard
+            uh.target     = it->second; // the edge's sender authors the body
             ++it;
         }
     }
@@ -648,6 +673,9 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             // path a later stream sample happened to arrive by).
             if (it->second.fromCensus) rq.fromCensus = true;
             if (it->second.forceReq)   rq.forceReq   = true;
+            // Who the question is about; a later census/stream pass may name a
+            // different author (handover), and the newest statement wins.
+            if (it->second.target != AUTHOR_NONE) rq.target = it->second.target;
             if (rq.deniedMs != 0) {
                 if ((now - rq.deniedMs) < DENIED_RETRY_MS) continue;
                 rq.deniedMs = 0; rq.sends = 0; // cooldown over: ask again
@@ -750,7 +778,41 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
         const EventPacket& ev = it->ev;
         Key k; k.t = ev.sType; k.c = ev.sContainer; k.cs = ev.sContainerSerial;
         k.i = ev.sIndex; k.s = ev.sSerial;
+        // N-player relay: the same reliable edge can reach us twice (a resent
+        // relay, a reconnect replay); apply each (sender, eventId) once. Ids are
+        // per-sender, so the window is per sender too. 0 = unnumbered.
+        if (ev.eventId != 0) {
+            EventSeen& es = eventSeen_[ev.ownerId];
+            if (!es.ids.insert(ev.eventId).second) {
+                char db[160]; _snprintf(db, sizeof(db) - 1,
+                    "[event] DUP id=%u ev=%u owner=%u hand=%u,%u (already applied)",
+                    ev.eventId, (unsigned)ev.event, ev.ownerId, ev.sIndex, ev.sSerial);
+                db[sizeof(db) - 1] = '\0'; coop::logLine(db);
+                continue;
+            }
+            es.order.push_back(ev.eventId);
+            if (es.order.size() > (size_t)EVENT_SEEN_WINDOW) {
+                es.ids.erase(es.order.front());
+                es.order.pop_front();
+            }
+        }
         Driven& d = targets_[k]; // creates a placeholder if the body isn't streamed yet
+        // Down/death/revive LATCHES pin a body's state against its own stream,
+        // so only the player streaming that body may set them. With several
+        // writers (a handover, a contested cell) a late edge from the old author
+        // would otherwise latch KO/death on a body someone else now drives.
+        // Unknown author (placeholder, never streamed) = accept, as before; with
+        // two players the author is always the one sender.
+        const bool latchFromAuthor = (d.author == AUTHOR_NONE || d.author == ev.ownerId);
+        if (!latchFromAuthor &&
+            (ev.event == EVT_DEATH || ev.event == EVT_KNOCKOUT || ev.event == EVT_REVIVE)) {
+            char lb[176]; _snprintf(lb, sizeof(lb) - 1,
+                "[event] LATCH-SKIP id=%u ev=%u owner=%u author=%u hand=%u,%u",
+                ev.eventId, (unsigned)ev.event, ev.ownerId, d.author,
+                ev.sIndex, ev.sSerial);
+            lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+            continue;
+        }
         switch (ev.event) {
             case EVT_DEATH:    d.deathLatched = true;  d.koLatched = true;  break;
             case EVT_KNOCKOUT: d.koLatched = true;                          break;
@@ -885,7 +947,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if (!recruitSync_) break;
                 Key nk; nk.t = ev.aType; nk.c = ev.aContainer;
                 nk.cs = ev.aContainerSerial; nk.i = ev.aIndex; nk.s = ev.aSerial;
-                rekeyPeerBody(gw, k, nk, "recruit");
+                rekeyPeerBody(gw, k, nk, "recruit", ev.ownerId);
                 break;
             }
             case EVT_SQUAD_MOVE: {
@@ -910,7 +972,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                     xb[sizeof(xb) - 1] = '\0'; coop::logLine(xb);
                     break;
                 }
-                rekeyPeerBody(gw, k, nk, "squad");
+                rekeyPeerBody(gw, k, nk, "squad", ev.ownerId);
                 break;
             }
             default: break;
@@ -933,7 +995,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
 // hand doesn't resolve here (runtime-born subject), the bidirectional
 // describe/mint channel covers it instead.
 void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
-                               const char* tag) {
+                               const char* tag, u32 author) {
     // A hand WE authored must never enter pinPeer_ (that set vetoes
     // publishing): an echo - or both sides recruiting the SAME baked NPC,
     // which lands on the SAME new hand (run 120738) - would otherwise
@@ -963,7 +1025,7 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // The author owns a peer-tab hand even if a local tab census would rank it
     // into a tab we own; but a transfer INTO a tab we own is exactly the control
     // hand-off, so we claim it instead of pinning it peer.
-    if (!destOwned) pinPeer_.insert(newK);
+    if (!destOwned) pinPeer_[newK] = author;
     // A chained edge (recruit then move, move then move) leaves the OLD key's
     // pin dead - drop it so the pin sets track only live hands.
     pinPeer_.erase(oldK);
@@ -1108,7 +1170,7 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // into our squad), insertPeerMember pins the actual local hand OWNED so
         // publishOwned streams it and the local player controls it. Idempotent +
         // tab-aware, so a squad-move re-containers an existing member too.
-        insertPeerMember(gw, c, newK, tag, destOwned);
+        insertPeerMember(gw, c, newK, tag, author, destOwned);
         if (destOwned) {
             // Control hand-off: drop every residual DRIVE artifact so publishOwned
             // streams the body immediately and applyTargets never fights our own
@@ -1147,7 +1209,7 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // squad never REQs and the body never mints. Enroll the new hand in the
         // force-REQ set: the reliable edge PROVES it is a legit host body, so we
         // REQ it regardless of distance (the reply-side mint gate still judges).
-        forceReqHands_.insert(newK);
+        forceReqHands_[newK] = author;
         char fb[176]; _snprintf(fb, sizeof(fb) - 1,
             "[%s] REKEY-FALLBACK new=%u,%u,%u,%u,%u force-REQ (no local body)",
             tag, newK.t, newK.c, newK.cs, newK.i, newK.s);
@@ -1162,7 +1224,7 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
 }
 
 void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
-                                  const char* tag, bool ownIt) {
+                                  const char* tag, u32 author, bool ownIt) {
     if (!c) return;
     unsigned int nh[5] = { newK.t, newK.c, newK.cs, newK.i, newK.s };
     bool ok = engine::joinPlayerSquadAt(gw, c, nh);
@@ -1195,7 +1257,7 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
     bool pinnedLocal = false;
     if (haveLh && (lh[0] | lh[1] | lh[2] | lh[3] | lh[4]) && !sameAsNew) {
         if (ownIt) { pinPeer_.erase(lk); pinOwned_.insert(lk); }
-        else       { pinOwned_.erase(lk); pinPeer_.insert(lk); }
+        else       { pinOwned_.erase(lk); pinPeer_[lk] = author; }
         if (ok) moveEcho_[lk.s] = nowMs();  // the engine may renumber the serial
         pinnedLocal = true;
     }

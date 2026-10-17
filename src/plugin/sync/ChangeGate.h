@@ -28,6 +28,8 @@
 #ifndef KENSHICOOP_CHANGE_GATE_H
 #define KENSHICOOP_CHANGE_GATE_H
 
+#include <map>
+
 namespace coop {
 namespace sync {
 
@@ -72,6 +74,30 @@ inline bool gateShouldSend(bool changed, unsigned long nowMs,
 inline bool gateSeqAccept(unsigned int seqSeen, unsigned int incomingSeq) {
     return seqSeen == 0 || incomingSeq > seqSeen;
 }
+
+// SEQ ACCEPT, per (sender, row) (protocol 56, N-player star). Every sender
+// numbers its rows from its OWN counter, so once the host relays one join's
+// rows to another a single per-row seqSeen lets the sender with the higher
+// counter starve everyone else's genuine changes as "stale". The guard is
+// therefore kept per sender inside the row; with one sender (two players) it
+// is exactly gateSeqAccept on one stamp.
+struct SenderSeq {
+    std::map<unsigned int, unsigned int> seen; // sender id -> newest accepted seq
+    // gateSeqAccept against this sender's stamp; stamps on accept.
+    bool accept(unsigned int sender, unsigned int incomingSeq) {
+        std::map<unsigned int, unsigned int>::iterator it = seen.find(sender);
+        if (it != seen.end()) {
+            if (!gateSeqAccept(it->second, incomingSeq)) return false;
+            it->second = incomingSeq;
+            return true;
+        }
+        seen[sender] = incomingSeq;
+        return true;
+    }
+    // A departed sender's counter means nothing to its successor (a reconnect
+    // may restart it), so its stamp is dropped on leave.
+    void forget(unsigned int sender) { seen.erase(sender); }
+};
 
 } // namespace sync
 } // namespace coop

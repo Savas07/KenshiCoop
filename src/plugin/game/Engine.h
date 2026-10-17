@@ -194,26 +194,36 @@ bool cameraCenter(GameWorld* gw, float out[3]);
 // contributes an interest anchor. Returns false if the lever is unresolved.
 bool cameraFocusOn(GameWorld* gw, Character* c);
 
+// Interest anchors (protocol 43, sized for N players in protocol 56): one per
+// squad-tab leader (up to MAX_PLAYERS) plus the local camera and every remote
+// player's camera hint (up to MAX_PLAYERS cameras in all).
+const unsigned int MAX_INTEREST_ANCHORS = 2 * MAX_PLAYERS;
+
 // Camera-anchored interest anchor stores (protocol 43). The sync layer
-// publishes the LOCAL camera center and the peer's (fresh) camera hint each
-// tick; interestCenters folds them in as extra anchors, deduped against the
-// squad-tab leader spheres. valid=false clears the anchor (camera not up /
-// hint stale). Main-thread only.
+// publishes the LOCAL camera center and every remote player's (fresh) camera
+// hint each tick; interestCenters folds them in as extra anchors, deduped
+// against the squad-tab leader spheres. valid=false clears the local anchor
+// (camera not up); n=0 clears the remote hints (all stale). Main-thread only.
 void setLocalCamAnchor(bool valid, float x, float y, float z);
-void setPeerCamHint(bool valid, float x, float y, float z);
-// Read the peer's camera hint back out, for predicates that must reason about
-// where THEY are looking rather than about the merged anchor set. False when no
-// fresh hint has arrived.
-bool peerCamAnchor(float out[3]);
+// xyz = n packed x,y,z triples (n is clamped to MAX_PLAYERS - 1), in the
+// order interestCenters should consider them (ascending player id).
+void setPeerCamHints(const float* xyz, unsigned int n);
+// Read the remote camera hints back out, for predicates that must reason about
+// where THEY are looking rather than about the merged anchor set. Writes up to
+// maxOut triples into out; returns the count (0 when no fresh hint arrived).
+unsigned int peerCamAnchors(float* out, unsigned int maxOut);
 // KENSHICOOP_CAM_INTEREST master enable: when off, interestCenters ignores
 // the camera anchors (squad-tab leaders only - the pre-43 behavior).
 void setCamInterest(bool on);
 
-// SEH-guarded: expose the current interest anchors (up to 4 x,y,z triples
-// into out[12]) to the sync layer - the mid-band nearest-first ordering
-// prioritizes by distance to the closest ANCHOR (tab leaders + cameras), so
-// camera-watched NPCs get mid-band drive slots too. Returns the anchor count.
-unsigned int interestAnchors(GameWorld* gw, float out[12]);
+// SEH-guarded: expose the current interest anchors (up to MAX_INTEREST_ANCHORS
+// x,y,z triples into out) to the sync layer - the mid-band nearest-first
+// ordering prioritizes by distance to the closest ANCHOR (tab leaders +
+// cameras), so camera-watched NPCs get mid-band drive slots too. Returns the
+// anchor count; nLeaders (optional) receives how many leading entries are
+// squad-tab leaders (the rest are cameras).
+unsigned int interestAnchors(GameWorld* gw, float out[3 * MAX_INTEREST_ANCHORS],
+                             unsigned int* nLeaders = 0);
 
 // ---- Stage 4 NPC replication primitives ------------------------------------
 

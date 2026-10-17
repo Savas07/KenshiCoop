@@ -14,16 +14,28 @@ namespace coop {
 namespace engine {
 
 // ---- In-game co-op session panel ---------------------------------------------
-// A native DatapanelGUI opened with F2 that lets the player pick role + transport
-// (buttons/checkboxes - the only reliably interactive DatapanelGUI controls;
-// MyGUI comboboxes/editboxes have no usable RVAs and don't receive keyboard focus
-// during gameplay) and Connect/Disconnect. The friend's Steam ID is entered by
-// clipboard: "Copy my Steam ID" puts the player's own id on the clipboard to
-// share, and "Paste friend's Steam ID" reads the friend's id back in (per-session,
-// never written to disk). The UDP endpoint (ip/port) still comes from
-// coop_config.json. The GUI layer stays session-agnostic: live status is passed IN
-// via *st and the user's actions are handed BACK through the callbacks (the plugin
-// root owns the session/config wiring). Main-thread only; SEH-guarded.
+// A native DatapanelGUI opened with F2 (buttons are the only reliably interactive
+// DatapanelGUI controls; MyGUI comboboxes/editboxes have no usable RVAs and don't
+// receive keyboard focus during gameplay). Two views:
+//   simple   - Host (opens a Steam lobby) + one-click Invite buttons for online
+//              friends, or one-click Join buttons for friends who are hosting;
+//              Leave / Stop hosting. No Steam IDs anywhere.
+//   advanced - the manual fallback: Role / Transport / Online toggles, plus
+//              "Copy my Steam ID" / "Paste friend's Steam ID" by clipboard
+//              (per-session, never written to disk). The UDP endpoint (ip/port)
+//              still comes from coop_config.json.
+// The GUI layer stays session-agnostic: live status is passed IN via *st and
+// the user's actions are handed BACK through *act (the plugin root owns the
+// session/config/Steam wiring). Main-thread only; SEH-guarded.
+
+// One online Steam friend for the simple view's Invite / Join lists.
+struct CoopPanelFriend {
+    unsigned long long id;
+    const char*        name;    // UTF-8 persona name
+    int                state;   // 1 online, 2 in Kenshi, 3 hosting co-op
+    int                version; // hosting only: 1 same mod protocol, -1 different, 0 unknown
+};
+
 struct CoopPanelState {
     unsigned long long selfSteamId; // steamp2p::selfId (0 = Steam not up)
     unsigned long long peerSteamId; // config steamPeer fallback (0 = unset; pasted id wins)
@@ -37,14 +49,31 @@ struct CoopPanelState {
     // while a join receives the host's world (e.g. "Streaming host world... 42%
     // (3.1/7.4 MB)"). Set by coopPanelDrive, rendered in dbgVal.
     const char*        transferDetail;
+    bool               inWorld;      // a game is loaded (hosting needs one)
+    int                playerCount;  // players in the session incl. us (1 = alone)
+    bool               steamInvites; // Steam lobby/invite layer is up
+    bool               lobbyHosting; // we own an open lobby (or one is opening)
+    const char*        inviteStatus; // lobby/invite status line ("" when idle)
+    const CoopPanelFriend* friends;  // online friends, hosting > in Kenshi > online
+    int                friendCount;
 };
 // The panel's role/transport selections at the moment Connect is hit. peerId is the
 // Steam ID pasted in-panel this session (0 if none), and overrides the config
 // steamPeer in coopUiConnect; the UDP endpoint is re-read from the config there.
 typedef void (*CoopConnectFn)(bool isHost, bool useSteam, unsigned long long peerId);
 typedef void (*CoopDisconnectFn)();
-void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect);
+typedef void (*CoopFriendFn)(unsigned long long friendId);
+struct CoopPanelActions {
+    CoopConnectFn    connect;    // advanced view: Online toggle
+    CoopDisconnectFn disconnect; // Leave / Stop hosting / Offline toggle
+    void           (*host)();    // simple view: open this game to friends
+    CoopFriendFn     invite;     // send a Steam invite to a friend
+    CoopFriendFn     join;       // join a friend who is hosting
+};
+void coopPanelTick(const CoopPanelState* st, const CoopPanelActions* act);
+
+// True while the F2 panel is open (the plugin keeps the friend list fresh then).
+bool coopPanelIsOpen();
 
 // Persistent co-op connection-status banner: a single screen-space label fixed 10
 // px in from the top-left corner (a createFloatingLabel MyGUI::Window on the
