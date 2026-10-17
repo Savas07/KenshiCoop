@@ -35,6 +35,9 @@ Replicator::Replicator()
       combatSnapTotal_(0), combatSoftWalk_(0), combatSlide_(0), combatOrder_(0),
       combatWrongTgt_(0), combatLogTick_(0),
       interpLogTick_(0),
+      trailN_(0), trailGapNewSum_(0.0f), trailGapNewMax_(0.0f), trailGapOutSum_(0.0f),
+      trailBodySpdSum_(0.0f), trailSrcSpdSum_(0.0f), trailSpdN_(0),
+      pauseHold_(0), sqSnapCool_(0), sqSettle_(0),
       translateFrames_(0), walkTruthFrames_(0),
       restSampleFrames_(0), marchFrames_(0),
       marchHold_(0), marchSettle_(0), marchRelapse_(0),
@@ -533,7 +536,7 @@ void Replicator::ingest(Inbound& in) {
                 (now - d.lastSeenMs) <= (unsigned long)PEER_STREAM_FRESH_MS;
             if (incumbentLive && it->ownerId > d.author) continue;
             if (d.author != AUTHOR_NONE) {
-                d.interp = EntityInterp();
+                d.interp.restartRing();
                 char b[160];
                 _snprintf(b, sizeof(b) - 1,
                           "[drive] AUTHOR hand=%u,%u,%u,%u,%u from=%u to=%u (%s)",

@@ -100,6 +100,15 @@ public:
 
     bool empty() const { return count_ == 0; }
 
+    // Drop the positional history but KEEP the timing statistics (cadence,
+    // jitter, queueing lag). For a stream whose positions can no longer be
+    // spliced onto the old ring - a different author's simulation (protocol 56
+    // handover) - while the path timing it learned is still the best estimate
+    // of the next packets' lateness. A full reset (EntityInterp()) re-learned
+    // the lag from zero, i.e. rendered at the 50 ms floor straight into Steam
+    // jitter and starved into extrapolation for the next seconds.
+    void restartRing() { count_ = 0; head_ = 0; lastArrival_ = 0; haveLast_ = false; }
+
     // Ring fill (0..CAP). A young ring (< CAP) means this entity was (re-)
     // acquired within the last ~16 samples - its first reconciliation snap
     // is a coverage event, not steady-state tracking noise (Phase 2).

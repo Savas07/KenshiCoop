@@ -1442,8 +1442,24 @@ void Replicator::applyTargets(GameWorld* gw) {
         if (segMs * 5 > moveHold) moveHold = segMs * 5; // survive sample droughts
         if (moveHold > 5000) moveHold = 5000;
         float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
-        if (vlen > d.velPeak) d.velPeak = vlen;
-        else                  d.velPeak *= 0.99f; // ~1 s half-life at 75 fps
+        // Consensus sim paused (protocol 25 speed SET 0). Nothing local moves -
+        // neither our walk orders nor, measurably, our teleports: the
+        // 2026-10-17 Steam session hard-snapped 'Plank' every frame for 5 s of
+        // pause (snapSq 2 -> 794) at a CONSTANT gap of 39.5 u, while the owner's
+        // frozen stream kept reporting cSpeed=71.6 / currentlyMoving. The drive
+        // holds still while paused (see the hold below) and the snap gate's
+        // velocity peak stops decaying, so unpausing resumes where it stopped.
+        bool simPaused = speedLastSet_ >= 0.0f && speedLastSet_ <= 0.01f;
+        // Peak decays with a ~1 s half-life of WALL time. It decayed 1% per
+        // frame ("~1 s at 75 fps"), which is 0.6 s at 120 fps and kept
+        // collapsing the gate to the snapDist floor during a pause.
+        {
+            unsigned long vdt = (d.velPeakMs != 0) ? (now - d.velPeakMs) : 0;
+            d.velPeakMs = now;
+            if (vlen > d.velPeak) d.velPeak = vlen;
+            else if (!simPaused && vdt > 0)
+                d.velPeak *= std::pow(0.5f, (float)vdt / 1000.0f);
+        }
         if (haveNewest && vlen > NPC_MOVE_VEL) d.moveSeenMs = now;
         bool npcMoving = haveNewest && d.moveSeenMs != 0 &&
                          (now - d.moveSeenMs) <= moveHold;
@@ -1587,9 +1603,33 @@ void Replicator::applyTargets(GameWorld* gw) {
         // rebuilt every tick, so it self-clears the instant ownership flips back.
         if (aiSuspend_) engine::addAiSuspend(c);
 
+        // Squad settle (MoveSync 2026-10-17). A PC copy classified moving on the
+        // owner's instantaneous flags, so the tick the owner stopped it entered
+        // the rest branch and PARKED (halt + teleport) at the interpolated pose -
+        // which renders a render-delay behind the stop point (~150 ms x run speed
+        // = 10 u at a run), while the walk-drive had the body at or past it: a
+        // visible jump back at every stop, then a per-frame re-place slide
+        // forward. Keep walking the body to the stop point until the render pose
+        // has caught up AND the body is there, bounded so a blocked body still
+        // settles. Beds keep their anchored rest path (see taskIsBedPose above).
+        bool squadSettle = false;
+        if (isSquad && !hostMoving && !crawling && haveNewest && haveActual &&
+            !engine::taskIsBedPose((int)out.task)) {
+            if (d.settleSinceMs == 0) d.settleSinceMs = now;
+            bool renderBehind = dist3(out.x, out.y, out.z,
+                                      newest.x, newest.y, newest.z) > SQUAD_SETTLE_DIST;
+            bool bodyAway = gapNewest > WALK_ARRIVE_DIST && !d.walkHalted;
+            if ((renderBehind || bodyAway) &&
+                (now - d.settleSinceMs) < SQUAD_SETTLE_MAX_MS) {
+                squadSettle = true;
+                ++sqSettle_;
+            }
+        } else if (hostMoving) {
+            d.settleSinceMs = 0;
+        }
         // Re-arm rest-pose reproduction whenever the body is genuinely moving, so
         // the next time it stops we re-evaluate the host's (possibly new) task.
-        bool genuinelyMoving = isSquad ? hostMoving : npcMoving;
+        bool genuinelyMoving = isSquad ? (hostMoving || squadSettle) : npcMoving;
         if (genuinelyMoving) {
             // Seat-break (2026-07-11): a rest pose applyRest committed is a
             // PLAYER-RANK order, and a seated body both ignores goal-level
@@ -1643,7 +1683,15 @@ void Replicator::applyTargets(GameWorld* gw) {
         // the movement controller (walk + teleport both no-op).
         bool snapOk;
         if (isSquad) {
-            snapOk = haveNewest;
+            // Cooldown (MoveSync): a squad snap that did not stick (paused sim,
+            // seat anchor, unloaded ground) re-fired EVERY frame - 600+ teleports
+            // in 5 s on the 2026-10-17 session. Between snaps the catch-up walk
+            // converges; a source teleport (segment snap edge) is never deferred.
+            bool cooling = d.sqSnapMs != 0 && (now - d.sqSnapMs) < SQUAD_SNAP_COOL_MS;
+            snapOk = haveNewest && (!cooling || teleportEdge);
+            if (haveNewest && !snapOk && !simPaused && genuinelyMoving && haveActual &&
+                gapNewest > snapGate)
+                ++sqSnapCool_;
         } else {
             // (A grow-vs-own-EMA ratio trigger was tried for the divergence
             // gate first and kept firing on melee-lunge jitter - srcVel 0,
@@ -1654,12 +1702,19 @@ void Replicator::applyTargets(GameWorld* gw) {
             snapOk = gapNewest > snapGate * 3.0f &&
                      (!midTier || (now - d.npcSnapTick) >= NPC_SNAP_COOL_MS);
         }
-        if (genuinelyMoving && haveActual && gapNewest > snapGate && snapOk) {
+        if (simPaused) {
+            // Paused consensus sim: hold. No snap, walk order, park or pose
+            // apply - none of them take effect until the sim runs again, and the
+            // per-frame retries were the snap storm above. Unpausing resumes the
+            // drive from the live state on the next tick.
+            ++pauseHold_;
+        } else if (genuinelyMoving && haveActual && gapNewest > snapGate && snapOk) {
             // Fell behind / source warped: hard-snap to the true position
             // (no-halt teleport keeps the clip phase advancing).
             engine::applyRaw(c, newest);
             if (isSquad) {
                 ++hardSnapSquad_;
+                d.sqSnapMs = now;
                 logHardSnap(c, out, "squad", gapNewest, vlen, snapGate, d.haveDest);
             } else {
                 // Accounting: a snap on a YOUNG ring (< 16 samples, ~0.8 s of
@@ -1775,12 +1830,39 @@ void Replicator::applyTargets(GameWorld* gw) {
             // builds speed (zeroFrac 0.388 -> 0.474 on leader_move). Waiting for a
             // metre of target movement is the hysteresis.
             bool sourceMoving = vlen > NPC_MOVE_VEL;
-            if (moved > REISSUE_DIST) {
-                float spd = out.cSpeed + gapNewest * catchupK_;
-                float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
-                float cap = base * 2.5f;
-                if (spd > cap) spd = cap;
-                engine::walkTo(c, tx, ty, tz, spd);
+            // Catch-up speed, low-passed per body (MoveSync). It was computed
+            // only on a re-issue, from gapNewest - which saw-tooths by a whole
+            // sample step (3.5 u at a run) every 50 ms - and for a squad body the
+            // locomotion mirror below then overwrote desiredSpeed with the
+            // source's plain speed in the same tick, so a PC copy that lost
+            // ground could never win it back: it trailed until the velocity gate
+            // teleported it (the 2026-10-17 session: gap 57 u at srcVel 69).
+            float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
+            float wantSpd = out.cSpeed + gapNewest * catchupK_;
+            if (wantSpd > base * 2.5f) wantSpd = base * 2.5f;
+            unsigned long ddt = (d.driveMs != 0) ? (now - d.driveMs) : 0;
+            d.driveMs = now;
+            if (ddt == 0 || ddt > 250 || !d.walkBranchPrev) {
+                d.catchSpd = wantSpd;
+            } else {
+                float a = (float)ddt / CATCHUP_FILTER_MS;
+                if (a > 1.0f) a = 1.0f;
+                d.catchSpd += (wantSpd - d.catchSpd) * a;
+            }
+            // Re-issue threshold. Each walkTo on a PC copy is a player move
+            // order (Character::setDestination) that re-plans the path, and at
+            // a run the lead point crosses the flat 1 u every sample - 14 path
+            // restarts/s measured (reissueSq 130 -> 420 in 35 s). Scale it with
+            // the remaining lead distance for squad bodies: a long lead needs a
+            // proportionally large target shift to change the route, and the
+            // threshold shrinks back to 1 u as the body closes on the point.
+            float reissueDist = REISSUE_DIST;
+            if (isSquad && haveActual) {
+                float leadFar = dist3(ax, ay, az, tx, ty, tz) * SQUAD_REISSUE_FRAC;
+                if (leadFar > reissueDist) reissueDist = leadFar;
+            }
+            if (moved > reissueDist) {
+                engine::walkTo(c, tx, ty, tz, d.catchSpd);
                 if (isSquad) ++walkReissueSquad_;
                 else         ++walkReissueNpc_;
                 d.haveDest = true; d.dx = tx; d.dy = ty; d.dz = tz;
@@ -1826,9 +1908,58 @@ void Replicator::applyTargets(GameWorld* gw) {
             // setDesiredSpeed on the CharMovement path, so they keep the
             // no-mirror behavior (the engine picks their clip from the locomotion
             // it actually performs); mirroring an NPC here would fight that.
-            if (isSquad)
-                engine::applyMotion(c, true, out.cSpeed,
-                                    out.cMotionX, out.cMotionY, out.cMotionZ);
+            if (isSquad && sourceMoving && haveActual) {
+                // Squad trail telemetry (the "[interp] squadTrail" line).
+                ++trailN_;
+                trailGapNewSum_ += gapNewest;
+                if (gapNewest > trailGapNewMax_) trailGapNewMax_ = gapNewest;
+                trailGapOutSum_ += dist3(ax, ay, az, out.x, out.y, out.z);
+                if (d.haveActual && ddt > 0 && ddt <= 250) {
+                    trailBodySpdSum_ += dist3(ax, ay, az, d.lx, d.ly, d.lz) *
+                                        1000.0f / (float)ddt;
+                    trailSrcSpdSum_  += vlen;
+                    ++trailSpdN_;
+                }
+                // Error bleed (MoveSync, KENSHICOOP_DRIVE_BLEED): a body that
+                // trails the source by more than its natural lag is moved up
+                // continuously - at most bleed x source speed extra, i.e. it
+                // reads as running a little faster - instead of accumulating the
+                // deficit into a velocity-gate teleport. A no-halt placement that
+                // keeps the body's own orientation (the walk owns the facing).
+                float bleed = driveBleed();
+                float allow = vlen * BLEED_ALLOW_SEC + WALK_ARRIVE_DIST;
+                if (bleed > 0.0f && ddt > 0 && ddt <= 250 && gapNewest > allow) {
+                    float step = bleed * vlen * (float)ddt / 1000.0f;
+                    float excess = gapNewest - allow;
+                    if (step > excess) step = excess;
+                    float k = step / gapNewest;
+                    if (engine::nudgePos(c, ax + (newest.x - ax) * k,
+                                         ay + (newest.y - ay) * k,
+                                         az + (newest.z - az) * k)) {
+                        trailBleedSum_ += step;
+                        ++trailBleedN_;
+                    }
+                }
+            }
+            // Locomotion mirror, carrying the catch-up speed: the owner's own
+            // speed here pinned the copy to the pace it had already lost ground
+            // at. While settling after the owner stopped (no source motion to
+            // mirror) the walk order's own gait runs the body to the stop point;
+            // once it has arrived and halted, the mirror says STOPPED - a copy
+            // left mirroring a frozen run state marched in place.
+            if (isSquad) {
+                if (sourceMoving || out.cMoving != 0) {
+                    if (!(d.walkHalted && !sourceMoving)) {
+                        float ms = (d.catchSpd > out.cSpeed) ? d.catchSpd : out.cSpeed;
+                        engine::applyMotion(c, true, ms,
+                                            out.cMotionX, out.cMotionY, out.cMotionZ);
+                    } else {
+                        engine::applyMotion(c, false, 0.0f, 0.0f, 0.0f, 0.0f);
+                    }
+                } else if (d.walkHalted) {
+                    engine::applyMotion(c, false, 0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            }
         } else {
             // At rest, task-authoritative: reproduce the host's sit/idle pose
             // at the same fixture, else quiet + park. Bar patrons sit
@@ -1878,7 +2009,9 @@ void Replicator::applyTargets(GameWorld* gw) {
         // population), not just cadence: a boundary walker flaps between
         // cadences faster than the estimate settles (run 111445). The
         // anti-zombie oracle owns mid-tier quality.
-        bool oracleNear = !midTier;
+        // A paused sim moves nothing on either side: scoring those frames
+        // charged every pause to zeroFrac/march (MoveSync).
+        bool oracleNear = !midTier && !simPaused;
         if (oracleNear && !isSquad && haveActual && oracleSquadN > 0) {
             float best = -1.0f;
             for (unsigned int oi = 0; oi < oracleSquadN; ++oi) {

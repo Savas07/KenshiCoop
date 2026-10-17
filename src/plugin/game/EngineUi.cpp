@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "../core/SteamId.h" // parseSteamId64 (paste button) + maskSteamId64 (id rows)
+#include "../core/Version.h" // KENSHICOOP_VERSION (panel title)
 
 namespace coop {
 namespace engine {
@@ -824,7 +825,7 @@ void coopPanelTick(const CoopPanelState* st, const CoopPanelActions* act) {
         RowList rl;
         if (g_panel.advanced) buildAdvancedRows(st, rl, transfer);
         else                  buildSimpleRows(st, rl, transfer);
-        std::string title = "Co-op Session    -    F2 to close";
+        std::string title = "Co-op Session  v" KENSHICOOP_VERSION "    -    F2 to close";
         std::string empty;
         PanelBuild pb;
         pb.title = &title;

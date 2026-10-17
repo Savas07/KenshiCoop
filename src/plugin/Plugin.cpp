@@ -31,6 +31,7 @@
 #include "core/CrashDump.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
+#include "core/Version.h"
 #include "net/NetLink.h"
 #include "net/SteamP2P.h"
 #include "net/SteamInvite.h"
@@ -2068,6 +2069,7 @@ void coopUiDisconnect() {
 // and the effective (resolved) config summary. Answerable from the log alone.
 void logStartupBanner() {
     coopLog("KenshiCoop loaded! (clean rebuild)");
+    coopLog("KenshiCoop: version v" KENSHICOOP_VERSION);
     if (g_cfg.fakeClockSkewMs != 0) {
         char b[96];
         _snprintf(b, sizeof(b) - 1, "KenshiCoop: FAKE clock skew injected: %+ld ms",

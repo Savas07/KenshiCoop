@@ -64,6 +64,21 @@ u32 monoMs() {
                  (unsigned __int64)freq.QuadPart);
 }
 
+// Service ENet until the next transmit slot (an absolute monoMs deadline).
+// The receive ladder used to be `while (enet_host_service(h, &ev, TICK_MS) > 0)`:
+// every inbound event restarted a full 50 ms wait, so the transmit half of the
+// loop (the entity batch and every outbound queue) only ran after 50 ms of
+// inbound SILENCE. Under a peer's own ~20 Hz stream that silence comes and goes
+// with path jitter, so the motion stream left irregularly (the 2026-10-17 Steam
+// session measured jit=20-50 ms on the SENDER's capture stamps) and a host fed
+// by several joins could go whole stretches without transmitting at all.
+int serviceUntil(ENetHost* h, ENetEvent* ev, u32 deadline) {
+    long rem = (long)(deadline - monoMs());
+    if (rem < 0) rem = 0;
+    if (rem > TICK_MS) rem = TICK_MS;
+    return enet_host_service(h, ev, (enet_uint32)rem);
+}
+
 // The fixed-POD queueX methods are all the same MAIN-thread enqueue: take the
 // publish lock, append one copied packet, release. This collapses that shared
 // body so each queueX is a one-liner and the lock discipline lives in one place.
@@ -514,6 +529,7 @@ void NetLink::threadLoop() {
     long          bestOffsetMs  = 0;
     unsigned int  syncSamples   = 0;
     const long    HALF_DAY_MS   = 12l * 3600l * 1000l;
+    u32           nextTx        = monoMs() + (u32)TICK_MS; // transmit slot (serviceUntil)
 
     while (!stopFlag_) {
         // Steam heartbeat: spike ping/echo + session-state change logging.
@@ -542,7 +558,7 @@ void NetLink::threadLoop() {
         }
 
         ENetEvent ev;
-        while (enet_host_service(enetHost_, &ev, TICK_MS) > 0) {
+        while (serviceUntil(enetHost_, &ev, nextTx) > 0) {
             switch (ev.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
                     if (isHost_) {
@@ -1148,6 +1164,13 @@ void NetLink::threadLoop() {
                 default:
                     break;
             }
+        }
+        // Next transmit slot: a fixed 20 Hz schedule, re-anchored if this pass
+        // ran so long that the slot already passed (never a catch-up burst).
+        {
+            u32 nowTx = monoMs();
+            nextTx += (u32)TICK_MS;
+            if ((long)(nowTx - nextTx) >= 0) nextTx = nowTx + (u32)TICK_MS;
         }
 
         // Release any WAN-sim-delayed inbound entities whose arrival time has come.

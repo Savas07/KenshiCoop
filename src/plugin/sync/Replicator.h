@@ -991,6 +991,16 @@ private:
         // accrued under sparse mid coverage - classed to the mid ledger
         // (like young-ring coverage snaps), not steady-state near tracking.
         unsigned long midSeenMs;
+        // ---- MoveSync (2026-10-17 remote-movement smoothness pass) ----------
+        unsigned long velPeakMs;  // last velPeak update: the peak now decays per
+                                  //   wall-clock second (it decayed per FRAME, so
+                                  //   the snap gate collapsed faster at high fps
+                                  //   and kept collapsing while the sim was paused)
+        unsigned long sqSnapMs;   // last squad hard snap (cooldown: a teleport that
+                                  //   does not stick must not re-fire every frame)
+        float         catchSpd;   // low-passed walk-drive catch-up speed (u/s)
+        unsigned long driveMs;    // last walk-branch tick (catch-up filter dt)
+        // ---- end MoveSync ----------------------------------------------------
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0), walkHalted(false), walkStallF(0),
                    suppressed(false), lastSeenMs(0), author(AUTHOR_NONE), authorSinceMs(0),
@@ -1012,7 +1022,8 @@ private:
                    restEnterMs(0), walkBranchPrev(false),
                    zeroF(0), activeF(0), advMs(0),
                    oracleActivePrev(false), oracleOnsetMs(0),
-                   prevInterpMode(-1), midSeenMs(0) {
+                   prevInterpMode(-1), midSeenMs(0),
+                   velPeakMs(0), sqSnapMs(0), catchSpd(0.0f), driveMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
         }
     };
@@ -1850,6 +1861,23 @@ private:
     unsigned long combatWrongTgt_;  // hard snaps fired while fighting the WRONG local target
     unsigned long combatLogTick_;
     unsigned long interpLogTick_;
+
+    // ---- MoveSync (2026-10-17 remote-movement smoothness pass) --------------
+    // Squad drive health, surfaced on a ~5 s "[interp] squadTrail" line next to
+    // the "[interp]" counters. Window sums (reset per line) of how far each
+    // driven SQUAD body trails its source while walking - gapNew = to the newest
+    // received pose (what the walk-drive chases), gapOut = to the interpolated
+    // render pose - plus the body's actual speed vs the source's stream speed,
+    // and cumulative counts of the new holds: pauseHold = drive ticks skipped
+    // while the consensus sim is paused, snapCool = squad snaps deferred by the
+    // cooldown, settle = ticks a squad body kept walking after its source
+    // stopped because the render pose had not yet reached the stop point.
+    unsigned long trailN_;
+    float         trailGapNewSum_, trailGapNewMax_, trailGapOutSum_;
+    float         trailBodySpdSum_, trailSrcSpdSum_;
+    unsigned long trailSpdN_;
+    unsigned long pauseHold_, sqSnapCool_, sqSettle_;
+    // ---- end MoveSync -------------------------------------------------------
 
     // Protocol 36 (wire v35): per-sender clock mapping for the batch send
     // stamp. offsetMs tracks the MINIMUM observed (arrival - sendMs) - the
