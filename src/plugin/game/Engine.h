@@ -85,6 +85,9 @@ void setLoadSuppress(bool on);
 // (the join's coordinated load issued on PKT_LOAD_GO / post-transfer).
 void setLoadBypassOnce();
 unsigned int drainLoadEdges(LoadEdge* out, unsigned int maxOut);
+// Monotonic count of loads that actually proceeded (any entry point). Unchanged
+// across a world becoming live = that world came from New Game, not a save.
+unsigned int loadEdgeSerial();
 
 // Protocol 32 probe: the deferred-signal mechanism's state. SaveManager::load
 // sets signal=LOADGAME(2) + a frame delay; SOMETHING must then call

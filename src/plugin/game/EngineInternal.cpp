@@ -167,12 +167,19 @@ static void adoptLoadedName(const char* nm) {
     setCurrentGameName(std::string(nm));
 }
 
+// Monotonic count of loads that really proceeded (not suppressed). The plugin
+// compares it across "world became live" edges to tell a world that came from
+// a save (count moved) from one that came from New Game (count unchanged).
+static volatile long g_loadEdgeSerial = 0;
+unsigned int loadEdgeSerial() { return (unsigned int)g_loadEdgeSerial; }
+
 // Shared edge/suppression body. Returns true when the original must run
 // (i.e. the load was NOT suppressed). 'via' tags the log with the entry.
 static bool loadDetourEdge(const char* nm, const char* via) {
     const bool bypass   = g_loadBypassOnce;
     const bool suppress = g_loadSuppressAll && !bypass;
     g_loadBypassOnce = false;
+    if (!suppress) InterlockedIncrement(&g_loadEdgeSerial);
     __try {
         LoadEdgeRec r;
         memset(&r, 0, sizeof(r));

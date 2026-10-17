@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 57;
+const u16 PROTOCOL_VERSION = 58;
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -1468,6 +1468,10 @@ struct LoadGoPacket {
     u32  loadId;      // per-host monotonic load id (stale-NACK guard)
     u32  fingerprint; // folder fingerprint of the host's copy (0 = unknown)
     char name[48];    // save name ('\0'-padded)
+    // Protocol 58: 1 = the host's world came from New Game this session (not
+    // from a save), so joins may open the character editor for their fresh
+    // co-op-start characters. 0 = an ongoing campaign: never re-roll anyone.
+    u8   freshStart;
 };
 
 // Join -> host: "my player pressed load" (the join's local load was

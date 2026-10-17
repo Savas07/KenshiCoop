@@ -114,6 +114,10 @@ struct SessionController {
     coop::u32    loadXferMask;
     // Host: the newest LOAD_GO id sent to each join (per-join stale-NACK guard).
     std::map<coop::u32, coop::u32> goIdFor;
+    // Character creation gate (protocol 58). Host: its live world came from New
+    // Game this session. Join: the GO it loaded said so (freshStart).
+    bool         worldFresh;
+    bool         hostFresh;
     // Coordinated save (protocol 31).
     std::string  savePending;      // host: save name awaiting quiescence
     coop::u32    saveReqId;        // join: monotonic PKT_SAVE_REQ counter
@@ -148,6 +152,7 @@ struct SessionController {
     SessionController()
       : gameStarted(false), gameStartTick(0), autoLoadDone(false),
         titleFirstTick(0), peerPresent(false), bootstrapMask(0), loadXferMask(0),
+        worldFresh(false), hostFresh(false),
         saveReqId(0), bootstrapArmed(false),
         swapStartTick(0), swapHookTicks(0),
         loadSuppressOn(false), loadIdOut(0), loadIdSeen(0), loadReqId(0),
@@ -160,6 +165,8 @@ DWORD&       g_gameStartTick   = g_session.gameStartTick;
 bool&        g_autoLoadDone    = g_session.autoLoadDone;
 DWORD&       g_titleFirstTick  = g_session.titleFirstTick;
 bool&        g_peerPresent     = g_session.peerPresent;
+bool&        g_worldFresh      = g_session.worldFresh;
+bool&        g_hostFresh       = g_session.hostFresh;
 std::string& g_savePending     = g_session.savePending;
 coop::u32&   g_saveReqId       = g_session.saveReqId;
 bool&        g_bootstrapArmed  = g_session.bootstrapArmed;
@@ -430,6 +437,13 @@ void processNetEvents(GameWorld* gw) {
 // being copy-pasted into both. Emits no log line, so the oracle log contract is
 // unaffected by the extraction.
 void pumpSaveReceive() {
+    // DONEs FIRST: the net thread queues a transfer's BEGIN, chunks and DONE in
+    // order, so every chunk of a DONE drained here is already queued and is
+    // drained below. Draining DONEs last let chunks + DONE that arrived while the
+    // chunk writes ran be verified as a SHORT transfer (badCrc, join stuck).
+    std::deque<coop::InboundSaveDone> dones;
+    g_inbound.drainSaveDones(dones);
+
     std::deque<coop::InboundSaveBegin> begins;
     g_inbound.drainSaveBegins(begins);
     for (std::deque<coop::InboundSaveBegin>::iterator it = begins.begin();
@@ -443,8 +457,6 @@ void pumpSaveReceive() {
         coop::savexfer::onSaveFile(it->hdr, it->path.c_str(),
                                    it->data.empty() ? 0 : &it->data[0]);
 
-    std::deque<coop::InboundSaveDone> dones;
-    g_inbound.drainSaveDones(dones);
     for (std::deque<coop::InboundSaveDone>::iterator it = dones.begin();
          it != dones.end(); ++it) {
         coop::u16 files = 0;
@@ -547,6 +559,7 @@ void driveSaveSync() {
                     go.loadId      = ++g_loadIdOut;
                     go.fingerprint = coop::savexfer::folderFingerprint(g_bootstrapName);
                     strncpy(go.name, g_bootstrapName.c_str(), sizeof(go.name) - 1);
+                    go.freshStart  = g_worldFresh ? 1 : 0;
                     g_net.queueLoadGo(go, g_session.bootstrapMask);
                     for (coop::u32 k = 1; k < coop::MAX_PLAYERS; ++k)
                         if (g_session.bootstrapMask & coop::peerBit(k)) g_session.goIdFor[k] = go.loadId;
@@ -627,6 +640,7 @@ void driveLoadSync(GameWorld* gw) {
             go.loadId      = ++g_loadIdOut;
             go.fingerprint = coop::savexfer::folderFingerprint(name);
             strncpy(go.name, name.c_str(), sizeof(go.name) - 1);
+            go.freshStart  = 0; // a load: the new world is a saved campaign
             g_net.queueLoadGo(go, joinMask());
             for (std::set<coop::u32>::const_iterator pit = g_session.peers.begin();
                  pit != g_session.peers.end(); ++pit)
@@ -751,6 +765,7 @@ void driveLoadSync(GameWorld* gw) {
              it != gos.end(); ++it) {
             if (it->pkt.loadId <= g_loadIdSeen) continue; // stale/duplicate
             g_loadIdSeen = it->pkt.loadId;
+            g_hostFresh  = it->pkt.freshStart != 0;
             char name[sizeof(it->pkt.name) + 1];
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
@@ -959,6 +974,17 @@ void coopPanelDrive() {
 // them, so no forward declarations are needed.
 // ---------------------------------------------------------------------------
 
+// "World became live" bookkeeping for character creation: a world that went
+// live with no proceeding load since the previous one came from New Game.
+void noteWorldLive() {
+    static unsigned int s_serialAtLive = 0;
+    const unsigned int serial = coop::engine::loadEdgeSerial();
+    g_worldFresh = (serial == s_serialAtLive);
+    s_serialAtLive = serial;
+    coopLog(g_worldFresh ? "[chargen] host world source: NEW GAME (joins may create characters)"
+                         : "[chargen] host world source: SAVE (no character creation)");
+}
+
 // Protocol 32 world-swap edge detection. Runs FIRST so the reload edge (and,
 // under load-sync, the session reset) lands before any sync code touches
 // pointers from the torn-down world this tick.
@@ -985,6 +1011,7 @@ void tickWorldSwapEdge(GameWorld* gw) {
                           "[load] WORLD-RELOAD swapMs=%lu hookTicksDuringSwap=%u",
                           (unsigned long)swapMs, (unsigned)g_swapHookTicks);
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
+                if (g_cfg.isHost) noteWorldLive();
                 // Session reset (protocol 32): centralized order (repl maps then
                 // inbound queues). Peer presence + suppression levers survive.
                 if (g_cfg.loadSync)
@@ -1331,13 +1358,18 @@ static void tickCharGen(GameWorld* gw, bool worldLive) {
                 return;
             }
         }
-        // Only a fresh KenshiCoop co-op start offers character creation: the
-        // editor (new-game mode) re-rolls the look and resets the body, which
-        // must never hit established characters of an ongoing campaign.
+        // Only a world the host started with New Game THIS session offers
+        // character creation (the GO said freshStart), and only for co-op-start
+        // characters: the editor (new-game mode) re-rolls the look and resets
+        // the body, which must never hit an ongoing campaign - including one
+        // that began from a co-op start, whose characters keep that template.
         for (unsigned int i = 0; i < n; ++i) {
-            if (!coop::engine::chargenIsCoopStartChar(owned[i])) {
+            const char* why = !g_hostFresh ? " (host world is a saved campaign)"
+                            : !coop::engine::chargenIsCoopStartChar(owned[i])
+                              ? " (existing character, not a co-op start)" : 0;
+            if (why) {
                 for (unsigned int k = 0; k < n; ++k) coop::engine::chargenSetMarker(owned[k]);
-                chargenLog("SKIP", g_net.localId(), owned[i], " (existing character, not a co-op start)");
+                chargenLog("SKIP", g_net.localId(), owned[i], why);
                 g_cgState = CG_DONE;
                 return;
             }
@@ -1849,6 +1881,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         g_gameStarted   = true;
         g_gameStartTick = GetTickCount();
         coopLog("KenshiCoop: gameplay started");
+        if (g_cfg.isHost) noteWorldLive();
         // Coordinated load (protocol 32): the title-screen auto-load fired the
         // load detour BEFORE gameplay - discard its queued edge here, or the
         // first driveLoadSync tick (g_gameStarted now true) would mistake it
