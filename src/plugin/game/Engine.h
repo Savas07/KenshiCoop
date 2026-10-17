@@ -12,6 +12,7 @@
 #define KENSHICOOP_ENGINE_H
 
 #include <string>
+#include <vector>
 #include "../../netproto/Wire.h"
 
 class GameWorld;
@@ -135,6 +136,9 @@ RootObject* resolveObject(const ObjectHand& h);
 // SEH-guarded RAW apply: teleport the body to the entity transform via the
 // movement controller (no interpolation). Stage 1 apply path.
 bool applyRaw(Character* c, const EntityState& e);
+// ---- MoveSync: SEH-guarded position nudge keeping the body's current facing
+// (error bleed for a trailing walk-driven squad copy). ----
+bool nudgePos(Character* c, float x, float y, float z);
 
 // SEH-guarded: read a character's current world position (for SCENARIO logging).
 bool readPos(Character* c, float* x, float* y, float* z);
@@ -2211,6 +2215,31 @@ void setSpeedCombatHint(bool inCombat);
 // click=false dehighlight). No-op when already matching. Gate the call on "no
 // user acted this tick" so a genuine same-frame click is not fought.
 void reconcileVoteButtons();
+
+// ---- CharCreate: join character creation (EngineCharGen.cpp, protocol 57) ----
+// All SEH-guarded. The marker is idata "kenshicoop chargen" in the appearance
+// GameData (persists through the save via AppearanceBase::serialise).
+bool chargenHasMarker(Character* c);
+bool chargenSetMarker(Character* c);
+// True when the body comes from a KenshiCoop co-op game start (its GameData
+// template is "<n>-KenshiCoop-MultiplayerStart.mod") - a fresh co-op character.
+bool chargenIsCoopStartChar(Character* c);
+// True when the RACE GameData 'sid' exists in this game's loaded data.
+bool chargenRaceKnown(GameWorld* gw, const char* sid);
+// Race GameData stringID of the body ('' when unknown).
+void chargenRaceSid(Character* c, char* out, unsigned int cap);
+// Open the native editor (EDIT_NEWGAME, all playable races) on chars[0..n).
+// False when an editor is already open or on fault.
+bool chargenOpenEditor(Character** chars, unsigned int n);
+// True while ForgottenGUI::characterEditor is non-null.
+bool chargenEditorOpen();
+// Test hook: randomise + next race + name every edited body, then confirm.
+bool chargenAutoConfirm(const char* name);
+// Export the body's appearance as .bod2 bytes (the editor's exporter path).
+bool chargenExport(Character* c, std::vector<unsigned char>& out);
+// Load .bod2 bytes back and hand them to setAppearanceData; then setName.
+bool chargenApply(Character* c, const std::vector<unsigned char>& bod2, const char* name);
+// ---- end CharCreate ----
 
 } // namespace engine
 } // namespace coop

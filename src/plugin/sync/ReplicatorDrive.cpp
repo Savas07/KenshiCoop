@@ -1457,7 +1457,10 @@ void Replicator::applyTargets(GameWorld* gw) {
             unsigned long vdt = (d.velPeakMs != 0) ? (now - d.velPeakMs) : 0;
             d.velPeakMs = now;
             if (vlen > d.velPeak) d.velPeak = vlen;
-            else if (!simPaused && vdt > 0)
+            // A squad copy's peak is frozen while its owner is halted (MoveSync
+            // 2026-10-18): the gate must not collapse under a body still walking
+            // in to the stop point.
+            else if (!simPaused && vdt > 0 && (!isSquad || hostMoving))
                 d.velPeak *= std::pow(0.5f, (float)vdt / 1000.0f);
         }
         if (haveNewest && vlen > NPC_MOVE_VEL) d.moveSeenMs = now;
@@ -1619,6 +1622,10 @@ void Replicator::applyTargets(GameWorld* gw) {
             bool renderBehind = dist3(out.x, out.y, out.z,
                                       newest.x, newest.y, newest.z) > SQUAD_SETTLE_DIST;
             bool bodyAway = gapNewest > WALK_ARRIVE_DIST && !d.walkHalted;
+            // The settle cap is a SAFETY bound for a blocked body, not a
+            // schedule: a copy 60-100 u behind at the halt needs 1.5-3 s at a
+            // run to walk in; ending earlier fell through to the rest-path
+            // park (a teleport). Measured 2026-10-18 move_legs.
             if ((renderBehind || bodyAway) &&
                 (now - d.settleSinceMs) < SQUAD_SETTLE_MAX_MS) {
                 squadSettle = true;
@@ -1688,10 +1695,29 @@ void Replicator::applyTargets(GameWorld* gw) {
             // in 5 s on the 2026-10-17 session. Between snaps the catch-up walk
             // converges; a source teleport (segment snap edge) is never deferred.
             bool cooling = d.sqSnapMs != 0 && (now - d.sqSnapMs) < SQUAD_SNAP_COOL_MS;
+            // Squad snap floor (MoveSync 2026-10-18). The velocity-scaled gate
+            // (velPeak x ~0.75 s) sat right at the copy's ordinary trail: in
+            // move_legs every squad snap was gap ~= gate (25-105 u) while the
+            // walk-drive was still closing it - a visible teleport for a body
+            // that would have walked in. A squad body now snaps only for a
+            // genuine desync (> SQUAD_SNAP_MIN_DIST, scaled by game speed) or
+            // a source teleport edge; anything less is walked in at catch-up
+            // speed (and the settle keeps it walking after the owner halts).
+            float sqFloor = SQUAD_SNAP_MIN_DIST * multEff;
+            if (snapGate < sqFloor && !teleportEdge) snapGate = sqFloor;
             snapOk = haveNewest && (!cooling || teleportEdge);
             if (haveNewest && !snapOk && !simPaused && genuinelyMoving && haveActual &&
                 gapNewest > snapGate)
                 ++sqSnapCool_;
+            if (squadDriveDebug() && haveActual && haveNewest) {
+                char b[256]; _snprintf(b, sizeof(b) - 1,
+                    "[sqdrv] hand=%u,%u gap=%.1f gate=%.1f srcVel=%.1f peak=%.1f mv=%d "
+                    "settle=%d halted=%d body=%.1f,%.1f new=%.1f,%.1f out=%.1f,%.1f tpe=%d",
+                    out.hIndex, out.hSerial, gapNewest, snapGate, vlen, d.velPeak,
+                    hostMoving ? 1 : 0, squadSettle ? 1 : 0, d.walkHalted ? 1 : 0,
+                    ax, az, newest.x, newest.z, out.x, out.z, teleportEdge ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
         } else {
             // (A grow-vs-own-EMA ratio trigger was tried for the divergence
             // gate first and kept firing on melee-lunge jitter - srcVel 0,
@@ -1838,6 +1864,11 @@ void Replicator::applyTargets(GameWorld* gw) {
             // ground could never win it back: it trailed until the velocity gate
             // teleported it (the 2026-10-17 session: gap 57 u at srcVel 69).
             float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
+            // Settling squad copy (owner halted, body still short of the stop
+            // point): cSpeed is 0, which used to cap the walk-in at 30 u/s from
+            // the 12 u/s fallback. Walk in at the owner's last running pace
+            // (velPeak is frozen while the owner is halted).
+            if (isSquad && !hostMoving && d.velPeak > base) base = d.velPeak;
             float wantSpd = out.cSpeed + gapNewest * catchupK_;
             if (wantSpd > base * 2.5f) wantSpd = base * 2.5f;
             unsigned long ddt = (d.driveMs != 0) ? (now - d.driveMs) : 0;
@@ -2154,6 +2185,29 @@ void Replicator::pruneDriveGrace(unsigned long now) {
     }
 }
 
+// ---- MoveSync: KENSHICOOP_DEBUG_SQUAD_DRIVE=1 per-frame [sqdrv] trace ----
+bool Replicator::squadDriveDebug() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("KENSHICOOP_DEBUG_SQUAD_DRIVE");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+// ---- MoveSync: KENSHICOOP_DRIVE_BLEED (read once; default 0 = off) ----
+// Measured 2026-10-18 (move_legs, 60/25/2 netsim): bleed=0.5 raised squad snaps
+// and the mean trail (each nudge teleport re-plans the walk), so it ships off.
+float Replicator::driveBleed() {
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        const char* e = getenv("KENSHICOOP_DRIVE_BLEED");
+        float f = e ? (float)atof(e) : 0.0f;
+        v = (f > 0.0f && f < 4.0f) ? f : 0.0f;
+    }
+    return v;
+}
+
 void Replicator::logDriveTelemetry(unsigned long now) {
     if (aiSuspend_ && (now - aiLogTick_) > 3000) {
         aiLogTick_ = now;
@@ -2210,6 +2264,22 @@ void Replicator::logDriveTelemetry(unsigned long now) {
                 z[sizeof(z) - 1] = '\0'; coop::logLine(z);
             }
         }
+        // ---- MoveSync: squad drive trail window ----
+        {
+            float n  = trailN_ ? (float)trailN_ : 1.0f;
+            float sn = trailSpdN_ ? (float)trailSpdN_ : 1.0f;
+            char s[288]; _snprintf(s, sizeof(s) - 1,
+                "[interp] squadTrail n=%lu gapNew=%.1f gapNewMax=%.1f gapOut=%.1f "
+                "bodySpd=%.1f srcSpd=%.1f bleed=%.1f/%lu pauseHold=%lu snapCool=%lu settle=%lu",
+                trailN_, trailGapNewSum_ / n, trailGapNewMax_, trailGapOutSum_ / n,
+                trailBodySpdSum_ / sn, trailSrcSpdSum_ / sn,
+                trailBleedSum_, trailBleedN_, pauseHold_, sqSnapCool_, sqSettle_);
+            s[sizeof(s) - 1] = '\0'; coop::logLine(s);
+            trailN_ = 0; trailGapNewSum_ = trailGapNewMax_ = trailGapOutSum_ = 0.0f;
+            trailBodySpdSum_ = trailSrcSpdSum_ = 0.0f; trailSpdN_ = 0;
+            trailBleedSum_ = 0.0f; trailBleedN_ = 0;
+        }
+        // ---- end MoveSync ----
     }
     // Combat warp-diagnosis rollup (~5 s, Phase 1). Quiet until combat has
     // happened this session (combatOrder_ > 0), so a peaceful run stays clean.

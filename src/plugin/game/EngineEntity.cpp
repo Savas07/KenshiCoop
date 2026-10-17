@@ -418,6 +418,19 @@ bool applyRaw(Character* c, const EntityState& e) {
     }
 }
 
+// MoveSync: teleport the body to (x,y,z) with its CURRENT orientation.
+bool nudgePos(Character* c, float x, float y, float z) {
+    if (!c) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        mv->_setPositionDirectionAndTeleport(Ogre::Vector3(x, y, z), c->getOrientation());
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool readPos(Character* c, float* x, float* y, float* z) {
     if (!c) return false;
     __try {

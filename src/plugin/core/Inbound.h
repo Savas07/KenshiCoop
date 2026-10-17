@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <deque>
 #include <vector>
+#include <string>
 #include "../../netproto/Wire.h"
 
 namespace coop {
@@ -255,6 +256,17 @@ struct InboundFixture {
     FixturePacket pkt;
 };
 
+// One received character-creation result (protocol 57, CharCreate): a join
+// finished the native editor on one of its owned characters. name/raceSid/bod2
+// are the packet's variable tail (see CharGenHeader).
+struct InboundCharGen {
+    u32             ownerId; // = hdr.ownerId (WorldQ purgeOwner key)
+    CharGenHeader   hdr;
+    std::string     name;
+    std::string     raceSid;
+    std::vector<u8> bod2;
+};
+
 // One received stealth detection-map snapshot (protocol 20): the detection
 // AUTHORITY (the host's world, where the sneaker is a driven copy) streams who
 // notices the sneaker; the sneaker's OWNER replays the entries between its
@@ -438,6 +450,7 @@ public:
         faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
         research_(worldReset_),   deed_(worldReset_),       fixture_(worldReset_),
+        charGen_(worldReset_),
         buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
         spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64),
@@ -613,6 +626,15 @@ public:
         InboundFixture ifx; ifx.ownerId = ownerId; ifx.pkt = pkt;
         EnterCriticalSection(&cs_); fixture_.push_back(ifx); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received character-creation result (protocol 57).
+    void pushCharGen(const CharGenHeader& hdr, const char* name, const char* race,
+                     const u8* data) {
+        InboundCharGen ic; ic.ownerId = hdr.ownerId; ic.hdr = hdr;
+        ic.name.assign(name, name + hdr.nameLen);
+        ic.raceSid.assign(race, race + hdr.raceLen);
+        if (hdr.dataLen > 0) ic.bod2.assign(data, data + hdr.dataLen);
+        EnterCriticalSection(&cs_); charGen_.push_back(ic); LeaveCriticalSection(&cs_);
+    }
     // NET thread: one received placed-building announcement (protocol 27), owner-tagged.
     void pushBuildPlace(u32 ownerId, const BuildPlacePacket& pkt) {
         InboundBuildPlace ibp; ibp.ownerId = ownerId; ibp.pkt = pkt;
@@ -777,6 +799,9 @@ public:
     void drainFixture(std::deque<InboundFixture>& out) {
         EnterCriticalSection(&cs_); out.swap(fixture_); LeaveCriticalSection(&cs_);
     }
+    void drainCharGen(std::deque<InboundCharGen>& out) {
+        EnterCriticalSection(&cs_); out.swap(charGen_); LeaveCriticalSection(&cs_);
+    }
     void drainBuildPlace(std::deque<InboundBuildPlace>& out) {
         EnterCriticalSection(&cs_); out.swap(buildPlace_); LeaveCriticalSection(&cs_);
     }
@@ -907,6 +932,7 @@ private:
     WorldQ<InboundResearch>        research_;
     WorldQ<InboundDeed>            deed_;
     WorldQ<InboundFixture>         fixture_;
+    WorldQ<InboundCharGen>         charGen_;
     WorldQ<InboundBuildPlace>      buildPlace_;
     WorldQ<InboundBuildState>      buildState_;
     WorldQ<InboundBuildDoor>       buildDoor_;

@@ -244,6 +244,8 @@ void NetLink::queueDeed(const DeedPacket& pkt) { pushLocked(outCs_, outDeed_, pk
 
 void NetLink::queueFixture(const FixturePacket& pkt) { pushLocked(outCs_, outFixture_, pkt); }
 
+void NetLink::queueCharGen(const std::vector<u8>& flat) { pushLocked(outCs_, outCharGen_, flat); }
+
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
 
 void NetLink::queueBuildState(const BuildStatePacket& pkt) { pushLocked(outCs_, outBuildState_, pkt); }
@@ -336,7 +338,7 @@ bool relayToJoins(u8 type) {
     case PKT_BUILD_REMOVE:  case PKT_NPC_CENSUS:    case PKT_INV_XFER:
     case PKT_CAM_HINT:      case PKT_WORLD_ITEM_CLAIM:
     case PKT_CELL_CLAIM:    case PKT_INV_XFER_ACK:  case PKT_DEED:
-    case PKT_FIXTURE:
+    case PKT_FIXTURE:       case PKT_CHARGEN:
         return true;
     default:
         return false;
@@ -953,6 +955,21 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushFixture(fxp.ownerId, fxp);
                         }
+                    } else if (type == PKT_CHARGEN) {
+                        // Reliable join character-creation result (protocol 57):
+                        // [CharGenHeader][name][raceSid][bod2].
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(CharGenHeader) && inbound_) {
+                            CharGenHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(CharGenHeader) + (unsigned)hdr.nameLen
+                                          + (unsigned)hdr.raceLen + hdr.dataLen;
+                            if (hdr.dataLen <= CHARGEN_DATA_MAX && len >= need) {
+                                const char* p = (const char*)ev.packet->data + sizeof(CharGenHeader);
+                                inbound_->pushCharGen(hdr, p, p + hdr.nameLen,
+                                                      (const u8*)(p + hdr.nameLen + hdr.raceLen));
+                            }
+                        }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
                         // describe/mint edge, keyed by the placer's hand.
@@ -1563,6 +1580,18 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < fixPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&fixPkts[i], sizeof(FixturePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // ---- CharCreate (protocol 57): pre-flattened character-creation results.
+        std::vector<std::vector<u8> > cgPkts;
+        EnterCriticalSection(&outCs_);
+        cgPkts.swap(outCharGen_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < cgPkts.size(); ++i) {
+            if (cgPkts[i].empty()) continue;
+            ENetPacket* out = enet_packet_create(&cgPkts[i][0], cgPkts[i].size(),
                                                  ENET_PACKET_FLAG_RELIABLE);
             sendOut(out, CH_RELIABLE);
         }

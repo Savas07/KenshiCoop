@@ -143,6 +143,11 @@ public:
     // Symmetric and static (a fixture's position/template never change), so this
     // is first-sight plus a slow safety resend and idles at zero traffic.
     void queueFixture(const FixturePacket& pkt);
+    // ---- CharCreate (protocol 57) ----
+    // MAIN thread: queue one reliable character-creation result. The packet is
+    // pre-flattened ([CharGenHeader][name][raceSid][bod2]). Join -> host; the
+    // host relays it to the other joins (relayToJoins).
+    void queueCharGen(const std::vector<u8>& flat);
     void queueBuildPlace(const BuildPlacePacket& pkt);
     void queueBuildState(const BuildStatePacket& pkt);
     void queueBuildDoor(const BuildDoorPacket& pkt);
@@ -317,6 +322,8 @@ private:
     std::vector<DeedPacket>      outDeed_;
     // Reliable runtime-fixture identity rows (protocol 55). Guarded by outCs_.
     std::vector<FixturePacket>   outFixture_;
+    // Reliable pre-flattened character-creation packets (protocol 57). Guarded by outCs_.
+    std::vector<std::vector<u8> > outCharGen_;
     std::vector<BuildPlacePacket> outBuildPlace_;
     std::vector<BuildStatePacket> outBuildState_;
     std::vector<BuildDoorPacket>  outBuildDoor_;

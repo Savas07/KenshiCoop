@@ -1000,6 +1000,7 @@ private:
                                   //   does not stick must not re-fire every frame)
         float         catchSpd;   // low-passed walk-drive catch-up speed (u/s)
         unsigned long driveMs;    // last walk-branch tick (catch-up filter dt)
+        unsigned long settleSinceMs; // squad settle start (0 = not settling)
         // ---- end MoveSync ----------------------------------------------------
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0), walkHalted(false), walkStallF(0),
@@ -1023,7 +1024,8 @@ private:
                    zeroF(0), activeF(0), advMs(0),
                    oracleActivePrev(false), oracleOnsetMs(0),
                    prevInterpMode(-1), midSeenMs(0),
-                   velPeakMs(0), sqSnapMs(0), catchSpd(0.0f), driveMs(0) {
+                   velPeakMs(0), sqSnapMs(0), catchSpd(0.0f), driveMs(0),
+                   settleSinceMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
         }
     };
@@ -1877,6 +1879,14 @@ private:
     float         trailBodySpdSum_, trailSrcSpdSum_;
     unsigned long trailSpdN_;
     unsigned long pauseHold_, sqSnapCool_, sqSettle_;
+    float         trailBleedSum_;   // window: total error-bleed nudge distance
+    unsigned long trailBleedN_;     // window: nudge count
+    // KENSHICOOP_DRIVE_BLEED (read once; default 0 = off): fraction of the
+    // source speed by which a trailing squad body is nudged toward its source.
+    static float driveBleed();
+    // KENSHICOOP_DEBUG_SQUAD_DRIVE=1 (read once; off by default): per-frame
+    // "[sqdrv]" line for every driven squad body (gap/gate/peak/settle/poses).
+    static bool squadDriveDebug();
     // ---- end MoveSync -------------------------------------------------------
 
     // Protocol 36 (wire v35): per-sender clock mapping for the batch send

@@ -1202,6 +1202,192 @@ static coop::SyncContext replCtx(GameWorld* gw) {
     return c;
 }
 
+// ---- CharCreate: join character creation (protocol 57) ---------------------
+// Join: once gameplay is live and replication knows which squad bodies this
+// client owns, open Kenshi's own character editor (EDIT_NEWGAME) on them unless
+// any already carries the chargen marker (reconnect -> SKIP). The join's speed
+// vote is paused while it edits, and publishOwned is skipped so peers keep the
+// bodies where they were. On close each body is marked, exported as .bod2 and
+// sent; the host applies look+name in place and relays to the other joins.
+// KENSHICOOP_TEST_CHARGEN_AUTO=<s>: auto-randomise/next-race/confirm after s.
+namespace {
+enum ChargenState { CG_IDLE, CG_OPEN, CG_DONE };
+ChargenState g_cgState = CG_IDLE;
+DWORD        g_cgLiveSince = 0;
+DWORD        g_cgOpenTick = 0;
+bool         g_cgAutoDone = false;
+Character*   g_cgChars[32];
+unsigned int g_cgCount = 0;
+const unsigned int CG_SETTLE_MS = 8000;
+}
+bool g_chargenSuppressPublish = false;
+
+static void chargenLog(const char* what, unsigned int pid, Character* c, const char* extra) {
+    char nm[64], race[64], b[256];
+    nm[0] = race[0] = '\0';
+    if (c) { coop::engine::charName(c, nm, sizeof(nm)); coop::engine::chargenRaceSid(c, race, sizeof(race)); }
+    _snprintf(b, sizeof(b) - 1, "[chargen] %s player=%u name='%s' race='%s'%s", what, pid, nm, race,
+              extra ? extra : "");
+    b[sizeof(b) - 1] = '\0';
+    coopLog(b);
+}
+
+static unsigned int chargenOwnedChars(GameWorld* gw, Character** out, unsigned int cap) {
+    Character* all[64];
+    unsigned int n = coop::engine::listPlayerChars(gw, all, 64), k = 0;
+    for (unsigned int i = 0; i < n && k < cap; ++i) {
+        unsigned int h[5];
+        if (all[i] && coop::engine::readObjectHand((RootObject*)all[i], h) &&
+            g_repl.ownerClassForHand(h) == 1)
+            out[k++] = all[i];
+    }
+    return k;
+}
+
+static void chargenSend(Character* c) {
+    unsigned int h[5];
+    std::vector<unsigned char> bod2;
+    if (!coop::engine::readObjectHand((RootObject*)c, h) || !coop::engine::chargenExport(c, bod2) ||
+        bod2.size() > coop::CHARGEN_DATA_MAX) {
+        chargenLog("SEND-FAIL", g_net.localId(), c, 0);
+        return;
+    }
+    char nm[256], race[256];
+    coop::engine::charName(c, nm, sizeof(nm));
+    coop::engine::chargenRaceSid(c, race, sizeof(race));
+    coop::CharGenHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = (coop::u8)coop::PKT_CHARGEN;
+    hdr.ownerId = g_net.localId();
+    for (int i = 0; i < 5; ++i) hdr.hand[i] = h[i];
+    size_t nl = strlen(nm), rl = strlen(race);
+    hdr.nameLen = (coop::u8)(nl > 255 ? 255 : nl);
+    hdr.raceLen = (coop::u8)(rl > 255 ? 255 : rl);
+    hdr.dataLen = (coop::u32)bod2.size();
+    std::vector<coop::u8> flat(sizeof(hdr) + hdr.nameLen + hdr.raceLen + bod2.size());
+    memcpy(&flat[0], &hdr, sizeof(hdr));
+    memcpy(&flat[sizeof(hdr)], nm, hdr.nameLen);
+    memcpy(&flat[sizeof(hdr) + hdr.nameLen], race, hdr.raceLen);
+    memcpy(&flat[sizeof(hdr) + hdr.nameLen + hdr.raceLen], &bod2[0], bod2.size());
+    g_net.queueCharGen(flat);
+    char ex[48];
+    _snprintf(ex, sizeof(ex) - 1, " bytes=%u", (unsigned)bod2.size());
+    ex[sizeof(ex) - 1] = '\0';
+    chargenLog("SEND", g_net.localId(), c, ex);
+}
+
+static void tickCharGen(GameWorld* gw, bool worldLive) {
+    if (!worldLive) {
+        // World swap: bodies are dangling. An open editor dies with the world.
+        g_cgState = CG_IDLE; g_cgLiveSince = 0; g_cgCount = 0;
+        g_chargenSuppressPublish = false;
+        return;
+    }
+    const DWORD now = GetTickCount();
+
+    // Receive side (host + other joins): apply look + name in place.
+    std::deque<coop::InboundCharGen> got;
+    g_inbound.drainCharGen(got);
+    for (size_t i = 0; i < got.size(); ++i) {
+        const coop::InboundCharGen& g = got[i];
+        if (g.hdr.ownerId == g_net.localId()) continue;
+        const unsigned int* h = g.hdr.hand;
+        Character* c = coop::engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (!c) { chargenLog("APPLY-FAIL(unresolved)", g.hdr.ownerId, 0, 0); continue; }
+        // A race from a mod we don't have would leave setRace with an unresolved
+        // race and can take the session down: keep the old look instead.
+        if (!g.raceSid.empty() && !coop::engine::chargenRaceKnown(gw, g.raceSid.c_str())) {
+            char rx[128];
+            _snprintf(rx, sizeof(rx) - 1, " race='%s' (not installed here)", g.raceSid.c_str());
+            rx[sizeof(rx) - 1] = '\0';
+            chargenLog("APPLY-FAIL(race)", g.hdr.ownerId, c, rx);
+            continue;
+        }
+        bool ok = coop::engine::chargenApply(c, g.bod2, g.name.c_str());
+        char ex[160];
+        _snprintf(ex, sizeof(ex) - 1, " sentRace='%s' bytes=%u%s", g.raceSid.c_str(),
+                  (unsigned)g.bod2.size(), ok ? "" : " FAILED");
+        ex[sizeof(ex) - 1] = '\0';
+        chargenLog("APPLY", g.hdr.ownerId, c, ex);
+        if (g_cfg.isHost && g_session.peers.size() > 1) chargenLog("RELAY", g.hdr.ownerId, c, 0);
+    }
+
+    if (g_cfg.isHost) return;
+    {   // KENSHICOOP_CHARGEN=0 disables the join-side editor (movement tests etc.).
+        const char* off = getenv("KENSHICOOP_CHARGEN");
+        if (off && off[0] == '0') return;
+    }
+    if (g_cgLiveSince == 0) g_cgLiveSince = now ? now : 1;
+
+    if (g_cgState == CG_IDLE) {
+        if (now - g_cgLiveSince < CG_SETTLE_MS) return;
+        Character* owned[32];
+        unsigned int n = chargenOwnedChars(gw, owned, 32);
+        if (n == 0) return; // ownership not known yet
+        for (unsigned int i = 0; i < n; ++i) {
+            if (coop::engine::chargenHasMarker(owned[i])) {
+                chargenLog("SKIP", g_net.localId(), owned[i], " (already created)");
+                g_cgState = CG_DONE;
+                return;
+            }
+        }
+        // Only a fresh KenshiCoop co-op start offers character creation: the
+        // editor (new-game mode) re-rolls the look and resets the body, which
+        // must never hit established characters of an ongoing campaign.
+        for (unsigned int i = 0; i < n; ++i) {
+            if (!coop::engine::chargenIsCoopStartChar(owned[i])) {
+                for (unsigned int k = 0; k < n; ++k) coop::engine::chargenSetMarker(owned[k]);
+                chargenLog("SKIP", g_net.localId(), owned[i], " (existing character, not a co-op start)");
+                g_cgState = CG_DONE;
+                return;
+            }
+        }
+        for (unsigned int i = 0; i < n; ++i) {
+            g_cgChars[i] = owned[i];
+            chargenLog("OPEN", g_net.localId(), owned[i], 0);
+        }
+        g_cgCount = n;
+        coop::engine::writeGameSpeed(gw, 1.0f, true);
+        if (!coop::engine::chargenOpenEditor(g_cgChars, n)) {
+            coopLog("[chargen] OPEN-FAIL (editor did not open)");
+            g_cgState = CG_DONE;
+            return;
+        }
+        g_chargenSuppressPublish = true;
+        g_cgState = CG_OPEN;
+        g_cgOpenTick = now;
+        g_cgAutoDone = false;
+        return;
+    }
+
+    if (g_cgState == CG_OPEN) {
+        if (coop::engine::chargenEditorOpen()) {
+            const char* e = getenv("KENSHICOOP_TEST_CHARGEN_AUTO");
+            if (e && e[0] && !g_cgAutoDone &&
+                now - g_cgOpenTick >= (DWORD)(atoi(e) * 1000)) {
+                g_cgAutoDone = true;
+                char nm[48];
+                _snprintf(nm, sizeof(nm) - 1, "Coop Player %u", (unsigned)g_net.localId());
+                nm[sizeof(nm) - 1] = '\0';
+                bool ok = coop::engine::chargenAutoConfirm(nm);
+                coopLog(ok ? "[chargen] TEST auto-confirm issued" : "[chargen] TEST auto-confirm FAILED");
+            }
+            return;
+        }
+        // Editor closed: its destructor already put the bodies back.
+        g_chargenSuppressPublish = false;
+        for (unsigned int i = 0; i < g_cgCount; ++i) {
+            Character* c = g_cgChars[i];
+            coop::engine::chargenSetMarker(c);
+            chargenLog("CONFIRM", g_net.localId(), c, 0);
+            chargenSend(c);
+        }
+        g_cgCount = 0;
+        g_cgState = CG_DONE;
+    }
+}
+// ---- end CharCreate ---------------------------------------------------------
+
 // Replication publish (pre-engine). BIDIRECTIONAL presence: both clients stream
 // their OWNED squad subset (partitioned by hand-rank) and drive the peer's; the
 // host additionally streams world NPCs. Ingest received targets BEFORE the engine
@@ -1219,7 +1405,10 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         g_repl.applyEvents(gw, g_inbound);
     }
     if (worldLive) {
-        g_repl.publishOwned(gw, g_net, g_net.localId());
+        // CharCreate: while the join's character editor is open the edited bodies
+        // sit on the editor platform at the world origin - don't publish that.
+        if (!g_chargenSuppressPublish)
+            g_repl.publishOwned(gw, g_net, g_net.localId());
         // Phase W2: BOTH clients watch their OWNED characters for a WEAPON drop and author a
         // reliable conservation intent so the peer relocates its own copy of that weapon (a
         // weapon can't be rebuilt via the W1 proxy path). Bidirectional; gated on worldSync.
@@ -1814,6 +2003,8 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // Replication publish (pre-engine, worldLive-gated): ingest received targets,
     // then stream every owned channel so applied state is current this tick.
     tickReplicatePublish(gw, worldLive);
+    // CharCreate: join character editor + apply received creations (protocol 57).
+    tickCharGen(gw, worldLive);
 
     // Coordinated save + load (protocols 31/32): run under g_gameStarted (NOT
     // worldLive) so they keep pumping DURING a world swap - they only touch net

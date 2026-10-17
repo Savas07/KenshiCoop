@@ -2297,6 +2297,73 @@ const float TownArriveScenario::MAX_STEP  = 1500.0f;
 const float TownArriveScenario::IDLE_LEG  = 15.0f;
 const float TownArriveScenario::PROBE_R   = 1800.0f;
 
+
+// move_legs (MoveSync 2026-10-18 remote-movement measurement): BOTH sides run
+// their own leader on long straight legs (start -> far -> start, LEG u per axis)
+// with a PAUSE_MS halt in the middle of every leg, so each side drives a
+// remote squad copy through sustained runs, stops and restarts. The verdict is
+// the [interp] / [interp] squadTrail counters on both logs; the scenario
+// itself only checks the leader resolved.
+class MoveLegsScenario : public TimedScenario {
+public:
+    MoveLegsScenario()
+        : TimedScenario("move_legs", 500), haveStart_(false), sx_(0), sy_(0), sz_(0),
+          lastPhase_(-1), dz_(0) {}
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        // OWN tab leader (host = rank 0, join = rank 1); engine::leader on a join
+        // can be the host's leader copy, which must not be ordered locally.
+        EntityState sq[32];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, 32);
+        int idx = tabLeaderIdx(sq, n, ctx.isHost ? 0u : 1u);
+        if (idx < 0) { coop::logLine("SCENARIO move_legs FAILED (no own tab leader)"); return; }
+        handFromEntity(sq[idx], own_);
+        Character* ld = ownLeader();
+        if (ld && engine::readPos(ld, &sx_, &sy_, &sz_)) haveStart_ = true;
+        dz_ = ctx.isHost ? LEG : -LEG;
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        Character* ld = haveStart_ ? ownLeader() : 0;
+        if (haveStart_ && ld && ctx.elapsedMs < DURATION_MS) {
+            // Cycle: [0,RUN) run out, [RUN,RUN+PAUSE) halt, [.., 2RUN+PAUSE) run
+            // back, then halt PAUSE again. Orders are re-sent each phase change.
+            unsigned long cyc = RUN_MS * 2 + PAUSE_MS * 2;
+            unsigned long t = ctx.elapsedMs % cyc;
+            int phase = (t < RUN_MS) ? 0 : (t < RUN_MS + PAUSE_MS) ? 1
+                      : (t < 2 * RUN_MS + PAUSE_MS) ? 2 : 3;
+            if (phase != lastPhase_) {
+                lastPhase_ = phase;
+                float x, y, z;
+                if (phase == 0) engine::orderMoveTo(ld, sx_ + LEG, sy_, sz_ + dz_);
+                else if (phase == 2) engine::orderMoveTo(ld, sx_, sy_, sz_);
+                else if (engine::readPos(ld, &x, &y, &z)) engine::orderMoveTo(ld, x, y, z);
+            }
+        }
+        if (evidenceDue(ctx.elapsedMs)) logScenarioLine("MEMBER", ld);
+        if (ctx.elapsedMs >= DURATION_MS) {
+            passed_ = haveStart_;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    Character* ownLeader() const {
+        return engine::resolveCharByHand(own_[3], own_[4], own_[0], own_[1], own_[2]);
+    }
+    unsigned int own_[5];
+    float dz_;
+    static const unsigned long DURATION_MS = 90000;
+    static const unsigned long RUN_MS      = 7000;
+    static const unsigned long PAUSE_MS    = 3000;
+    static const float         LEG;
+    bool  haveStart_;
+    float sx_, sy_, sz_;
+    int   lastPhase_;
+};
+
+const float MoveLegsScenario::LEG = 200.0f;
 } // namespace
 
 Scenario* makeMovementScenario(const std::string& name) {
@@ -2345,6 +2412,7 @@ Scenario* makeMovementScenario(const std::string& name) {
     if (name == "split_interest") return new SplitInterestScenario();
     if (name == "split_far")     return new SplitFarScenario();
     if (name == "camp_approach") return new CampApproachScenario();
+    if (name == "move_legs")     return new MoveLegsScenario();
     return 0;
 }
 

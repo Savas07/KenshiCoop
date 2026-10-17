@@ -496,6 +496,7 @@ static void testRoundTrips() {
     roundTrip<DeedPacket>("DeedPacket", (u8)PKT_DEED);
     roundTrip<FixturePacket>("FixturePacket", (u8)PKT_FIXTURE);
     roundTrip<PeerStatePacket>("PeerStatePacket", (u8)PKT_PEER_STATE);
+    roundTrip<CharGenHeader>("CharGenHeader", (u8)PKT_CHARGEN);
     roundTrip<CellClaimPacket>("CellClaimPacket", (u8)PKT_CELL_CLAIM);
     roundTrip<InvXferAckPacket>("InvXferAckPacket", (u8)PKT_INV_XFER_ACK);
 

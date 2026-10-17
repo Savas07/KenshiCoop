@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 56;
+const u16 PROTOCOL_VERSION = 57;
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -87,7 +87,8 @@ enum PacketType {
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
     PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
-    PKT_PEER_STATE       = 49 // RELIABLE roster edge: another join arrived/left (host -> joins, protocol 56); PeerStatePacket
+    PKT_PEER_STATE       = 49,// RELIABLE roster edge: another join arrived/left (host -> joins, protocol 56); PeerStatePacket
+    PKT_CHARGEN          = 50 // RELIABLE join character-creation result (join -> host -> joins, protocol 57); CharGenHeader + tail
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1602,6 +1603,23 @@ struct TimePongPacket {
     u32 nonce;        // echoed from the ping
     u32 echoWallMs;   // the ping's senderWallMs, echoed verbatim
     u32 responderWallMs; // host's wallClockMs() at echo
+};
+
+// ---- Protocol 57: join character creation -----------------------------------
+// A join that finished the native character editor (EDIT_NEWGAME) on one of
+// its owned characters sends the result: the body's hand, its new name, the
+// race stringID and the appearance GameData serialised by the game's own .bod2
+// exporter (GameData::saveToFile). Receivers load it back with loadFromFile and
+// hand it to Character::setAppearanceData (in-place race/look change).
+// Layout: [CharGenHeader][name[nameLen]][raceSid[raceLen]][bod2[dataLen]].
+const u32 CHARGEN_DATA_MAX = 256u * 1024u;
+struct CharGenHeader {
+    u8  type;      // = PKT_CHARGEN
+    u32 ownerId;   // network player id of the creating join
+    u32 hand[5];   // character hand (readObjectHand layout)
+    u8  nameLen;
+    u8  raceLen;
+    u32 dataLen;   // .bod2 byte count (<= CHARGEN_DATA_MAX)
 };
 
 #pragma pack(pop)

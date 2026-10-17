@@ -108,6 +108,60 @@ void steamLog(const char* msg) {
     coop::logLine(b);
 }
 
+// ---- Steam teardown guard ------------------------------------------------------
+// The flat ISteamNetworking calls dispatch through steamclient64.dll's vtable. When
+// the game shuts Steam down (SteamAPI_Shutdown on exit, or the Steam client going
+// away) that module is unloaded while our NET thread is still polling in hookWait,
+// and the next call reads unmapped memory (2026-10-17 real session: AV at
+// steam_api64.dll+0x48e3 from hookWait/g_isAvail). Every Steam call goes through
+// these SEH thunks; the first fault marks the tunnel dead (g_ready=false), so the
+// hooks report "no traffic" and ENet times the peer out instead of the process
+// dying. No objects with destructors inside the __try bodies (C2712).
+volatile LONG g_steamFaulted = 0;
+
+void markSteamDead() {
+    g_ready = false;
+    if (InterlockedExchange(&g_steamFaulted, 1) == 0)
+        steamLog("Steam interface faulted (Steam shut down / unloaded?) - tunnel disabled");
+}
+
+bool isAvailSeh(unsigned int* avail, int ch) {
+    if (!g_ready) return false;
+    bool ok = false, bad = false;
+    __try { ok = g_isAvail(g_iface, avail, ch); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { bad = true; }
+    if (bad) { markSteamDead(); return false; }
+    return ok;
+}
+
+bool readSeh(void* buf, unsigned int cap, unsigned int* got,
+             unsigned long long* sender, int ch) {
+    if (!g_ready) return false;
+    bool ok = false, bad = false;
+    __try { ok = g_read(g_iface, buf, cap, got, sender, ch); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { bad = true; }
+    if (bad) { markSteamDead(); return false; }
+    return ok;
+}
+
+bool sendSeh(SteamId to, const void* buf, unsigned int len, int type, int ch) {
+    if (!g_ready) return false;
+    bool ok = false, bad = false;
+    __try { ok = g_send(g_iface, to, buf, len, type, ch); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { bad = true; }
+    if (bad) { markSteamDead(); return false; }
+    return ok;
+}
+
+bool sessionStateSeh(SteamId peer, SessionState* st) {
+    if (!g_ready) return false;
+    bool ok = false, bad = false;
+    __try { ok = g_sessionState(g_iface, peer, st); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { bad = true; }
+    if (bad) { markSteamDead(); return false; }
+    return ok;
+}
+
 // ---- ENet socket hooks (net thread only) -------------------------------------
 // One fake socket handle; a send goes to the SteamID in the destination
 // address's slot, a receive is accepted only from a SteamID that holds a slot
@@ -141,7 +195,7 @@ int ENET_CALLBACK hookSend(ENetSocket s, const ENetAddress* address,
         std::memcpy(buf + len, buffers[i].data, buffers[i].dataLength);
         len += (unsigned int)buffers[i].dataLength;
     }
-    if (!g_send(g_iface, to, buf, len, SEND_UNRELIABLE, CH_TUNNEL)) return -1;
+    if (!sendSeh(to, buf, len, SEND_UNRELIABLE, CH_TUNNEL)) return -1;
     return (int)len;
 }
 
@@ -152,8 +206,8 @@ int ENET_CALLBACK hookReceive(ENetSocket s, ENetAddress* address,
     unsigned char buf[4096];
     (void)s;
     if (!g_ready || bufferCount < 1) return 0;
-    if (!g_isAvail(g_iface, &avail, CH_TUNNEL)) return 0;
-    if (!g_read(g_iface, buf, sizeof(buf), &got, &sender, CH_TUNNEL)) return 0;
+    if (!isAvailSeh(&avail, CH_TUNNEL)) return 0;
+    if (!readSeh(buf, sizeof(buf), &got, &sender, CH_TUNNEL)) return 0;
     int slot = slotOf(sender);
     if (slot < 0) {
         // Someone who is not one of our co-op peers sent to us: drop.
@@ -195,7 +249,7 @@ int ENET_CALLBACK hookWait(ENetSocket s, enet_uint32* condition, enet_uint32 tim
     }
     for (;;) {
         unsigned int avail = 0;
-        if (g_ready && g_isAvail(g_iface, &avail, CH_TUNNEL)) {
+        if (isAvailSeh(&avail, CH_TUNNEL)) {
             *condition |= ENET_SOCKET_WAIT_RECEIVE;
             return 0;
         }
@@ -215,7 +269,7 @@ ENetSocketHooks g_hooks; // filled in installEnetHooks
 void logSessionState(int slot, SteamId peer) {
     SessionState st;
     std::memset(&st, 0, sizeof(st));
-    if (!g_sessionState(g_iface, peer, &st)) return;
+    if (!sessionStateSeh(peer, &st)) return;
     SessionState& last = g_lastState[slot];
     if (g_haveLastState[slot] &&
         st.connectionActive == last.connectionActive &&
@@ -247,17 +301,17 @@ void spikeTick() {
         unsigned int avail = 0, got = 0;
         unsigned long long sender = 0;
         SpikeMsg m;
-        if (!g_isAvail(g_iface, &avail, CH_SPIKE)) break;
-        if (!g_read(g_iface, &m, sizeof(m), &got, &sender, CH_SPIKE)) break;
+        if (!isAvailSeh(&avail, CH_SPIKE)) break;
+        if (!readSeh(&m, sizeof(m), &got, &sender, CH_SPIKE)) break;
         if (got != sizeof(m)) continue;
         if (std::memcmp(m.tag, "KCSP", 4) == 0) {
             // Ping: echo it back with the sender's own timestamp intact.
             std::memcpy(m.tag, "KCSQ", 4);
-            g_send(g_iface, sender, &m, sizeof(m), SEND_UNRELIABLE, CH_SPIKE);
+            sendSeh(sender, &m, sizeof(m), SEND_UNRELIABLE, CH_SPIKE);
         } else if (std::memcmp(m.tag, "KCSQ", 4) == 0) {
             SessionState st;
             std::memset(&st, 0, sizeof(st));
-            g_sessionState(g_iface, sender, &st);
+            sessionStateSeh(sender, &st);
             char b[128];
             _snprintf(b, sizeof(b) - 1, "ping seq=%u rtt=%lu ms relay=%u",
                       m.seq, (unsigned long)(now - m.tick), (unsigned)st.usingRelay);
@@ -273,7 +327,7 @@ void spikeTick() {
         std::memcpy(m.tag, "KCSP", 4);
         m.seq  = ++g_pingSeq;
         m.tick = now;
-        g_send(g_iface, g_pingPeer, &m, sizeof(m), SEND_UNRELIABLE, CH_SPIKE);
+        sendSeh(g_pingPeer, &m, sizeof(m), SEND_UNRELIABLE, CH_SPIKE);
     }
 }
 

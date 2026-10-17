@@ -38,6 +38,7 @@ Replicator::Replicator()
       trailN_(0), trailGapNewSum_(0.0f), trailGapNewMax_(0.0f), trailGapOutSum_(0.0f),
       trailBodySpdSum_(0.0f), trailSrcSpdSum_(0.0f), trailSpdN_(0),
       pauseHold_(0), sqSnapCool_(0), sqSettle_(0),
+      trailBleedSum_(0.0f), trailBleedN_(0),
       translateFrames_(0), walkTruthFrames_(0),
       restSampleFrames_(0), marchFrames_(0),
       marchHold_(0), marchSettle_(0), marchRelapse_(0),

@@ -84,6 +84,15 @@ const float REPARK_DIST = 1.0f;   // at rest, re-place if it drifts past this
 const float CATCHUP_K   = 2.0f;   // gap-proportional speed boost (chase a moving tgt)
                                   // (default for catchupK_ - env-tunable, proto 36)
 const float REISSUE_DIST = 1.0f;  // re-issue the walk order only when tgt moved this far
+// ---- MoveSync (remote-movement smoothness pass) ----
+const unsigned long SQUAD_SNAP_COOL_MS = 400;  // min spacing between squad hard snaps
+const float SQUAD_SETTLE_DIST = 0.75f;         // keep walking after stop until render pose this close to newest
+const unsigned long SQUAD_SETTLE_MAX_MS = 6000; // ...safety cap for a blocked body (walk-in of ~150 u at a walk)
+const float SQUAD_SNAP_MIN_DIST = 150.0f;      // squad hard-snap floor (x game speed); below it the copy walks in
+const float CATCHUP_FILTER_MS = 150.0f;        // catch-up speed low-pass time constant
+const float SQUAD_REISSUE_FRAC = 0.15f;        // squad re-issue threshold as a fraction of body->lead dist
+const float BLEED_ALLOW_SEC = 0.25f;           // trail (in travel time) tolerated before error bleed
+// ---- end MoveSync ----
 const float WALK_ARRIVE_DIST = 2.0f; // ...and cancel it once the body is this close to the
                                   // issued point while the source has stopped (march-in-place:
                                   // an order outstanding on a body that already stands there
