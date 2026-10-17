@@ -143,7 +143,12 @@ bool               g_hostReady    = false;// host's world is live: admit lobby m
 
 } // namespace
 
-void setHostReady(bool ready) { g_hostReady = ready; }
+void setHostReady(bool ready) {
+    if (ready == g_hostReady) return;
+    g_hostReady = ready;
+    coop::logLine(ready ? "[invite] host READY (world live) - lobby members will be let in"
+                        : "[invite] host NOT ready (menu/loading) - lobby members wait");
+}
 
 namespace {
 bool               g_creating     = false;// CreateLobby call in flight
@@ -151,6 +156,19 @@ bool               g_watch        = false;// panel open: keep the friend list fr
 unsigned long long g_pendingInvitee = 0;  // friend clicked before the lobby existed
 unsigned long long g_launchLobby  = 0;    // "+connect_lobby <id>" from the command line
 char               g_status[128]  = {0};
+// Host: last "kc_ready" value written to lobby data (-1 = not yet published).
+int                g_readyPublished = -1;
+// Host: member count last logged (-1 = none yet), for lobby membership logs.
+int                g_lastMemberCount = -1;
+// Join: the host we will connect to once its lobby says it is ready (0 = none).
+unsigned long long g_joinOwner    = 0;
+bool               g_joinWaitLogged = false;
+
+// Display name for logs/status (Steam caches names of friends + lobby members).
+const char* personaName(unsigned long long id) {
+    const char* n = (g_frName && id) ? g_frName(g_friends, id) : 0;
+    return (n && n[0]) ? n : "?";
+}
 
 // Cached friend list for the panel (our own copy - GetFriendPersonaName returns a
 // Steam-owned pointer only valid until the next call). Offline friends are never
@@ -260,6 +278,8 @@ void enterLobby(unsigned long long lobby) {
     g_admittedN = 0;
     g_creating  = false;
     g_pendingInvitee = 0;
+    g_joinOwner = 0;
+    g_joinWaitLogged = false;
     g_joinLobby(g_mm, lobby);
 }
 
@@ -276,6 +296,8 @@ void onLobbyCreated(LobbyCreated_t* r, bool ioFailure) {
     g_weAreHost = true;
     g_hostFired = false;
     g_admittedN = 0;
+    g_readyPublished = -1;   // publish kc_ready on the next tick
+    g_lastMemberCount = -1;
     char pv[16];
     _snprintf(pv, sizeof(pv) - 1, "%u", (unsigned)coop::PROTOCOL_VERSION);
     pv[sizeof(pv) - 1] = '\0';
@@ -359,12 +381,19 @@ void onLobbyEnter(LobbyEnter_t* r) {
     }
 
     coop::steamp2p::accept(owner); // pre-accept the host's P2P session
-    char b[96];
-    _snprintf(b, sizeof(b) - 1, "joined host %llu via lobby - connecting as CLIENT", owner);
+    // Connect only once the host's world is live (its "kc_ready" lobby flag);
+    // tick() polls it. Until then we sit in the lobby - no connect spam.
+    g_joinOwner = owner;
+    g_joinWaitLogged = false;
+    char b[160];
+    _snprintf(b, sizeof(b) - 1, "entered lobby of host %llu (%s) - waiting for host ready",
+              owner, personaName(owner));
     b[sizeof(b) - 1] = '\0';
     steamLog(b);
-    setStatus("Connecting to host...");
-    if (g_onConnect) g_onConnect(false, true, owner);
+    _snprintf(b, sizeof(b) - 1, "In %s's lobby - waiting for them to start the game",
+              personaName(owner));
+    b[sizeof(b) - 1] = '\0';
+    setStatus(b);
 }
 
 void onP2PSessionRequest(P2PSessionRequest_t* r) {
@@ -605,13 +634,37 @@ void tick() {
         }
     }
 
-    // Host membership poll: whenever a friend enters the lobby, learn their
-    // SteamID and admit them - the first arrival starts the host session, later
-    // ones join the running tunnel. (Avoids needing the LobbyChatUpdate callback.)
-    if (g_weAreHost && g_lobby != 0 && g_hostReady && g_getNum) {
+    // Host: publish readiness on the lobby (joins connect only once it is "1"),
+    // and log every membership change with names.
+    if (g_weAreHost && g_lobby != 0 && g_setData && g_readyPublished != (g_hostReady ? 1 : 0)) {
+        g_readyPublished = g_hostReady ? 1 : 0;
+        g_setData(g_mm, g_lobby, "kc_ready", g_hostReady ? "1" : "0");
+        steamLog(g_hostReady ? "lobby flag kc_ready=1 published" : "lobby flag kc_ready=0 published");
+    }
+    if (g_weAreHost && g_lobby != 0 && g_getNum) {
         int n = g_getNum(g_mm, g_lobby);
         SteamId self = (SteamId)coop::steamp2p::selfId();
-        for (int i = 0; i < n; ++i) {
+        if (n != g_lastMemberCount) {
+            g_lastMemberCount = n;
+            char b[256];
+            int len = _snprintf(b, sizeof(b) - 1, "lobby members=%d:", n);
+            for (int i = 0; i < n && len > 0 && len < (int)sizeof(b) - 40; ++i) {
+                unsigned long long m = g_getMember(g_mm, g_lobby, i);
+                len += _snprintf(b + len, sizeof(b) - 1 - len, " %s%s", personaName(m), m == self ? "(you)" : "");
+            }
+            b[sizeof(b) - 1] = '\0';
+            steamLog(b);
+            if (!g_hostReady && n > 1) {
+                char s[128];
+                _snprintf(s, sizeof(s) - 1, "%d friend(s) in your lobby - they join once your game is loaded", n - 1);
+                s[sizeof(s) - 1] = '\0';
+                setStatus(s);
+            }
+        }
+        // Admission: whenever a friend is in the lobby and our world is live,
+        // the first arrival starts the host session, later ones join the
+        // running tunnel. (Avoids needing the LobbyChatUpdate callback.)
+        for (int i = 0; g_hostReady && i < n; ++i) {
             unsigned long long m = g_getMember(g_mm, g_lobby, i);
             if (m == 0 || m == self) continue;
             bool known = false;
@@ -619,8 +672,9 @@ void tick() {
             if (known || g_admittedN >= (int)MAX_PLAYERS) continue;
             g_admitted[g_admittedN++] = m;
             coop::steamp2p::accept(m);
-            char b[96];
-            _snprintf(b, sizeof(b) - 1, "friend %llu joined the lobby - hosting for them", m);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1, "admitting %llu (%s) - %s", m, personaName(m),
+                      g_hostFired ? "adding to running session" : "starting host session");
             b[sizeof(b) - 1] = '\0';
             steamLog(b);
             if (!g_hostFired) {
@@ -633,6 +687,25 @@ void tick() {
             }
         }
     }
+
+    // Join: connect once the host's lobby says its world is live.
+    if (g_joinOwner != 0 && g_lobby != 0 && g_getData) {
+        const char* r = g_getData(g_mm, g_lobby, "kc_ready");
+        if (r && r[0] == '1') {
+            unsigned long long owner = g_joinOwner;
+            g_joinOwner = 0;
+            char b[128];
+            _snprintf(b, sizeof(b) - 1, "host %llu (%s) is ready - connecting as CLIENT",
+                      owner, personaName(owner));
+            b[sizeof(b) - 1] = '\0';
+            steamLog(b);
+            setStatus("Connecting to host...");
+            if (g_onConnect) g_onConnect(false, true, owner);
+        } else if (!g_joinWaitLogged) {
+            g_joinWaitLogged = true;
+            steamLog("host not ready yet (kc_ready != 1) - waiting in lobby");
+        }
+    }
 }
 
 const char* status() { return g_status; }
@@ -643,6 +716,10 @@ void reset() {
     g_weAreHost = false;
     g_hostFired = false;
     g_admittedN = 0;
+    g_readyPublished = -1;
+    g_lastMemberCount = -1;
+    g_joinOwner = 0;
+    g_joinWaitLogged = false;
     g_creating  = false;
     g_pendingInvitee = 0;
     g_lastFriendRefresh = 0;

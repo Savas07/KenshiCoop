@@ -843,9 +843,26 @@ void coopPanelDrive() {
     coop::steaminvite::tick();
     // Friends waiting in the host's lobby are let in only once the host's world
     // is live - never at the menu or during character creation.
-    coop::steaminvite::setHostReady(g_gameStarted && g_lastGw &&
-                                    coop::engine::gameplayLive(g_lastGw));
+    const bool hostReady = g_gameStarted && g_lastGw && coop::engine::gameplayLive(g_lastGw);
+    coop::steaminvite::setHostReady(hostReady);
     const bool lobbyHosting = coop::steaminvite::hostingLobby();
+    // Heartbeat for after-the-fact debugging: one line every 30 s.
+    {
+        static DWORD s_lastBeat = 0;
+        DWORD now = GetTickCount();
+        if (s_lastBeat == 0 || now - s_lastBeat >= 30000) {
+            s_lastBeat = now;
+            char b[256];
+            _snprintf(b, sizeof(b) - 1,
+                      "[session] role=%s net=%d id=%u players=%u inWorld=%d ready=%d lobbyHost=%d status='%s'",
+                      g_cfg.isHost ? "host" : "join", g_net.isRunning() ? 1 : 0,
+                      (unsigned)g_net.localId(), (unsigned)g_session.peers.size() + 1,
+                      g_gameStarted ? 1 : 0, hostReady ? 1 : 0, lobbyHosting ? 1 : 0,
+                      coop::steaminvite::status());
+            b[sizeof(b) - 1] = '\0';
+            coopLog(b);
+        }
+    }
 
     coop::engine::CoopPanelState ps;
     ps.selfSteamId  = (unsigned long long)coop::steamp2p::selfId();
