@@ -2002,6 +2002,7 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     sessionResetForUi();
 
     g_cfg.isHost    = isHost;
+    coop::logSetTag(isHost ? "HOST" : "JOIN");
     g_cfg.transport = useSteam ? "steam" : "udp";
     // Re-read the UDP endpoint (ip/port) from coop_config.json so editing it then
     // hitting Connect works without restarting the game. (It also picks up a

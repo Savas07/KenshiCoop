@@ -22,6 +22,10 @@ namespace coop {
 // short mode tag (e.g. "HOST"/"JOIN"). Safe to call once at plugin load.
 void logInit(const char* path, const char* modeTag);
 
+// Change the mode tag later (the F2 panel picks the role after load: a player
+// who joins a friend must log as JOIN even though the file was opened as HOST).
+void logSetTag(const char* modeTag);
+
 // The wall clock every timestamp in this plugin derives from: milliseconds
 // since local midnight PLUS the injected fake skew (see logSetFakeSkewMs).
 // Both the log-line "[HH:MM:SS.mmm]" stamps AND the wire time-sync packets

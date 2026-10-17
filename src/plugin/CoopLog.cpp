@@ -71,6 +71,15 @@ void logInit(const char* path, const char* modeTag) {
     writeLine("INFO", "log opened");
 }
 
+void logSetTag(const char* modeTag) {
+    if (!g_init || !modeTag) return;
+    EnterCriticalSection(&g_cs);
+    size_t i = 0;
+    for (; modeTag[i] && i < sizeof(g_tag) - 1; ++i) g_tag[i] = modeTag[i];
+    g_tag[i] = '\0';
+    LeaveCriticalSection(&g_cs);
+}
+
 void logLine(const char* msg)    { writeLine("INFO",  msg); }
 void logErrLine(const char* msg) { writeLine("ERROR", msg); }
 

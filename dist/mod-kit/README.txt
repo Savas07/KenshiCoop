@@ -78,3 +78,5 @@ TROUBLESHOOTING
     '[steam] session ... active=1' in <Kenshi>\KenshiCoop_*.log.
   * "protocol mismatch": one player has an older/newer build; both should use
     the same release.
+  * Sending logs: every player's log is <Kenshi>\KenshiCoop_host.log (joining
+    players too - their lines switch to [JOIN] once they join a friend).
