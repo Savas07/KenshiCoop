@@ -1881,13 +1881,27 @@ void titleUpdate_hook(TitleScreen* self) {
     // mainLoop_hook (gated on g_gameStarted). Pump the join half FIRST (before
     // the panel) so a GUI fault can never block it. gw is null: processNetEvents
     // only touches it under a gw&& guard, and the JOIN branches of driveSaveSync/
-    // driveLoadSync never deref it. The load path is gated on savesReady():
-    // before then the host's LOAD_GO simply waits in the inbound queue (no NACK
-    // -> no stream yet), and the save-receiver half still commits chunks to disk.
+    // driveLoadSync never deref it. The load path waits for the save manager:
+    // savesReady() (it has saves listed) or, for a player who has NO saves at
+    // all (savesReady() then never turns true - a fresh install could never
+    // join), the title screen having been up for 3 s. Before then the host's
+    // LOAD_GO simply waits in the inbound queue (no NACK -> no stream yet), and
+    // the save-receiver half still commits chunks to disk.
     if (g_net.isRunning() && !g_cfg.isHost && !g_gameStarted) {
+        static DWORD s_titleSince = 0;
+        static bool  s_noSaveLogged = false;
+        if (s_titleSince == 0) s_titleSince = GetTickCount();
+        bool ready = coop::engine::savesReady();
+        if (!ready && GetTickCount() - s_titleSince >= 3000) {
+            ready = true;
+            if (!s_noSaveLogged) {
+                s_noSaveLogged = true;
+                coopLog("[load] no local saves listed - handling host load orders anyway");
+            }
+        }
         processNetEvents(0);
         if (g_cfg.saveSync) driveSaveSync();
-        if (g_cfg.loadSync && coop::engine::savesReady()) driveLoadSync(0);
+        if (g_cfg.loadSync && ready) driveLoadSync(0);
         // F2 panel + status banner while the join waits at the menu (guarded; the
         // host's world is the destination, so we skip the config auto-load for a
         // join session).
