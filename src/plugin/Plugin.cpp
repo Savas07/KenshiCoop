@@ -1193,15 +1193,20 @@ void nameFreshWorld() {
     b[sizeof(b) - 1] = '\0'; coopLog(b);
 }
 
-// "World became live" bookkeeping for character creation: a world that went
-// live with no proceeding load since the previous one came from New Game.
+// "World became live" bookkeeping: a world that went live with no proceeding
+// load since the previous one came from New Game. Runs on EVERY world-live edge
+// whatever the current role - g_cfg.isHost only records the last connect, so a
+// role-gated call left a stale fresh state + push name behind when this player
+// joined someone, left, loaded a campaign and hosted again (that campaign was
+// then pushed into the old co-op world's folder, with freshStart=1). A join's
+// world always comes from a load, so there it just clears the state.
 void noteWorldLive() {
     static unsigned int s_serialAtLive = 0;
     const unsigned int serial = coop::engine::loadEdgeSerial();
     g_worldFresh = (serial == s_serialAtLive);
     s_serialAtLive = serial;
-    coopLog(g_worldFresh ? "[chargen] host world source: NEW GAME (joins may create characters)"
-                         : "[chargen] host world source: SAVE (no character creation)");
+    coopLog(g_worldFresh ? "[chargen] world source: NEW GAME (when hosting, joins may create characters)"
+                         : "[chargen] world source: SAVE (no character creation)");
     if (g_worldFresh) nameFreshWorld();
     else              g_freshPushName.clear(); // a loaded world: push under its own name
 }
@@ -1232,7 +1237,7 @@ void tickWorldSwapEdge(GameWorld* gw) {
                           "[load] WORLD-RELOAD swapMs=%lu hookTicksDuringSwap=%u",
                           (unsigned long)swapMs, (unsigned)g_swapHookTicks);
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
-                if (g_cfg.isHost) noteWorldLive();
+                noteWorldLive();
                 // Session reset (protocol 32): centralized order (repl maps then
                 // inbound queues). Peer presence + suppression levers survive.
                 if (g_cfg.loadSync)
@@ -2102,7 +2107,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         g_gameStarted   = true;
         g_gameStartTick = GetTickCount();
         coopLog("KenshiCoop: gameplay started");
-        if (g_cfg.isHost) noteWorldLive();
+        noteWorldLive();
         // Coordinated load (protocol 32): the title-screen auto-load fired the
         // load detour BEFORE gameplay - discard its queued edge here, or the
         // first driveLoadSync tick (g_gameStarted now true) would mistake it

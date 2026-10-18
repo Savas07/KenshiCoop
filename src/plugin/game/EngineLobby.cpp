@@ -667,7 +667,8 @@ void runAction(const std::string& a, const LobbyState* st, const LobbyActions* a
 // Synthetic input does not reach the game window reliably, so tests script the
 // lobby through the SAME delegates a mouse click fires: "open" clicks the
 // injected MULTIPLAYER button, "begin" Kenshi's New Game BEGIN button, "confirm"
-// the host's own New Game character editor as it is, any other verb (host,
+// the host's own New Game character editor as it is, "vanilla=<name>" a widget of
+// Kenshi's title menu by layout name (e.g. NewGameButton), any other verb (host,
 // newgame, saves, close, leave, load=<save>) the lobby button with that action.
 // Steps are ';'-separated, ~3 s apart, each retried up to 30 s until its target
 // exists. Invite is deliberately not scriptable (it messages a real Steam friend).
@@ -715,6 +716,10 @@ void testTick() {
         if (chargenEditorOpen() && chargenConfirmEditor()) target = (MyGUI::Widget*)1;
     } else if (t.verb == "open") {
         target = g_ui.menuBtn;
+        fireClick(target);
+    } else if (t.verb == "vanilla") {
+        // A widget of Kenshi's own title menu by layout name (e.g. NewGameButton).
+        target = findLayoutWidget(t.arg.c_str(), "ExitButton", 0);
         fireClick(target);
     } else if (t.verb == "begin") {
         target = findLayoutWidget("BeginButton", "TitleTextBox", 0);
