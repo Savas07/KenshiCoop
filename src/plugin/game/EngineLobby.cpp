@@ -28,6 +28,7 @@
 #include <mygui/MyGUI_Button.h>
 #include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_Delegate.h>
+#include <mygui/MyGUI_TabControl.h>
 
 #include <windows.h>
 #include <cstdio>
@@ -804,6 +805,29 @@ void lobbyTick(const LobbyState* st, const LobbyActions* act) {
 bool lobbyIsOpen() { return g_ui.open; }
 
 void lobbyTestTick() { testTick(); }
+
+// ASCII-uppercase copy (Kenshi shows squad tab captions in capitals).
+static std::string upperAscii(const std::string& s) {
+    std::string u(s);
+    for (size_t i = 0; i < u.size(); ++i) if (u[i] >= 'a' && u[i] <= 'z') u[i] = (char)(u[i] - 32);
+    return u;
+}
+
+bool renameSquadTabCaption(const std::string& oldName, const std::string& newName) {
+    MyGUI::Widget* w = findLayoutWidget("SquadPanel", "ShortcutsPanel", 0);
+    if (!w) return false;
+    MyGUI::TabControl* tc = w->castType<MyGUI::TabControl>(false);
+    if (!tc) return false;
+    const std::string o = upperAscii(oldName);
+    for (size_t i = 0; i < tc->getItemCount(); ++i) {
+        const std::string cur = tc->getItemNameAt(i).asUTF8();
+        if (cur != oldName && upperAscii(cur) != o) continue;
+        const bool caps = cur != oldName && cur == o;
+        tc->setItemNameAt(i, MyGUI::UString(caps ? upperAscii(newName) : newName));
+        return true;
+    }
+    return false;
+}
 
 } // namespace engine
 } // namespace coop

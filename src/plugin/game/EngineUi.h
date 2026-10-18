@@ -10,6 +10,8 @@
 #ifndef KENSHICOOP_ENGINE_UI_H
 #define KENSHICOOP_ENGINE_UI_H
 
+#include <string>
+
 namespace coop {
 namespace engine {
 
@@ -129,6 +131,10 @@ bool lobbyIsOpen();
 // character editor is part of the world, where the title screen no longer
 // ticks): steps like "confirm" run from here. No-op without the env script.
 void lobbyTestTick();
+// The live squad tab bar (MainPanel's SquadPanel) keeps the caption it built
+// when the tab appeared; after renaming a squad, retitle its tab too. False when
+// no tab carries oldName (e.g. the bar is not built yet).
+bool renameSquadTabCaption(const std::string& oldName, const std::string& newName);
 
 // Persistent co-op connection-status banner: a single screen-space label fixed 10
 // px in from the top-left corner (a createFloatingLabel MyGUI::Window on the

@@ -430,7 +430,7 @@ void onLobbyCreated(LobbyCreated_t* r, bool ioFailure) {
         steamLog(c);
         setStatus("Invite sent - waiting for your friend to accept...");
     } else {
-        setStatus("Open to friends - invite one below, or they Join from their F2");
+        setStatus("Open to friends - invite them below, or they join from MULTIPLAYER > JOIN");
     }
 }
 

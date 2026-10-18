@@ -511,6 +511,19 @@ void applySquadNames(GameWorld* gw) {
     const DWORD now = GetTickCount();
     if (g_roster.empty() || now - s_last < 2000) return;
     s_last = now;
+    // Tab bar captions that could not be retitled yet (bar not built at the
+    // moment of the rename): retried each pass for ~1 minute.
+    static std::vector<std::pair<std::string, std::string> > s_capPending;
+    static std::vector<int> s_capTries;
+    for (size_t k = 0; k < s_capPending.size(); ) {
+        if (coop::engine::renameSquadTabCaption(s_capPending[k].first, s_capPending[k].second) ||
+            ++s_capTries[k] > 30) {
+            s_capPending.erase(s_capPending.begin() + k);
+            s_capTries.erase(s_capTries.begin() + k);
+        } else {
+            ++k;
+        }
+    }
     std::vector<std::pair<std::pair<coop::u32, coop::u32>, coop::u32> > tabs;
     g_repl.sharedTabs(tabs);
     std::vector<std::string> used;
@@ -533,8 +546,10 @@ void applySquadNames(GameWorld* gw) {
         char b[256];
         if (rc == 1) {
             rosterRemember(name);
-            _snprintf(b, sizeof(b) - 1, "[roster] squad tab rank %u named '%s' (was '%s')",
-                      (unsigned)tabs[i].second, name.c_str(), before.c_str());
+            const bool cap = coop::engine::renameSquadTabCaption(before, name);
+            if (!cap) { s_capPending.push_back(std::make_pair(before, name)); s_capTries.push_back(0); }
+            _snprintf(b, sizeof(b) - 1, "[roster] squad tab rank %u named '%s' (was '%s') tabbar=%d",
+                      (unsigned)tabs[i].second, name.c_str(), before.c_str(), cap ? 1 : 0);
         } else if (rc == 0 && before != name && s_keptLogged.insert(tabs[i].first).second) {
             _snprintf(b, sizeof(b) - 1, "[roster] squad tab rank %u keeps its own name '%s' (player name '%s')",
                       (unsigned)tabs[i].second, before.c_str(), name.c_str());
@@ -1293,10 +1308,12 @@ void coopPanelDrive(bool atTitle) {
         detail = g_cfg.isHost ? "Hosting - waiting for peer..." : "Connecting...";
         ostate = 1;
     } else if (lobbyHosting) {
-        detail = "Open to friends - press F2 to invite one";
+        detail = atTitle ? "Lobby open - invite friends in MULTIPLAYER"
+                         : "Lobby open - press F2 to invite more friends";
         ostate = 1;
     } else {
-        detail = "Offline - press F2 to host or join a friend";
+        detail = atTitle ? "Offline - click MULTIPLAYER to host or join"
+                         : "Offline - host or join from MULTIPLAYER on the main menu";
         ostate = 0;
     }
     ps.detail = detail.c_str();
