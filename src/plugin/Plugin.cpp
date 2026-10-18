@@ -1366,7 +1366,12 @@ void coopPanelDrive(bool atTitle) {
     act.join       = &coop::steaminvite::joinFriend;
 
     coop::engine::coopPanelTick(&ps, &act);
-    coop::engine::coopOverlayTick(detail.c_str(), ostate, g_net.isRunning() || lobbyHosting);
+    // Top-left status banner: hidden for now (to be reworked); KENSHICOOP_BANNER=1
+    // shows it again for debugging. Session status stays in the lobby + F2 panel.
+    static int s_banner = -1;
+    if (s_banner < 0) { const char* e = getenv("KENSHICOOP_BANNER"); s_banner = (e && e[0] == '1') ? 1 : 0; }
+    coop::engine::coopOverlayTick(detail.c_str(), ostate,
+                                  s_banner == 1 && (g_net.isRunning() || lobbyHosting));
     if (atTitle) lobbyDrive(s_friends, transfer);
     else         coop::engine::lobbyTestTick();
 }

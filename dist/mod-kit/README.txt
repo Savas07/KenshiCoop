@@ -1,4 +1,4 @@
-﻿KenshiCoop v0.57.2 - co-op mod
+﻿KenshiCoop v0.57.3 - co-op mod
 ==============================
 
 This zip contains ONE folder: "KenshiCoop". That folder IS the mod.
@@ -50,8 +50,7 @@ PLAY (Steam - recommended)
      sends its world to you and you load right into it. (You do NOT need the
      host's save beforehand. An identical copy already on disk is used as-is.)
   3. In-game, F2 opens the co-op panel: status, Invite more friends, and
-     "Leave co-op session". A status banner in the TOP-LEFT corner shows the
-     session state at the main menu as well as in-game.
+     "Leave co-op session".
   Good to know:
    * New game: each joining player designs their character in Kenshi's own
      character editor right after loading in (about 8 s after their world

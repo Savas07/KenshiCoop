@@ -62,7 +62,7 @@ only needed for LAN / direct-UDP games.)
 
 ### 1. Install the mod
 
-Grab `KenshiCoop-kit-v0.57.2.zip` from the
+Grab `KenshiCoop-kit-v0.57.3.zip` from the
 [latest release](https://github.com/Savas07/KenshiCoop/releases/latest) and
 unzip it anywhere (every player). You do not need to clone this repository -
 but if you did, the same kit is in [dist/mod-kit](dist/mod-kit).
@@ -95,9 +95,7 @@ Kenshi and enable **KenshiCoop** in the Mods menu.
    it and you join once the main menu is up. (If you already have an identical
    copy of the host's save on disk, it's used as-is instead of transferring.)
 3. In-game, **F2** opens the co-op panel: live status, **Invite** more friends
-   (the list stays available while you play) and **Leave co-op session**. A
-   status banner in the **top-left corner** shows the session state at the main
-   menu as well as in-game.
+   (the list stays available while you play) and **Leave co-op session**.
 
 If the host runs a different KenshiCoop version, their entry reads *different
 mod version* and joining is refused - every player needs the same release.
