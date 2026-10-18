@@ -333,6 +333,12 @@ struct Config {
     // along the ground behind its carrier. "0" is the A/B escape hatch.
     bool          carrySync;
 
+    // KENSHICOOP_GLIDE / coop_config.json "glide" (default ON): squad copies that
+    // cannot keep up by walking (owner's clock catch-up, or a copy that stopped
+    // obeying move orders) follow the streamed path by placement instead of
+    // trailing to the 150 u snap. 0 = walk drive + snap gate only.
+    bool          glide;
+
     // KENSHICOOP_FURN_SYNC (default ON): furniture-occupancy sync (protocol 19)
     // - reliable bed/cage enter/exit edges + self-healing occupancy state,
     // executed engine-native (setBedMode/setPrisonMode) between each machine's

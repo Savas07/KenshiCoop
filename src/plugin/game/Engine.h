@@ -175,6 +175,20 @@ bool applyMotion(Character* c, bool moving, float speed, float mx, float my, flo
 // SEH-guarded: read the body's live locomotion truth (the float-bug oracle):
 // currentlyMoving + currentSpeed. Returns false on fault / missing controller.
 bool readMotion(Character* c, bool* moving, float* speed);
+// Locomotion internals for diagnosing a body that takes move orders but does
+// not translate (havok character present? animation-tracking mode? ...).
+struct MoveDiag {
+    bool  valid;
+    bool  havok;          // CharMovement::havokCharacter != 0
+    bool  tracer;         // CharMovement::tracer != 0
+    bool  animOverride;   // CharMovement::animationOverride
+    bool  trackingAnim;   // isTrackingAnimationMode()
+    int   mode;           // movementMode
+    bool  moving;         // currentlyMoving
+    float speed, desired;
+    float dx, dy, dz;     // destination
+};
+bool readMoveDiag(Character* c, MoveDiag* out);
 
 // SEH-guarded: fetch the local player's squad leader (playerCharacters[0]) or 0.
 Character* leader(GameWorld* gw);

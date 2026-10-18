@@ -338,6 +338,10 @@ inline bool taskIsCombatWait(u16 t) { return t == TASK_COMBAT_WAIT; }
 // pickup). Priority sits below combat, above rest poses.
 const u16 TASK_CARRY_BODY = 0xFE02u;
 inline bool taskIsCarry(u16 t) { return t == TASK_CARRY_BODY; }
+// Kenshi's get-up tasks (TaskType STAND_UP=28, GET_UP_STAND_UP=65,
+// FORCE_GET_UP=66): the post-KO/ragdoll recovery during which move orders are
+// ignored. Engine task keys, so no protocol change.
+inline bool taskIsGetUp(int t) { return t == 28 || t == 65 || t == 66; }
 
 // bodyState bit-flags. A body is "down" (on the ground, not upright) when any of
 // BODY_DOWN / BODY_RAGDOLL / BODY_DEAD is set; BODY_CRAWL is an upright-ish stealth/

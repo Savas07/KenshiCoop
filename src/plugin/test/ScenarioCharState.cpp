@@ -262,6 +262,148 @@ private:
     unsigned int  l1Hand_[5];
 };
 
+// carry_walk (field report 2026-10-18): the host picked up the JOIN's
+// character, carried it and put it down; from then on the host's copy of it
+// stood frozen where it was dropped while the join walked the body around the
+// map. carry_order window C covers the pickup/carry/drop but ends right after
+// the revive, so the "walks off afterwards" half was never exercised. Timeline
+// (peer-armed clock): join KO's its leader L1; host's L0 picks L1 up, walks a
+// leg and ragdoll-drops it; the join revives L1 and walks it a square route.
+// Both sides log "SCENARIO TRACK" for L1 (and L0) at 2 Hz: the host's L1 pos
+// must follow the join's after the revive.
+class CarryWalkScenario : public TimedScenario {
+public:
+    CarryWalkScenario()
+        : TimedScenario("carry_walk", 0), lastLogMs_(0), lastHoldMs_(0),
+          haveL0_(false), haveL1_(false), down_(false), pick_(false), walk_(false),
+          drop_(false), revive_(false), leg_(0), haveStart_(false), sx_(0), sy_(0), sz_(0) {}
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveL0_ || !haveL1_) latch(ctx);
+        const unsigned long t = ctx.elapsedMs;
+        // Controls: KENSHICOOP_CW_NOCARRY=1 skips the host's pickup/carry/drop,
+        // KENSHICOOP_CW_NODOWN=1 skips the KO (isolates which transition breaks
+        // the post-transition drive).
+        const char* nc = getenv("KENSHICOOP_CW_NOCARRY");
+        const char* nd = getenv("KENSHICOOP_CW_NODOWN");
+        if (nc && nc[0] == '1') { pick_ = walk_ = drop_ = true; }
+        if (!ctx.isHost && haveL1_ && !down_ && t >= DOWN_AT) {
+            if (nd && nd[0] == '1') act("down(skipped)", l1_, true);
+            else act("down", l1_, engine::orderDownSubject(ctx.gw, l1_));
+            down_ = true;
+        }
+        // KENSHICOOP_CW_HOLD=0: never re-top the KO timer, so the body wakes on
+        // its own (the scaffold KO lasts ~8 s) - mid-carry, on the shoulder.
+        const char* hd = getenv("KENSHICOOP_CW_HOLD");
+        if (!ctx.isHost && down_ && !revive_ && !(hd && hd[0] == '0') && t - lastHoldMs_ >= 2000) {
+            lastHoldMs_ = t;
+            Character* c = byHand(l1_);
+            if (c) engine::holdDown(c);
+        }
+        if (ctx.isHost && haveL0_ && haveL1_ && !pick_ && t >= PICK_AT) {
+            act("pickup", l1_, engine::carrySubject(ctx.gw, l0_, l1_)); pick_ = true;
+        }
+        if (ctx.isHost && haveL0_ && !walk_ && t >= CWALK_AT) {
+            Character* c = byHand(l0_);
+            float x, y, z;
+            bool ok = c && engine::readPos(c, &x, &y, &z) && engine::orderMoveTo(c, x + 10.0f, y, z);
+            act("carrywalk", l0_, ok); walk_ = true;
+        }
+        if (ctx.isHost && haveL0_ && !drop_ && t >= DROP_AT) {
+            // KENSHICOOP_CW_RAGDOLL=0: the gentle put-down instead of the ragdoll drop.
+            const char* rg = getenv("KENSHICOOP_CW_RAGDOLL");
+            const bool ragdoll = !(rg && rg[0] == '0');
+            act(ragdoll ? "drop(ragdoll)" : "drop(putdown)", l0_, engine::dropSubject(ctx.gw, l0_, ragdoll));
+            drop_ = true;
+        }
+        // KENSHICOOP_CW_WAKE=natural: stop holding the KO at REVIVE_AT and let the
+        // body wake on its own (the field case) instead of an explicit revive.
+        if (!ctx.isHost && haveL1_ && !revive_ && t >= REVIVE_AT) {
+            const char* wk = getenv("KENSHICOOP_CW_WAKE");
+            if (wk && strcmp(wk, "natural") == 0) act("release(natural wake)", l1_, true);
+            else act("revive", l1_, engine::reviveSubject(ctx.gw, l1_));
+            revive_ = true;
+        }
+        // Square route after the revive: 4 legs, LEG_MS apart.
+        // KENSHICOOP_CW_ROUTE_AT=<ms>: start walking that soon (the field case:
+        // the player walked off right after being put down).
+        const char* ra = getenv("KENSHICOOP_CW_ROUTE_AT");
+        const unsigned long routeAt = (ra && ra[0]) ? (unsigned long)atol(ra) : ROUTE_AT;
+        if (!ctx.isHost && haveL1_ && (revive_ || (ra && ra[0] && t >= routeAt)) &&
+            t >= routeAt && leg_ < 4 &&
+            t >= routeAt + (unsigned long)leg_ * LEG_MS) {
+            Character* c = byHand(l1_);
+            if (c && !haveStart_ && engine::readPos(c, &sx_, &sy_, &sz_)) haveStart_ = true;
+            // KENSHICOOP_CW_LEG=<u>: square side (default 60). Long legs (400) are
+            // the field shape - a sustained walk the drive must keep up with.
+            const char* lg = getenv("KENSHICOOP_CW_LEG");
+            const float L = (lg && lg[0]) ? (float)atof(lg) : 60.0f;
+            const float DX[4] = { L, L, 0.0f, 0.0f };
+            const float DZ[4] = { 0.0f, L, L, 0.0f };
+            bool ok = c && haveStart_ && engine::orderMoveTo(c, sx_ + DX[leg_], sy_, sz_ + DZ[leg_]);
+            act("routeleg", l1_, ok);
+            ++leg_;
+        }
+        if (t - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = t;
+            if (haveL1_) track("L1", l1_, t);
+            if (haveL0_) track("L0", l0_, t);
+        }
+        if (t >= DURATION) {
+            passed_ = ctx.isHost ? (pick_ && drop_) : (down_ && revive_ && leg_ == 4);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    static const unsigned long DOWN_AT = 8000, PICK_AT = 12000, CWALK_AT = 14000,
+                               DROP_AT = 22000, REVIVE_AT = 26000, ROUTE_AT = 40000,
+                               LEG_MS = 7000, DURATION = 76000;
+    Character* byHand(const unsigned int h[5]) {
+        return engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+    }
+    void act(const char* what, const unsigned int h[5], bool ok) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CARRYWALK %s hand=%u,%u ok=%d", what, h[3], h[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    void track(const char* who, const unsigned int h[5], unsigned long t) {
+        Character* c = byHand(h);
+        if (!c) return;
+        float x = 0, y = 0, z = 0;
+        engine::readPos(c, &x, &y, &z);
+        engine::CarryRead cr;
+        bool haveCr = engine::readCarry(c, &cr) && cr.valid;
+        char b[360];
+        engine::MoveDiag md;
+        bool haveMd = engine::readMoveDiag(c, &md);
+        _snprintf(b, sizeof(b) - 1, "SCENARIO TRACK %s t=%lu pos=%.1f,%.1f,%.1f bs=%u carrying=%d beingCarried=%d "
+                  "havok=%d tracer=%d animOvr=%d trackAnim=%d mode=%d mv=%d spd=%.1f want=%.1f task=%d",
+                  who, t, x, y, z, (unsigned)engine::readBodyState(c),
+                  haveCr && cr.carrying ? 1 : 0, haveCr && cr.beingCarried ? 1 : 0,
+                  haveMd && md.havok ? 1 : 0, haveMd && md.tracer ? 1 : 0, haveMd && md.animOverride ? 1 : 0,
+                  haveMd && md.trackingAnim ? 1 : 0, haveMd ? md.mode : -1, haveMd && md.moving ? 1 : 0,
+                  haveMd ? md.speed : 0.0f, haveMd ? md.desired : 0.0f, engine::readTaskKey(c));
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    void latch(const ScenarioContext& ctx) {
+        EntityState sq[32];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, 32);
+        int i0 = tabLeaderIdx(sq, n, 0), i1 = tabLeaderIdx(sq, n, 1);
+        if (!haveL0_ && i0 >= 0) { handFromEntity(sq[i0], l0_); haveL0_ = true; }
+        if (!haveL1_ && i1 >= 0) { handFromEntity(sq[i1], l1_); haveL1_ = true; }
+    }
+    unsigned long lastLogMs_, lastHoldMs_;
+    bool haveL0_, haveL1_, down_, pick_, walk_, drop_, revive_;
+    int  leg_;
+    bool haveStart_;
+    float sx_, sy_, sz_;
+    unsigned int l0_[5], l1_[5];
+};
+
 // npc_carry (protocol 18, world-NPC carrier extension): the 2026-07-07 remote
 // session's third gap - a HOST-side world NPC hauling a downed player character
 // never replicated to the join. One window: the host KO's its second member
@@ -2411,6 +2553,7 @@ Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "lockpick_escape") return new EscapeScenario("lockpick_escape", false);
     if (name == "escape_cohesion") return new EscapeScenario("escape_cohesion", true);
     if (name == "carry_order")  return new CarryOrderScenario();
+    if (name == "carry_walk")   return new CarryWalkScenario();
     if (name == "npc_carry")    return new NpcCarryScenario();
     if (name == "bed_pose")     return new BedPoseScenario();
     if (name == "bed_wake")     return new BedWakeScenario();

@@ -555,6 +555,28 @@ bool readMotion(Character* c, bool* moving, float* speed) {
     }
 }
 
+bool readMoveDiag(Character* c, MoveDiag* out) {
+    if (!c || !out) return false;
+    out->valid = false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        out->havok        = mv->havokCharacter != 0;
+        out->tracer       = mv->tracer != 0;
+        out->animOverride = mv->animationOverride;
+        out->trackingAnim = mv->isTrackingAnimationMode();
+        out->mode         = (int)mv->movementMode;
+        out->moving       = mv->currentlyMoving;
+        out->speed        = mv->currentSpeed;
+        out->desired      = mv->desiredSpeed;
+        out->dx = mv->destination.x; out->dy = mv->destination.y; out->dz = mv->destination.z;
+        out->valid = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 int readTaskKey(Character* c) {
     if (!c || !g_taskerKeyFn) return -1;
     __try {

@@ -192,6 +192,22 @@ const unsigned long ATTR_WINDOW_MS = 3000; // remember a combatant's victim this
 const unsigned long CARRY_HEAL_MS = 1500; // min gap between self-heal pickups
 const unsigned long CARRY_DROP_MS = 3000; // stream must stop reporting the carry
                                           // this long before the local copy drops
+const unsigned long PHYS_HEAL_MS  = 1000; // min gap between locomotion-body restores
+const unsigned long GETUP_HEAL_MS = 250;  // min gap between stale get-up releases
+// Squad glide: source covering this many times its own gait speed per wall
+// second, at running pace, for GLIDE_SUSTAIN_MS = the owner's sim runs faster
+// than ours (clock catch-up). 1.35 missed the catch-up tail (slew ~1.3 still
+// out-ran the walk and snapped). Held GLIDE_HOLD_MS past the last such sample.
+const float         GLIDE_SPEED_RATIO = 1.15f;
+const float         GLIDE_MIN_SPEED   = 30.0f;
+const unsigned long GLIDE_SUSTAIN_MS  = 300;
+const unsigned long GLIDE_HOLD_MS     = 600;
+const float         GLIDE_SLEW_BAND   = 0.10f; // own sim this far off 1x -> glide squad copies
+// Frozen-copy fallback: owner running, gap above GLIDE_STALL_GAP, our copy has
+// stayed within GLIDE_STALL_MOVE of one spot for GLIDE_STALL_MS -> glide.
+const float         GLIDE_STALL_GAP   = 20.0f;
+const float         GLIDE_STALL_MOVE  = 1.0f;
+const unsigned long GLIDE_STALL_MS    = 400;
 // Furniture occupancy sync (protocol 19): same shape as the carry self-heal.
 const unsigned long FURN_HEAL_MS = 1500;  // min gap between self-heal enters
 const unsigned long FURN_EXIT_MS = 3000;  // stream must stop reporting occupancy

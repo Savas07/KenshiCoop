@@ -208,6 +208,10 @@ void loadConfig(Config& c) {
     // it the peer's down-enforcement drags/teleports a carried KO'd body
     // along the ground behind its carrier. "0" is the A/B escape hatch.
     c.carrySync = envOr("KENSHICOOP_CARRY_SYNC", "1") != "0";
+    {
+        std::string g = envOr("KENSHICOOP_GLIDE", fileOr(f, "glide", "1").c_str());
+        c.glide = !(g == "0" || g == "false" || g == "off");
+    }
 
     // Furniture occupancy sync (protocol 19, DEFAULT ON): reliable enter/exit
     // edges + self-healing BODY_IN_BED/BODY_IN_CAGE state, executed engine-
@@ -443,6 +447,7 @@ std::string describeConfig(const Config& c) {
         { "med",     c.medSync },      { "speed",   c.speedSync },
         { "speedCombatCap", c.speedCombatCap },
         { "stats",   c.statsSync },    { "carry",   c.carrySync },
+        { "glide",   c.glide },
         { "furn",    c.furnSync },     { "chain",   c.chainSync },
         { "stealth", c.stealthSync },  { "prone",   c.proneSync },
         { "money",   c.moneySync },

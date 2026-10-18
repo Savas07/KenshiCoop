@@ -876,6 +876,55 @@ void Replicator::applyTargets(GameWorld* gw) {
             engine::knockDown(c, false); // host says upright again -> stand back up
             d.downApplied = false;
         }
+        // ---- Locomotion-body restore (squad copies) ------------------------------
+        // Reached only by a body the stream says is UPRIGHT and free (the down,
+        // carried, furniture and crawl branches above all continue out). Kenshi
+        // destroys a character's Havok controller when it stops being a free
+        // walker (KO ragdoll, shoulder carry) and the body's own recovery rebuilds
+        // it; an AI-suspended copy never runs that recovery. Without a controller
+        // the copy can be placed but ignores every walk order. Field report
+        // 2026-10-18: after the host put the join's character down, the host's
+        // copy stood at the drop point while the join walked away, snapping only
+        // at the 150 u gate; carry_walk reproduced havok=0 after the drop. Same
+        // repair the crawl drive uses (restoreMovement = CharMovement::restore).
+        // Default OFF (KENSHICOOP_EXP_MOVEHEAL=1) until a test shows it firing
+        // and fixing the carry case.
+        static int s_expMoveHeal = -1;
+        if (s_expMoveHeal < 0) {
+            const char* e = getenv("KENSHICOOP_EXP_MOVEHEAL");
+            s_expMoveHeal = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (s_expMoveHeal && isSquad && (now - d.physHealTick) >= PHYS_HEAL_MS &&
+            !engine::hasPhysicsBody(c) && !coop::bodyIsDown(engine::readBodyState(c))) {
+            d.physHealTick = now;
+            bool restored = engine::restoreMovement(c);
+            if (restored) d.haveDest = false;   // re-issue the walk on the new controller
+            ++physHeal_;
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[heal] PHYSICS hand=%u,%u restored=%d", out.hIndex, out.hSerial, restored ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // Kenshi runs a get-up task (GET_UP_STAND_UP / FORCE_GET_UP / STAND_UP)
+        // after any KO or ragdoll, and a body in it ignores move orders. On the
+        // owner it completes in a beat; on an AI-suspended copy it lingered for
+        // seconds (carry_walk: task=65 while the owner already walked; KO-only
+        // control with the walk right after the wake: stuck walk frames 26% -> 9%
+        // with this). Once the OWNER walks and is not itself getting up, the
+        // copy's get-up is stale: end it and re-issue the walk at once.
+        if (out.cMoving != 0 && !coop::taskIsGetUp((int)out.task) &&
+            (now - d.getUpHealTick) >= GETUP_HEAL_MS) {
+            int lt = engine::readTaskKey(c);
+            if (coop::taskIsGetUp(lt) && !coop::bodyIsDown(engine::readBodyState(c))) {
+                d.getUpHealTick = now;
+                bool ok = engine::endAction(c);
+                d.haveDest = false;            // the next walk branch re-issues the order
+                ++getUpHeal_;
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[heal] GETUP hand=%u,%u task=%d ok=%d after=%d",
+                    out.hIndex, out.hSerial, lt, ok ? 1 : 0, engine::readTaskKey(c));
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
 
         // ---- Stealth posture (protocol 20) -------------------------------------
         // Continuous mode apply: the streamed BODY_SNEAK bit IS Character::
@@ -1728,12 +1777,90 @@ void Replicator::applyTargets(GameWorld* gw) {
             snapOk = gapNewest > snapGate * 3.0f &&
                      (!midTier || (now - d.npcSnapTick) >= NPC_SNAP_COOL_MS);
         }
+        // ---- Squad glide (source outruns its own gait) -----------------------
+        // While the join's clock catches up to the host's (timeSlew up to 2x on
+        // the join after loading in with a clock skew) its characters run at their
+        // normal gait in GAME time but cover up to twice the ground per WALL
+        // second. The copy on the other screen walks at that normal gait - the
+        // engine will not run a player character faster than its max speed - so
+        // it fell ~65 u/s behind and hard-snapped at the 150 u gate: move_legs
+        // under 120 ms netsim measured srcSpd=135 vs cSpeed=71 and 10 squad snaps
+        // in the 22 s the join spent at slew=2.00, none after. The owner's own
+        // speed (cSpeed) is per GAME second, the stream's velocity per WALL
+        // second, so their ratio names this case directly. Then the copy follows
+        // the interpolated path frame by frame with the gait mirrored - the crawl
+        // drive's placement - instead of trailing and teleporting.
+        // Gated on a SUSTAINED excess at running pace: during a start or stop
+        // the interpolated velocity lags the owner's instantaneous speed, which
+        // read as a false ratio at cSpeed 10-24 (glide entered on every leg).
+        bool srcFast = isSquad && out.cSpeed > GLIDE_MIN_SPEED &&
+                       vlen > out.cSpeed * GLIDE_SPEED_RATIO;
+        if (!srcFast) d.glideFastSinceMs = 0;
+        else if (d.glideFastSinceMs == 0) d.glideFastSinceMs = now;
+        if (srcFast && (now - d.glideFastSinceMs) >= GLIDE_SUSTAIN_MS)
+            d.glideUntilMs = now + GLIDE_HOLD_MS;
+        // The mirror case on the slewing side itself: while OUR sim runs at a
+        // catch-up rate, a walked copy of the other player's character covers
+        // timeSlew_ x its gait per wall second and overruns/trails the stream
+        // (move_legs mg1: 3 join-side squad snaps at slew 1.76-2.00).
+        if (isSquad && (timeSlew_ > 1.0f + GLIDE_SLEW_BAND || timeSlew_ < 1.0f - GLIDE_SLEW_BAND))
+            d.glideUntilMs = now + GLIDE_HOLD_MS;
+        // Symptom fallback: the owner runs, the gap is open, and our copy has not
+        // moved for GLIDE_STALL_MS although the walk drive keeps ordering it. Seen
+        // after a shoulder carry + drop (the field report's frozen copy ending in
+        // 150 u snaps), after a KO, and right after a glide episode; the cause is
+        // not known yet. Placement does not depend on the copy accepting move
+        // orders, so hand it to the glide until the owner stops. Reads only our
+        // own position and the stream - never the mirrored locomotion fields.
+        if (isSquad && !d.glideActive && haveActual && vlen > GLIDE_MIN_SPEED &&
+            gapNewest > GLIDE_STALL_GAP) {
+            float sdx = ax - d.glideStallX, sdz = az - d.glideStallZ;
+            if (d.glideStallSinceMs == 0 || sdx * sdx + sdz * sdz > GLIDE_STALL_MOVE * GLIDE_STALL_MOVE) {
+                d.glideStallX = ax; d.glideStallZ = az; d.glideStallSinceMs = now;
+            } else if ((now - d.glideStallSinceMs) >= GLIDE_STALL_MS) {
+                d.glideUntilMs = now + GLIDE_HOLD_MS;
+                d.glideStallSinceMs = 0;
+                ++glideStallEnters_;
+            }
+        } else {
+            d.glideStallSinceMs = 0;
+        }
+        // Once gliding, stay in it until the owner stops: handing a running copy
+        // back to the walk drive mid-run left it ignoring move orders for 4-5 s
+        // after a long placement episode (move_legs: body frozen with reissueSq
+        // climbing, then a 150 u snap). A stop is a clean hand-off - the rest
+        // path places the body anyway.
+        if (d.glideActive && genuinelyMoving)
+            d.glideUntilMs = now + GLIDE_HOLD_MS;
+        // Config::glide (KENSHICOOP_GLIDE / coop_config.json "glide") = 0: walk
+        // drive + snap gate only.
+        bool squadGlide = glide_ && isSquad && d.glideUntilMs != 0 && (long)(d.glideUntilMs - now) > 0;
+        if (!squadGlide && d.glideActive) {
+            d.glideActive = false;
+            d.haveDest = false;                 // walk resumes with a fresh order
+            char b[128]; _snprintf(b, sizeof(b) - 1, "[glide] exit hand=%u,%u frames=%lu",
+                                   out.hIndex, out.hSerial, d.glideFrames);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
         if (simPaused) {
             // Paused consensus sim: hold. No snap, walk order, park or pose
             // apply - none of them take effect until the sim runs again, and the
             // per-frame retries were the snap storm above. Unpausing resumes the
             // drive from the live state on the next tick.
             ++pauseHold_;
+        } else if (squadGlide && genuinelyMoving && haveActual) {
+            if (!d.glideActive) {
+                d.glideActive = true; d.glideFrames = 0;
+                engine::haltMovement(c);        // no walk order fighting the placement
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[glide] enter hand=%u,%u srcVel=%.1f cSpeed=%.1f slew=%.2f gap=%.1f",
+                    out.hIndex, out.hSerial, vlen, out.cSpeed, timeSlew_, gapNewest);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            ++d.glideFrames; ++glideFrames_;
+            engine::applyRaw(c, out);
+            engine::applyMotion(c, true, out.cSpeed, out.cMotionX, out.cMotionY, out.cMotionZ);
+            d.parked = false; d.haveDest = false;
         } else if (genuinelyMoving && haveActual && gapNewest > snapGate && snapOk) {
             // Fell behind / source warped: hard-snap to the true position
             // (no-halt teleport keeps the clip phase advancing).
@@ -2268,12 +2395,14 @@ void Replicator::logDriveTelemetry(unsigned long now) {
         {
             float n  = trailN_ ? (float)trailN_ : 1.0f;
             float sn = trailSpdN_ ? (float)trailSpdN_ : 1.0f;
-            char s[288]; _snprintf(s, sizeof(s) - 1,
+            char s[320]; _snprintf(s, sizeof(s) - 1,
                 "[interp] squadTrail n=%lu gapNew=%.1f gapNewMax=%.1f gapOut=%.1f "
-                "bodySpd=%.1f srcSpd=%.1f bleed=%.1f/%lu pauseHold=%lu snapCool=%lu settle=%lu",
+                "bodySpd=%.1f srcSpd=%.1f bleed=%.1f/%lu pauseHold=%lu snapCool=%lu settle=%lu "
+                "glide=%lu glideStall=%lu getupHeal=%lu physHeal=%lu",
                 trailN_, trailGapNewSum_ / n, trailGapNewMax_, trailGapOutSum_ / n,
                 trailBodySpdSum_ / sn, trailSrcSpdSum_ / sn,
-                trailBleedSum_, trailBleedN_, pauseHold_, sqSnapCool_, sqSettle_);
+                trailBleedSum_, trailBleedN_, pauseHold_, sqSnapCool_, sqSettle_,
+                glideFrames_, glideStallEnters_, getUpHeal_, physHeal_);
             s[sizeof(s) - 1] = '\0'; coop::logLine(s);
             trailN_ = 0; trailGapNewSum_ = trailGapNewMax_ = trailGapOutSum_ = 0.0f;
             trailBodySpdSum_ = trailSrcSpdSum_ = 0.0f; trailSpdN_ = 0;

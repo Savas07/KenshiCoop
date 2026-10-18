@@ -2903,6 +2903,7 @@ void configureReplicator() {
     // Carried-body sync (protocol 18, default ON): reliable pickup/drop edges +
     // self-healing carried state. KENSHICOOP_CARRY_SYNC=0 is the A/B escape hatch.
     g_repl.setCarrySync(g_cfg.carrySync);
+    g_repl.setGlide(g_cfg.glide);
 
     // Furniture occupancy sync (protocol 19, default ON): reliable bed/cage
     // enter/exit edges + self-healing occupancy state. KENSHICOOP_FURN_SYNC=0
@@ -3255,8 +3256,13 @@ __declspec(dllexport) void startPlugin() {
     // When Steam is up, also arm the invite layer so this player can RECEIVE a
     // Steam "Join Game"/invite (GameLobbyJoinRequested) even before touching the
     // panel - the joiner never has to open it or type an ID.
+    // KENSHICOOP_TEST_NOSTEAM=1 (test instances): leave Steam alone entirely, so
+    // a test copy running beside the user's own game never registers lobby /
+    // invite callbacks or rich presence on the shared Steam account.
+    const char* noSteam = getenv("KENSHICOOP_TEST_NOSTEAM");
     const bool interactive = g_cfg.scenario.empty() && g_cfg.testSeconds == 0;
-    if (interactive || g_cfg.transport == "steam" || g_cfg.steamPing != 0) {
+    if (!(noSteam && noSteam[0] == '1') &&
+        (interactive || g_cfg.transport == "steam" || g_cfg.steamPing != 0)) {
         if (coop::steamp2p::init())
             coop::steaminvite::init(&coopUiConnect);
     }

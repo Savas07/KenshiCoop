@@ -162,6 +162,7 @@ public:
     // self-healing carried state for player-squad members, executed engine-
     // native on each machine's local pair. KENSHICOOP_CARRY_SYNC=0 disables.
     void setCarrySync(bool v) { carrySync_ = v; }
+    void setGlide(bool v) { glide_ = v; }
 
     // Peer-left sweep (carried-body sync): any driven copy still carrying a body
     // after its AUTHOR disconnected gets a local drop, so the carried body is
@@ -924,6 +925,14 @@ private:
         unsigned int agreeStreak;     // consecutive agreeing+in-position samples
         // Carried-body sync (protocol 18):
         unsigned long carryHealTick;  // last self-heal pickup attempt (throttle)
+        unsigned long physHealTick;   // last locomotion-body restore attempt (throttle)
+        unsigned long getUpHealTick;  // last stale get-up release (throttle)
+        unsigned long glideUntilMs;   // squad glide regime held until (0 = never)
+        unsigned long glideFastSinceMs; // source outrunning its gait since (0 = not)
+        float         glideStallX, glideStallZ; // copy position anchor for the stall test
+        unsigned long glideStallSinceMs;        // copy has not left the anchor since (0 = off)
+        bool          glideActive;    // in the glide regime (edge log + walk re-issue)
+        unsigned long glideFrames;    // frames of the current glide episode
         unsigned long carryNoSeeTick; // first tick a locally-carrying copy's stream
                                       //   stopped reporting TASK_CARRY_BODY (the
                                       //   debounced host-side-drop detector)
@@ -1021,7 +1030,10 @@ private:
                    combatOverTick(0), npcSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
-                   carryHealTick(0), carryNoSeeTick(0),
+                   carryHealTick(0), physHealTick(0), getUpHealTick(0),
+                   glideUntilMs(0), glideFastSinceMs(0), glideStallX(0), glideStallZ(0),
+                   glideStallSinceMs(0), glideActive(false), glideFrames(0),
+                   carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
                    haveChainOwner(false), chainHealTick(0),
                    sneakTick(0), proneTick(0), crawlDrive(false),
@@ -1851,6 +1863,10 @@ private:
                                     //   20 Hz pipeline; a newly covered mid NPC's one-time
                                     //   reconciliation snap is correct, not rubber-banding
     unsigned long walkReissueSquad_;
+    unsigned long physHeal_;        // driven bodies whose missing physics character was restored
+    unsigned long getUpHeal_;       // stale get-up tasks ended on driven copies
+    unsigned long glideFrames_;     // squad frames driven in the glide regime
+    unsigned long glideStallEnters_; // glide episodes started by the frozen-copy fallback
     unsigned long walkReissueNpc_;
     unsigned long restFlipNpc_;     // walk->rest classifier transitions (flap telemetry)
     unsigned long restFlipMid_;     // same, mid-tier bodies (kept out of the near gate)
@@ -1992,6 +2008,7 @@ private:
 
     // Carried-body sync (protocol 18): master enable (KENSHICOOP_CARRY_SYNC).
     bool                 carrySync_;
+    bool                 glide_;      // squad glide regime enable (Config::glide)
     bool                 furnSync_;
     // Chained/pole prisoner sync (protocol 41): master enable
     // (KENSHICOOP_CHAIN_SYNC). Sub-gate within the furniture pipeline.
