@@ -493,7 +493,14 @@ public:
                 case 5:  logScenarioAct("carry_swap", "join leg2", runLeg(l1_, 0.0f, 400.0f)); break;
                 case 6:  logScenarioAct("carry_swap", "join leg3", runLeg(l1_, -400.0f, -400.0f)); break;
                 case 7:  logScenarioAct("carry_swap", "join pickup L0", engine::carrySubject(ctx.gw, l1_, l0_)); break;
-                case 8:  logScenarioAct("carry_swap", "join carrywalk", runLeg(l1_, -60.0f, 0.0f)); break;
+                case 8: {
+                    // KENSHICOOP_CS_CARRY_LEG=<u> (default 60): a long carry walk is
+                    // the field shape (the carrier copy then needs to keep up).
+                    const char* cl = getenv("KENSHICOOP_CS_CARRY_LEG");
+                    const float leg = (cl && cl[0]) ? (float)atof(cl) : 60.0f;
+                    logScenarioAct("carry_swap", "join carrywalk", runLeg(l1_, -leg, 0.0f));
+                    break;
+                }
                 case 9:  logScenarioAct("carry_swap", "join putdown", engine::dropSubject(ctx.gw, l1_, false)); break;
                 case 10: logScenarioAct("carry_swap", "host leg1", runLeg(l0_, 0.0f, -400.0f)); break;
                 case 11: logScenarioAct("carry_swap", "join leg4", runLeg(l1_, 400.0f, 0.0f)); break;

@@ -1829,9 +1829,22 @@ void Replicator::applyTargets(GameWorld* gw) {
         // path places the body anyway.
         if (d.glideActive && genuinelyMoving)
             d.glideUntilMs = now + GLIDE_HOLD_MS;
+        // Never glide a CARRIER: per-frame placement of a body with someone on
+        // its shoulder tears the carried body's attach apart (the reason NPC
+        // carriers early-continue in the carry block above). Field log 23:57:33-42:
+        // the join's copy carrying the host's character entered glide via the
+        // stall fallback mid-carry. A carrier stays on the walk drive; the
+        // physics restore above keeps it able to walk.
+        bool carrierNow = coop::taskIsCarry(out.task);
+        if (!carrierNow) {
+            engine::CarryRead gcr;
+            carrierNow = engine::readCarry(c, &gcr) && gcr.carrying;
+        }
+        if (carrierNow) { d.glideUntilMs = 0; d.glideStallSinceMs = 0; }
         // Config::glide (KENSHICOOP_GLIDE / coop_config.json "glide") = 0: walk
         // drive + snap gate only.
-        bool squadGlide = glide_ && isSquad && d.glideUntilMs != 0 && (long)(d.glideUntilMs - now) > 0;
+        bool squadGlide = glide_ && isSquad && !carrierNow && d.glideUntilMs != 0 &&
+                          (long)(d.glideUntilMs - now) > 0;
         if (!squadGlide && d.glideActive) {
             d.glideActive = false;
             d.haveDest = false;                 // walk resumes with a fresh order
