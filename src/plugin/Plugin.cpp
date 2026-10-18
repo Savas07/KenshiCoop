@@ -129,6 +129,7 @@ struct SessionController {
     // save.
     bool         bootstrapArmed;   // host: a connect-triggered save is baking
     std::string  bootstrapName;    // host: that save's name (== savePending)
+    std::string  freshPushName;    // host: a New Game world's own push save name
     // World-swap edge detection (protocol 32): once gameplay has started,
     // gameplayLive dropping means the engine is swapping worlds (a load); live
     // again = the reload edge (session-reset point). Sub-second dips are FLICKER
@@ -171,6 +172,7 @@ std::string& g_savePending     = g_session.savePending;
 coop::u32&   g_saveReqId       = g_session.saveReqId;
 bool&        g_bootstrapArmed  = g_session.bootstrapArmed;
 std::string& g_bootstrapName   = g_session.bootstrapName;
+std::string& g_freshPushName   = g_session.freshPushName;
 DWORD&       g_swapStartTick   = g_session.swapStartTick;
 coop::u32&   g_swapHookTicks   = g_session.swapHookTicks;
 bool&        g_loadSuppressOn  = g_session.loadSuppressOn;
@@ -300,7 +302,8 @@ void armConnectPush(coop::u32 targetMask) {
     char cur[64];
     cur[0] = '\0';
     coop::engine::saveInfo(cur, sizeof(cur), 0, 0);
-    std::string name = cur[0] ? cur : "coopresume";
+    std::string name = !g_freshPushName.empty() ? g_freshPushName
+                     : (cur[0] ? std::string(cur) : std::string("coopresume"));
     g_bootstrapArmed = true;
     g_bootstrapName  = name;
     g_session.bootstrapMask = targetMask;
@@ -841,7 +844,187 @@ void driveLoadSync(GameWorld* gw) {
     }
 }
 
-// Co-op session panel (F2) + status banner. Interactive sessions only - the
+// ---- Main-menu Multiplayer lobby (title screen only) -------------------------
+// The richer front end over the SAME Steam lobby layer and actions as the F2
+// panel: lobby members with Steam names + avatars, Invite / Join lists and the
+// host's New game / Load game. Members come from Steam lobby membership; a host
+// also lists players connected outside the lobby (direct LAN / Steam-ID joins)
+// by the steamid in their HELLO identity.
+struct LobbyMem { unsigned long long id; std::string name, tag; };
+
+bool lobbyLoadSave(const char* name) {
+    if (!name || !name[0]) return false;
+    char b[128];
+    _snprintf(b, sizeof(b) - 1, "[lobby] host loads save '%s' for everyone", name);
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+    return coop::engine::loadSave(std::string(name));
+}
+
+bool connectedSteamId(unsigned long long sid) {
+    for (coop::u32 id = 1; id < coop::MAX_PLAYERS; ++id)
+        if (sid != 0 && g_net.peerConnected(id) && g_net.peerSteamId(id) == sid) return true;
+    return false;
+}
+
+void lobbyDrive(const std::vector<coop::engine::CoopPanelFriend>& friends, const std::string& transfer) {
+    namespace si = coop::steaminvite;
+    const bool open = coop::engine::lobbyIsOpen();
+
+    // The host's Load list: re-read every 5 s while the window is open.
+    static std::vector<coop::savexfer::SaveListEntry> s_saves;
+    static std::vector<std::string> s_when;
+    static DWORD s_savesAt = 0;
+    const DWORD now = GetTickCount();
+    if (!open) {
+        s_savesAt = 0;
+    } else if (s_savesAt == 0 || now - s_savesAt >= 5000) {
+        s_savesAt = now ? now : 1;
+        coop::savexfer::listSaves(s_saves, 12);
+        s_when.clear();
+        for (size_t i = 0; i < s_saves.size(); ++i) {
+            FILETIME ft, lt;
+            SYSTEMTIME t;
+            ft.dwLowDateTime  = (DWORD)(s_saves[i].writeTime & 0xFFFFFFFFu);
+            ft.dwHighDateTime = (DWORD)(s_saves[i].writeTime >> 32);
+            char w[32] = "";
+            if (FileTimeToLocalFileTime(&ft, &lt) && FileTimeToSystemTime(&lt, &t))
+                _snprintf(w, sizeof(w) - 1, "%04u-%02u-%02u %02u:%02u", (unsigned)t.wYear,
+                          (unsigned)t.wMonth, (unsigned)t.wDay, (unsigned)t.wHour, (unsigned)t.wMinute);
+            w[sizeof(w) - 1] = '\0';
+            s_when.push_back(w);
+        }
+    }
+    std::vector<coop::engine::LobbySave> saves;
+    for (size_t i = 0; i < s_saves.size(); ++i) {
+        coop::engine::LobbySave s;
+        s.name    = s_saves[i].name.c_str();
+        s.display = s_saves[i].display.c_str();
+        s.when    = s_when[i].c_str();
+        saves.push_back(s);
+    }
+
+    // Members.
+    std::vector<LobbyMem> mem;
+    std::vector<unsigned long long> lobbyIds;
+    const unsigned long long self = (unsigned long long)coop::steamp2p::selfId();
+    const bool hostRunning = g_net.isRunning() && g_cfg.isHost;
+    char nb[96];
+    if (si::inLobby()) {
+        const unsigned long long owner = si::lobbyOwner();
+        const int n = si::lobbyMemberCount();
+        for (int i = 0; i < n; ++i) {
+            const unsigned long long id = si::lobbyMember(i);
+            if (id == 0) continue;
+            lobbyIds.push_back(id);
+            LobbyMem m;
+            m.id = id;
+            si::nameOf(id, nb, sizeof(nb));
+            m.name = nb[0] ? nb : "(loading name...)";
+            if (id == owner) m.tag = "host";
+            if (id == self) m.tag += m.tag.empty() ? "you" : " - you";
+            else if (hostRunning && connectedSteamId(id)) m.tag += m.tag.empty() ? "connected" : " - connected";
+            if (m.tag.empty()) m.tag = "in lobby - waiting for the game";
+            mem.push_back(m);
+        }
+    } else {
+        LobbyMem m;
+        m.id = self;
+        si::nameOf(self, nb, sizeof(nb));
+        m.name = nb[0] ? nb : "You";
+        m.tag  = hostRunning ? "host - you" : "you";
+        mem.push_back(m);
+        if (g_net.isRunning() && !g_cfg.isHost && g_peerPresent) {
+            LobbyMem h;
+            h.id = 0; h.name = "Host"; h.tag = "host - connected";
+            mem.push_back(h);
+        }
+    }
+    if (hostRunning) {
+        // NetLink's own roster: the session layer drains connect events only once
+        // the host's world is live, and the lobby lives at the title screen.
+        for (coop::u32 pid = 1; pid < coop::MAX_PLAYERS; ++pid) {
+            if (!g_net.peerConnected(pid)) continue;
+            const unsigned long long sid = g_net.peerSteamId(pid);
+            bool listed = false;
+            for (size_t k = 0; k < lobbyIds.size(); ++k)
+                if (sid != 0 && sid != self && lobbyIds[k] == sid) listed = true;
+            if (listed) continue;
+            char pn[32];
+            _snprintf(pn, sizeof(pn) - 1, "player %u", (unsigned)pid);
+            pn[sizeof(pn) - 1] = '\0';
+            LobbyMem p;
+            p.id = sid;
+            nb[0] = '\0';
+            if (sid) si::nameOf(sid, nb, sizeof(nb));
+            p.name = nb[0] ? nb : pn;
+            p.tag  = std::string("connected - ") + pn;
+            mem.push_back(p);
+        }
+    }
+    std::vector<coop::engine::LobbyMember> members;
+    for (size_t i = 0; i < mem.size(); ++i) {
+        coop::engine::LobbyMember lm;
+        lm.steamId = mem[i].id;
+        lm.name    = mem[i].name.c_str();
+        lm.tag     = mem[i].tag.c_str();
+        members.push_back(lm);
+    }
+
+    // Per friend: 2 = already in our lobby, 1 = invited.
+    std::vector<unsigned char> invited;
+    for (size_t i = 0; i < friends.size(); ++i) {
+        unsigned char v = si::invited(friends[i].id) ? 1 : 0;
+        for (size_t k = 0; k < lobbyIds.size(); ++k) if (lobbyIds[k] == friends[i].id) v = 2;
+        invited.push_back(v);
+    }
+
+    bool peers = g_peerPresent;
+    if (hostRunning)
+        for (coop::u32 pid = 1; pid < coop::MAX_PLAYERS; ++pid) if (g_net.peerConnected(pid)) peers = true;
+    std::string status = si::status();
+    if (status.empty()) {
+        if (peers)
+            status = g_cfg.isHost ? "Players connected - start or load a game" : "Connected to the host";
+        else if (g_net.isRunning())
+            status = g_cfg.isHost ? "Hosting - waiting for players" : "Connecting to the host...";
+        else
+            status = "Host a game and invite friends, or join a friend who is hosting.";
+    }
+    std::string hostName;
+    if (si::inLobby() && !si::lobbyHost()) { si::nameOf(si::lobbyOwner(), nb, sizeof(nb)); hostName = nb; }
+
+    coop::engine::LobbyState ls;
+    ls.steamUp      = si::ready();
+    ls.inLobby      = si::inLobby();
+    ls.lobbyHost    = si::lobbyHost();
+    ls.opening      = si::hostingLobby() && !si::lobbyHost();
+    ls.running      = g_net.isRunning();
+    ls.isHost       = g_cfg.isHost;
+    ls.peerPresent  = peers;
+    ls.hostName     = hostName.c_str();
+    ls.status       = status.c_str();
+    ls.transfer     = transfer.empty() ? (const char*)0 : transfer.c_str();
+    ls.members      = members.empty() ? 0 : &members[0];
+    ls.memberCount  = (int)members.size();
+    ls.friends      = friends.empty() ? 0 : &friends[0];
+    ls.invited      = invited.empty() ? 0 : &invited[0];
+    ls.friendCount  = (int)friends.size();
+    ls.saves        = saves.empty() ? 0 : &saves[0];
+    ls.saveCount    = (int)saves.size();
+    ls.joinedSerial = si::joinedSerial();
+
+    coop::engine::LobbyActions la;
+    la.host     = &si::hostLobby;
+    la.invite   = &si::inviteFriend;
+    la.join     = &si::joinFriend;
+    la.leave    = &coopUiDisconnect;
+    la.loadSave = &lobbyLoadSave;
+    la.avatar   = &si::avatarRGBA;
+    coop::engine::lobbyTick(&ls, &la);
+}
+
+// Co-op session panel (F2) + status banner, and at the title screen the
+// Multiplayer lobby window. Interactive sessions only - the
 // unattended harness (scenario / self-exit timer) never touches the panel, and
 // keeping the GUI stack out of those runs avoids perturbing the scenario
 // oracles. Both calls are SEH-guarded internally and touch only GUI + input, so
@@ -850,12 +1033,13 @@ void driveLoadSync(GameWorld* gw) {
 // the title-screen titleUpdate_hook so a join can join a friend (or accept a
 // Steam invite) straight from the main menu, and so the banner reports status
 // there too.
-void coopPanelDrive() {
+void coopPanelDrive(bool atTitle) {
     if (!(g_cfg.scenario.empty() && g_cfg.testSeconds == 0)) return;
 
     // Pump Steam callbacks (invites, lobby joins, P2P session requests) and keep
-    // the friend list fresh only while the panel is open to show it.
-    coop::steaminvite::watchFriends(coop::engine::coopPanelIsOpen());
+    // the friend list fresh only while the panel or lobby window shows it.
+    coop::steaminvite::watchFriends(coop::engine::coopPanelIsOpen() ||
+                                    (atTitle && coop::engine::lobbyIsOpen()));
     coop::steaminvite::tick();
     // Friends waiting in the host's lobby are let in only once the host's world
     // is live - never at the menu or during character creation.
@@ -962,6 +1146,8 @@ void coopPanelDrive() {
 
     coop::engine::coopPanelTick(&ps, &act);
     coop::engine::coopOverlayTick(detail.c_str(), ostate, g_net.isRunning() || lobbyHosting);
+    if (atTitle) lobbyDrive(s_friends, transfer);
+    else         coop::engine::lobbyTestTick();
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.
@@ -974,6 +1160,39 @@ void coopPanelDrive() {
 // them, so no forward declarations are needed.
 // ---------------------------------------------------------------------------
 
+// A New Game world starts with Kenshi's "current game" still naming the newest
+// existing save (the CONTINUE target), and the connect push bakes the live world
+// under that name - so a friend joining a brand-new co-op game overwrote the
+// player's newest campaign (seen with coopresume). Writing currentGame through
+// getCurrentGame() does not stick, so a fresh world gets its own unused save
+// name that armConnectPush uses instead.
+void nameFreshWorld() {
+    char cur[96] = "";
+    coop::engine::saveInfo(cur, sizeof(cur), 0, 0);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char base[48];
+    _snprintf(base, sizeof(base) - 1, "KenshiCoop %04u-%02u-%02u %02u%02u", (unsigned)t.wYear,
+              (unsigned)t.wMonth, (unsigned)t.wDay, (unsigned)t.wHour, (unsigned)t.wMinute);
+    base[sizeof(base) - 1] = '\0';
+    std::string name = base;
+    for (int i = 2; i < 100; ++i) {
+        const std::string folder = coop::savexfer::saveFolderFor(name);
+        wchar_t w[600];
+        if (!MultiByteToWideChar(CP_UTF8, 0, folder.c_str(), -1, w, 600) ||
+            GetFileAttributesW(w) == INVALID_FILE_ATTRIBUTES) break; // unused
+        char n[64];
+        _snprintf(n, sizeof(n) - 1, "%s (%d)", base, i);
+        n[sizeof(n) - 1] = '\0';
+        name = n;
+    }
+    g_freshPushName = name;
+    char b[224];
+    _snprintf(b, sizeof(b) - 1, "[load] new game world: connect push saves as '%s' (current game was '%s')",
+              name.c_str(), cur);
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+}
+
 // "World became live" bookkeeping for character creation: a world that went
 // live with no proceeding load since the previous one came from New Game.
 void noteWorldLive() {
@@ -983,6 +1202,8 @@ void noteWorldLive() {
     s_serialAtLive = serial;
     coopLog(g_worldFresh ? "[chargen] host world source: NEW GAME (joins may create characters)"
                          : "[chargen] host world source: SAVE (no character creation)");
+    if (g_worldFresh) nameFreshWorld();
+    else              g_freshPushName.clear(); // a loaded world: push under its own name
 }
 
 // Protocol 32 world-swap edge detection. Runs FIRST so the reload edge (and,
@@ -1870,7 +2091,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     }
 #endif
 
-    coopPanelDrive();
+    coopPanelDrive(false);
 
     // Protocol 32 world-swap edge detection + session reset. Runs FIRST so the
     // reload edge lands before any sync code touches pointers from the torn-down
@@ -2072,7 +2293,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
 // live in titleUpdate_hook, but coopPanelDrive uses std::string internally, so
 // the guarded call lives in its own function (C2712).
 void coopPanelDriveSeh() {
-    __try { coopPanelDrive(); }
+    __try { coopPanelDrive(true); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         static bool s_warned = false;
         if (!s_warned) { s_warned = true;
@@ -2781,13 +3002,15 @@ __declspec(dllexport) void startPlugin() {
     // env/config role+transport+peer (the legacy launcher behaviour).
     bool autoStart = g_cfg.autoConnect || !g_cfg.scenario.empty() || g_cfg.testSeconds > 0;
 
-    // Bring Steam up now (when the panel may be used, or Steam is configured) so
-    // the panel can show THIS player's SteamID for the two-code exchange before
-    // any connection is made. init() is idempotent; startNetworking re-uses it.
+    // Bring Steam up for every INTERACTIVE session (the F2 panel and the main-menu
+    // lobby are usable there, with or without KENSHICOOP_AUTOCONNECT), or when
+    // Steam is configured, so the panel can show THIS player's SteamID before any
+    // connection is made. init() is idempotent; startNetworking re-uses it.
     // When Steam is up, also arm the invite layer so this player can RECEIVE a
     // Steam "Join Game"/invite (GameLobbyJoinRequested) even before touching the
     // panel - the joiner never has to open it or type an ID.
-    if (!autoStart || g_cfg.transport == "steam" || g_cfg.steamPing != 0) {
+    const bool interactive = g_cfg.scenario.empty() && g_cfg.testSeconds == 0;
+    if (interactive || g_cfg.transport == "steam" || g_cfg.steamPing != 0) {
         if (coop::steamp2p::init())
             coop::steaminvite::init(&coopUiConnect);
     }

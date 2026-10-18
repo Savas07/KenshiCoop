@@ -2238,6 +2238,9 @@ bool chargenOpenEditor(Character** chars, unsigned int n);
 bool chargenEditorOpen();
 // Test hook: randomise + next race + name every edited body, then confirm.
 bool chargenAutoConfirm(const char* name);
+// Test hook: confirm the open editor as it is (e.g. the host's own New Game
+// squad), every character counted as reviewed.
+bool chargenConfirmEditor();
 // Export the body's appearance as .bod2 bytes (the editor's exporter path).
 bool chargenExport(Character* c, std::vector<unsigned char>& out);
 // Load .bod2 bytes back and hand them to setAppearanceData; then setName.

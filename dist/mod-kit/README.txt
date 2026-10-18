@@ -1,5 +1,5 @@
-﻿KenshiCoop v0.55.1 - co-op mod
-==============================
+﻿KenshiCoop v0.56 - co-op mod
+============================
 
 This zip contains ONE folder: "KenshiCoop". That folder IS the mod.
 
@@ -27,26 +27,35 @@ PREREQUISITES (both players)
 
 PLAY (Steam - recommended)
 --------------------------
-  The Co-op panel opens with F2, at the MAIN MENU as well as in-game. Up to 8
-  players (host + 7 friends); everyone needs this same release. Each player
-  drives one squad tab in join order (host = tab 1, first friend = tab 2, ...):
-  start a new game with "Multiplayer (Wanderer xN)" for your group size (x2-x8).
-  1. HOST: load the save you want to play (or start a new game), press F2 and
-     click "Host co-op". Your online Steam friends are listed (friends already
-     in Kenshi first, six per page - "More friends" pages on). Click "Invite"
-     next to your friend's name: they get a Steam invite.
-  2. JOIN: straight from the MAIN MENU - no save needed. Either accept the
-     Steam invite, or press F2 and click "Join" next to the host's name under
-     "Join a friend", or use "Join Game" on the host in your Steam friends
-     list. If Kenshi was closed when you accepted, Steam starts it and you join
-     once the main menu is up. The host sends its world to you on connect and
-     you load right into it. (You do NOT need the host's save beforehand. If
-     you already have an identical copy on disk it is used as-is instead of
-     transferring.)
-  3. The status line in the panel shows live state, and a status banner in the
-     TOP-LEFT corner shows it too - at the main menu as well as in-game, so a
-     joining player can watch the transfer before the world loads. Click
-     "Leave co-op session" (or "Stop hosting" before anyone joined) to leave.
+  Kenshi's MAIN MENU has a MULTIPLAYER button: it opens the co-op lobby. Up to
+  8 players (host + 7 friends); everyone needs this same release. Each player
+  drives one squad tab in join order (host = tab 1, first friend = tab 2, ...).
+  1. HOST: main menu > MULTIPLAYER > HOST GAME. The lobby lists everyone in it
+     (Steam name + avatar) and your online Steam friends (friends already in
+     Kenshi first; < and > page through). Click INVITE next to each friend -
+     they get a Steam invite and show up under PLAYERS when they accept. Then:
+       NEW GAME  - Kenshi's own New Game window opens with the
+                   "Multiplayer (Wanderer xN)" start for your lobby size already
+                   selected (any other start can still be picked), or
+       LOAD GAME - your saves are listed; click LOAD next to the one to play.
+     Friends wait in the lobby until your world is running (after your own
+     character creation on a new game), then join it automatically.
+  2. JOIN: accept the Steam invite, or main menu > MULTIPLAYER > JOIN next to a
+     friend who is hosting, or "Join Game" on the host in your Steam friends
+     list. The lobby opens and shows who is in it. If Kenshi was closed when you
+     accepted, Steam starts it and you join once the main menu is up. The host
+     sends its world to you and you load right into it. (You do NOT need the
+     host's save beforehand. An identical copy already on disk is used as-is.)
+  3. In-game, F2 opens the co-op panel: status, Invite more friends, and
+     "Leave co-op session". A status banner in the TOP-LEFT corner shows the
+     session state at the main menu as well as in-game.
+  Good to know:
+   * New game: each joining player designs their character in Kenshi's own
+     character editor right after loading in (about 8 s after their world
+     appears; the game stays paused for everyone until they confirm). Loading
+     a save never opens it - established characters are never re-rolled.
+   * When a friend joins a new game, the host's world is first saved as
+     "KenshiCoop YYYY-MM-DD HHMM" - it never overwrites an existing save.
 
 PLAY (Advanced - manual Steam ID or LAN / direct UDP)
 -----------------------------------------------------
@@ -70,12 +79,13 @@ TROUBLESHOOTING
     <Kenshi>\RE_Kenshi_log.txt for 'KenshiCoop'; reinstalling RE_Kenshi
     usually fixes it.
   * No connection (Steam): both Steams must be RUNNING and ONLINE. A friend is
-    listed under "Join a friend" only while they are hosting ("Host co-op")
-    and Steam shows them in Kenshi; the list refreshes every few seconds while
-    the panel is open. "different mod version" next to a host means you run
-    different KenshiCoop releases. With the Advanced manual flow, each side
-    must have Pasted the OTHER player's ID. Look for '[invite]' lines and
-    '[steam] session ... active=1' in <Kenshi>\KenshiCoop_*.log.
+    listed under FRIENDS HOSTING in the lobby (and "Join a friend" in F2) only
+    while they are hosting (HOST GAME / "Host co-op") and Steam shows them in
+    Kenshi; the lists refresh every few seconds. "different mod version" next
+    to a host means you run different KenshiCoop releases. With the Advanced
+    manual flow, each side must have Pasted the OTHER player's ID. Look for
+    '[invite]' / '[lobby]' lines and '[steam] session ... active=1' in
+    <Kenshi>\KenshiCoop_*.log.
   * "protocol mismatch": one player has an older/newer build; both should use
     the same release.
   * Sending logs: every player's log is <Kenshi>\KenshiCoop_host.log (joining

@@ -42,12 +42,13 @@ third_party/      ENet patches, VC10 compat shim (deps are fetched, not committe
 
 ## Try it (play with a friend)
 
-Up to 8 players, one machine each. You set up the session **inside the game** with an
-in-game panel (press **F2**): the host clicks **Host co-op** and then **Invite**
-next to a friend's name, and the friend accepts the Steam invite (or clicks
-**Join** next to the host's name). Nobody types or swaps a Steam ID, edits a
-config file or runs a launcher script. (A tiny `coop_config.json` is only
-needed for LAN / direct-UDP games.)
+Up to 8 players, one machine each. Everything happens **inside the game**:
+Kenshi's main menu gets a **MULTIPLAYER** button that opens the co-op lobby. The
+host opens a lobby, invites Steam friends (listed with their Steam names and
+avatars) and starts a new game or loads a save from there; friends accept the
+Steam invite and land in the host's world. Nobody types or swaps a Steam ID,
+edits a config file or runs a launcher script. (A tiny `coop_config.json` is
+only needed for LAN / direct-UDP games.)
 
 ### Before you start (both players)
 
@@ -61,7 +62,7 @@ needed for LAN / direct-UDP games.)
 
 ### 1. Install the mod
 
-Grab `KenshiCoop-kit-v0.55.1.zip` from the
+Grab `KenshiCoop-kit-v0.56.zip` from the
 [latest release](https://github.com/Savas07/KenshiCoop/releases/latest) and
 unzip it anywhere (every player). You do not need to clone this repository -
 but if you did, the same kit is in [dist/mod-kit](dist/mod-kit).
@@ -72,41 +73,36 @@ Kenshi `mods` directory so you end up with
 `C:\Program Files (x86)\Steam\steamapps\common\Kenshi\mods\`). Then launch
 Kenshi and enable **KenshiCoop** in the Mods menu.
 
-### 2. Connect in-game (press F2)
+### 2. Play together: the MULTIPLAYER lobby
 
-The Co-op panel works at the **main menu** (before you load a game) as well as
-in-game, so the joining player doesn't need to load anything first.
+1. **Host:** on Kenshi's main menu click **MULTIPLAYER**, then **HOST GAME**.
+   The lobby shows everyone in it (Steam name + avatar) and your online Steam
+   friends (friends already in Kenshi first; page with **<** / **>**). Click
+   **INVITE** next to each friend - they get a Steam invite and appear under
+   *Players* when they accept. Then either:
+   - **NEW GAME** - opens Kenshi's own New Game window with the
+     **Multiplayer (Wanderer xN)** start for your lobby size already selected
+     (you can still pick any start), or
+   - **LOAD GAME** - lists your saves; click **LOAD** next to the one to play.
 
-1. **Host:** load the save you want to play, or start a new game - pick
-   **Multiplayer (Wanderer xN)** matching your group size (x2 to x8, one squad
-   per player) from the start list for a ready-made co-op start (see
-   below). Press **F2** and click **Host co-op**. Your online Steam friends
-   appear in the panel (friends already in Kenshi first); click **Invite** next
-   to each friend's name to send them a Steam invite. The list stays open while
-   you play, so you can invite more friends later.
-2. **Join:** any of these works, straight from the **main menu** with no save
-   needed:
-   - accept the Steam invite notification, or
-   - press **F2** - friends who are hosting appear under *Join a friend*; click
-     **Join** next to the host's name, or
-   - right-click the host in your Steam friends list and choose **Join Game**.
+   Friends in the lobby wait there until your world is running (after your own
+   character creation on a new game), then join it automatically.
+2. **Join:** accept the Steam invite, or on the main menu click **MULTIPLAYER**
+   and **JOIN** next to a friend who is hosting, or use **Join Game** on the
+   host in your Steam friends list. The lobby opens and shows who is in it; once
+   the host's world is up it is streamed to you and you load right into it - no
+   save needed. If Kenshi isn't running when you accept the invite, Steam starts
+   it and you join once the main menu is up. (If you already have an identical
+   copy of the host's save on disk, it's used as-is instead of transferring.)
+3. In-game, **F2** opens the co-op panel: live status, **Invite** more friends
+   (the list stays available while you play) and **Leave co-op session**. A
+   status banner in the **top-left corner** shows the session state at the main
+   menu as well as in-game.
 
-   If Kenshi isn't running when you accept the invite, Steam starts it and
-   you join automatically once the main menu is up. The host streams its world
-   to you on connect and you load right into it. (If you already have an
-   identical copy of the host's save on disk, it's used as-is instead of
-   transferring.)
-3. The status line in the panel shows live state, and a status banner in the
-   **top-left corner** shows it too - at the main menu as well as in-game, so a
-   joining player can watch the transfer before the world loads. Click
-   **Leave co-op session** (or **Stop hosting** before anyone joined) to leave.
+If the host runs a different KenshiCoop version, their entry reads *different
+mod version* and joining is refused - every player needs the same release.
 
-The panel only lists your **online** Steam friends, six per page; **More
-friends** pages through the rest. If the host runs a different KenshiCoop
-version, their entry reads *different mod version* and joining is refused -
-both players need the same release.
-
-**Advanced (manual Steam ID / LAN):** click **Advanced** in the panel for the
+**Advanced (manual Steam ID / LAN):** press **F2** and click **Advanced** for the
 original controls - Role / Transport / Connection toggles plus **Copy my Steam
 ID** / **Paste friend's Steam ID** (a per-session clipboard swap; nothing is
 written to disk). Use it when Steam invites aren't available, or for
@@ -149,8 +145,16 @@ re-read whenever you go ONLINE, so no restart is needed after an edit.
   skips the transfer.
 - **Saving just works.** Any save either player makes during a session becomes
   one shared save on both machines, streamed to the other side automatically.
-  To resume next time, the host loads that save and goes online, and the join
-  can reconnect straight from the main menu again.
+  To resume next time, the host loads that save from the lobby (**LOAD GAME**),
+  and the friends join again from the main menu.
+- **New games get their own save.** When a friend joins a new game, the host's
+  world is first saved as **KenshiCoop YYYY-MM-DD HHMM** - it never overwrites
+  one of your existing saves.
+- **Character creation for joining players.** On a new game started with a
+  Multiplayer start, each joining player designs their own character in Kenshi's
+  character editor right after loading in (about 8 s after their world appears;
+  the game stays paused for everyone until they confirm). Loading an existing
+  save never opens the editor - established characters are never re-rolled.
 
 ### If something goes wrong
 
@@ -158,11 +162,12 @@ re-read whenever you go ONLINE, so no restart is needed after an edit.
   `<Kenshi>\RE_Kenshi_log.txt` for `KenshiCoop`; reinstalling
   [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847) usually fixes it.
 - **No connection (Steam)** - both Steams must be online (not offline mode).
-  A friend only shows up under *Join a friend* while they are hosting (clicked
-  **Host co-op**) and Steam reports them in Kenshi; the list refreshes every few
-  seconds while the panel is open. With the Advanced manual flow, each side must
-  have **Pasted** the *other* player's ID. Look for `[invite]` lines and
-  `[steam] session ... active=1` in `<Kenshi>\KenshiCoop_*.log`.
+  A friend only shows up under *Friends hosting* in the lobby (and *Join a
+  friend* in F2) while they are hosting (clicked **HOST GAME** / **Host co-op**)
+  and Steam reports them in Kenshi; the lists refresh every few seconds. With the
+  Advanced manual flow, each side must have **Pasted** the *other* player's ID.
+  Look for `[invite]` / `[lobby]` lines and `[steam] session ... active=1` in
+  `<Kenshi>\KenshiCoop_*.log`.
 - **"protocol mismatch" in the log** - one of you has an older build; both
   players should re-install from the same release.
 

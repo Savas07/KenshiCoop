@@ -101,6 +101,7 @@ NetLink::NetLink()
       steamPeer_(0),
       simDelayMs_(0), simJitterMs_(0), simLossPct_(0) {
     InitializeCriticalSection(&outCs_);
+    for (u32 i = 0; i < MAX_PLAYERS; ++i) { peerUp_[i] = 0; peerSteam_[i] = 0; }
 }
 
 NetLink::~NetLink() {
@@ -145,6 +146,7 @@ void NetLink::stop() {
         CloseHandle(thread_);
         thread_ = 0;
         enet_deinitialize();
+        for (u32 i = 0; i < MAX_PLAYERS; ++i) { peerUp_[i] = 0; peerSteam_[i] = 0; }
     }
 }
 
@@ -516,7 +518,7 @@ void NetLink::threadLoop() {
         if (serverPeer_) serverPeer_->mtu = 1200;
     }
 
-    for (u32 i = 0; i < MAX_PLAYERS; ++i) idInUse_[i] = false;
+    for (u32 i = 0; i < MAX_PLAYERS; ++i) { idInUse_[i] = false; peerUp_[i] = 0; peerSteam_[i] = 0; }
     idByIdentity_.clear();
     DWORD lastConnectAttempt = GetTickCount();
 
@@ -627,6 +629,10 @@ void NetLink::threadLoop() {
                             } else {
                                 idInUse_[id] = true;
                                 if (!ident.empty()) idByIdentity_[ident] = id;
+                                // Lobby UI (main thread): who holds this id. 64-bit
+                                // aligned store - atomic on x64, read without a lock.
+                                peerSteam_[id] = _strtoui64(ident.c_str(), 0, 10);
+                                peerUp_[id] = 1;
                                 epochSeen_.erase(id); // its epoch sequence starts over
                                 ev.peer->data = (void*)(size_t)id;
                                 WelcomePacket w;
@@ -1166,6 +1172,8 @@ void NetLink::threadLoop() {
                         // A peer that never got past HELLO was never a member.
                         if (id != 0 && id < MAX_PLAYERS) {
                             idInUse_[id] = false;
+                            peerSteam_[id] = 0;
+                            peerUp_[id] = 0;
                             epochSeen_.erase(id); // its epoch sequence ends (v44)
                             sendPeerState(id, false, PEER_MASK_ALL);
                             if (inbound_) inbound_->pushLeave(id);

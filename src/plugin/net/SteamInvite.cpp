@@ -99,6 +99,12 @@ struct FriendGameInfo_t {
 };
 #pragma pack(pop)
 typedef bool  (*FrGetGamePlayedFn)(void* friends, unsigned long long id, FriendGameInfo_t* out);
+typedef const char* (*FrGetSelfNameFn)(void* friends);
+typedef int   (*FrGetAvatarFn)(void* friends, unsigned long long id);
+typedef bool  (*FrReqUserInfoFn)(void* friends, unsigned long long id, bool nameOnly);
+typedef void* (*ClientGetUtilsFn)(void* client, int hPipe, const char* version);
+typedef bool  (*UtGetImageSizeFn)(void* utils, int image, unsigned int* w, unsigned int* h);
+typedef bool  (*UtGetImageRGBAFn)(void* utils, int image, unsigned char* dest, int destSize);
 
 const unsigned KENSHI_APPID = 233860;
 typedef void  (*RegisterCbFn)(void* cb, int iCallback);
@@ -123,6 +129,12 @@ FrGetByIndexFn        g_frByIndex   = 0;
 FrGetNameFn           g_frName      = 0;
 FrGetStateFn          g_frState     = 0;
 FrGetGamePlayedFn     g_frGame      = 0;
+FrGetSelfNameFn       g_frSelfName  = 0;
+FrGetAvatarFn         g_frAvatar    = 0;
+FrReqUserInfoFn       g_frReqInfo   = 0;
+void*                 g_utils       = 0; // ISteamUtils* (avatars; optional)
+UtGetImageSizeFn      g_utImgSize   = 0;
+UtGetImageRGBAFn      g_utImgRGBA   = 0;
 RegisterCbFn          g_regCb       = 0;
 RegisterCrFn          g_regCr       = 0;
 UnregisterCbFn        g_unregCb     = 0;
@@ -163,6 +175,17 @@ int                g_lastMemberCount = -1;
 // Join: the host we will connect to once its lobby says it is ready (0 = none).
 unsigned long long g_joinOwner    = 0;
 bool               g_joinWaitLogged = false;
+// Friends invited into the current lobby (the window shows "invited" for them).
+const int          MAX_INVITED = 32;
+unsigned long long g_invited[MAX_INVITED];
+int                g_invitedN     = 0;
+// Bumped on every successful lobby entry as the joining player.
+unsigned           g_joinedSerial = 0;
+
+void noteInvited(unsigned long long id) {
+    for (int i = 0; i < g_invitedN; ++i) if (g_invited[i] == id) return;
+    if (g_invitedN < MAX_INVITED) g_invited[g_invitedN++] = id;
+}
 
 // Display name for logs/status (Steam caches names of friends + lobby members).
 const char* personaName(unsigned long long id) {
@@ -280,6 +303,7 @@ void enterLobby(unsigned long long lobby) {
     g_pendingInvitee = 0;
     g_joinOwner = 0;
     g_joinWaitLogged = false;
+    g_invitedN = 0;
     g_joinLobby(g_mm, lobby);
 }
 
@@ -384,6 +408,7 @@ void onLobbyEnter(LobbyEnter_t* r) {
     // Connect only once the host's world is live (its "kc_ready" lobby flag);
     // tick() polls it. Until then we sit in the lobby - no connect spam.
     g_joinOwner = owner;
+    ++g_joinedSerial;
     g_joinWaitLogged = false;
     char b[160];
     _snprintf(b, sizeof(b) - 1, "entered lobby of host %llu (%s) - waiting for host ready",
@@ -486,6 +511,14 @@ bool init(ConnectFn onConnect) {
     g_frName      = (FrGetNameFn)          GetProcAddress(mod, "SteamAPI_ISteamFriends_GetFriendPersonaName");
     g_frState     = (FrGetStateFn)         GetProcAddress(mod, "SteamAPI_ISteamFriends_GetFriendPersonaState");
     g_frGame      = (FrGetGamePlayedFn)    GetProcAddress(mod, "SteamAPI_ISteamFriends_GetFriendGamePlayed");
+    // Lobby window extras (names + avatars). Optional: missing ones only cost
+    // the avatar pictures / own name, never the lobby itself.
+    g_frSelfName  = (FrGetSelfNameFn)      GetProcAddress(mod, "SteamAPI_ISteamFriends_GetPersonaName");
+    g_frAvatar    = (FrGetAvatarFn)        GetProcAddress(mod, "SteamAPI_ISteamFriends_GetMediumFriendAvatar");
+    g_frReqInfo   = (FrReqUserInfoFn)      GetProcAddress(mod, "SteamAPI_ISteamFriends_RequestUserInformation");
+    g_utImgSize   = (UtGetImageSizeFn)     GetProcAddress(mod, "SteamAPI_ISteamUtils_GetImageSize");
+    g_utImgRGBA   = (UtGetImageRGBAFn)     GetProcAddress(mod, "SteamAPI_ISteamUtils_GetImageRGBA");
+    ClientGetUtilsFn getUtIf = (ClientGetUtilsFn)GetProcAddress(mod, "SteamAPI_ISteamClient_GetISteamUtils");
     g_regCb       = (RegisterCbFn)         GetProcAddress(mod, "SteamAPI_RegisterCallback");
     g_regCr       = (RegisterCrFn)         GetProcAddress(mod, "SteamAPI_RegisterCallResult");
     g_unregCb     = (UnregisterCbFn)       GetProcAddress(mod, "SteamAPI_UnregisterCallback");
@@ -520,6 +553,13 @@ bool init(ConnectFn onConnect) {
     g_regCb(&g_cbJoinRequested, cb_GameLobbyJoinRequested);
     g_regCb(&g_cbP2PRequest, cb_P2PSessionRequest);
 
+    if (getUtIf) {
+        static const char* const utVers[] = { "SteamUtils009", "SteamUtils008", "SteamUtils007", "SteamUtils010" };
+        for (int i = 0; i < 4 && g_utils == 0; ++i) g_utils = getUtIf(client, getPipe(), utVers[i]);
+    }
+    if (!g_utils || !g_frAvatar || !g_utImgSize || !g_utImgRGBA)
+        steamLog("avatars unavailable (ISteamUtils / avatar exports missing)");
+
     g_launchLobby = parseLaunchLobby();
 
     g_ready = true;
@@ -545,6 +585,7 @@ bool hostingLobby() { return g_creating || (g_weAreHost && g_lobby != 0); }
 void inviteFriend(SteamId id) {
     if (!g_ready || id == 0) return;
     createLobbyIfNeeded(); // no-op if already have one / creating
+    noteInvited(id);
     const FriendRow* f = findFriend(id);
     const char* nm = f ? f->name : "friend";
     if (g_lobby != 0 && g_weAreHost && g_inviteToLobby) {
@@ -563,6 +604,89 @@ void inviteFriend(SteamId id) {
     s[sizeof(s) - 1] = '\0';
     setStatus(s);
 }
+
+bool    inLobby()   { return g_ready && g_lobby != 0; }
+bool    lobbyHost() { return g_ready && g_lobby != 0 && g_weAreHost; }
+SteamId lobbyOwner() {
+    if (!g_ready || g_lobby == 0) return 0;
+    if (g_weAreHost) return (SteamId)coop::steamp2p::selfId();
+    return g_getOwner ? g_getOwner(g_mm, g_lobby) : 0;
+}
+int lobbyMemberCount() {
+    return (g_ready && g_lobby != 0 && g_getNum) ? g_getNum(g_mm, g_lobby) : 0;
+}
+SteamId lobbyMember(int i) {
+    if (!g_ready || g_lobby == 0 || !g_getMember || i < 0) return 0;
+    return g_getMember(g_mm, g_lobby, i);
+}
+
+void nameOf(SteamId id, char* out, int cap) {
+    if (!out || cap <= 0) return;
+    out[0] = '\0';
+    if (!g_ready || id == 0) return;
+    const char* n = 0;
+    if (id == (SteamId)coop::steamp2p::selfId() && g_frSelfName) n = g_frSelfName(g_friends);
+    if ((!n || !n[0]) && g_frName) n = g_frName(g_friends, id);
+    if (!n || !n[0] || (n[0] == '[' && strcmp(n, "[unknown]") == 0)) {
+        // Not a friend and not cached yet (a lobby member we have never seen):
+        // ask Steam once; the name shows up on a later refresh.
+        if (g_frReqInfo) g_frReqInfo(g_friends, id, false);
+        return;
+    }
+    _snprintf(out, cap - 1, "%s", n);
+    out[cap - 1] = '\0';
+}
+
+// Log each user's avatar fetch outcome when it changes (first 24 users only):
+// enough to see why a picture stays blank without flooding the log.
+static void avatarTrace(SteamId id, int state, int img) {
+    static SteamId s_ids[24];
+    static int     s_state[24];
+    static int     s_n = 0;
+    int i = 0;
+    while (i < s_n && s_ids[i] != id) ++i;
+    if (i == s_n) {
+        if (s_n >= 24) return;
+        s_ids[s_n] = id; s_state[s_n] = -99; ++s_n;
+    }
+    if (s_state[i] == state) return;
+    s_state[i] = state;
+    static const char* const what[] = { "ok", "loading (-1)", "none cached (0)", "size failed", "rgba failed" };
+    char b[128];
+    _snprintf(b, sizeof(b) - 1, "avatar %llu: %s image=%d", id, what[state], img);
+    b[sizeof(b) - 1] = '\0';
+    steamLog(b);
+}
+
+bool avatarRGBA(SteamId id, unsigned char* out, int cap, int* w, int* h) {
+    if (!g_ready || id == 0 || !out || !g_utils || !g_frAvatar || !g_utImgSize || !g_utImgRGBA)
+        return false;
+    const int img = g_frAvatar(g_friends, id);
+    if (img == -1) { avatarTrace(id, 1, img); return false; } // downloading; asked already
+    if (img == 0) {                       // none cached: request the persona
+        avatarTrace(id, 2, img);
+        if (g_frReqInfo) g_frReqInfo(g_friends, id, false);
+        return false;
+    }
+    unsigned int iw = 0, ih = 0;
+    if (!g_utImgSize(g_utils, img, &iw, &ih) || iw == 0 || ih == 0 || iw > 256 || ih > 256) {
+        avatarTrace(id, 3, img);
+        return false;
+    }
+    const int bytes = (int)(iw * ih * 4);
+    if (bytes > cap || !g_utImgRGBA(g_utils, img, out, bytes)) { avatarTrace(id, 4, img); return false; }
+    avatarTrace(id, 0, img);
+    if (w) *w = (int)iw;
+    if (h) *h = (int)ih;
+    return true;
+}
+
+bool invited(SteamId id) {
+    for (int i = 0; i < g_invitedN; ++i) if (g_invited[i] == id) return true;
+    return false;
+}
+
+unsigned joinedSerial() { return g_joinedSerial; }
 
 void joinFriend(SteamId id) {
     if (!g_ready || id == 0) return;
@@ -724,6 +848,7 @@ void reset() {
     g_pendingInvitee = 0;
     g_lastFriendRefresh = 0;
     g_status[0] = '\0';
+    g_invitedN = 0;
     if (g_ready && g_unregCb) g_unregCb(&g_cbLobbyCreated);
 }
 

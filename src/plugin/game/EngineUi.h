@@ -75,6 +75,61 @@ void coopPanelTick(const CoopPanelState* st, const CoopPanelActions* act);
 // True while the F2 panel is open (the plugin keeps the friend list fresh then).
 bool coopPanelIsOpen();
 
+// ---- Main-menu Multiplayer lobby ---------------------------------------------
+// A MULTIPLAYER button added to Kenshi's title menu opens the lobby window: a
+// MyGUI panel parented to the title screen (so Kenshi's own New Game / Load
+// windows draw above it and it hides with the menu). It shows the lobby members
+// with Steam names + avatars, the Invite list (host) or Friends-hosting list,
+// and the host's New game / Load game choices. Same contract as the F2 panel:
+// live state in, user actions out through LobbyActions; the Steam lobby layer
+// stays the one session system underneath. Title-screen tick only, main thread.
+struct LobbyMember {
+    unsigned long long steamId; // 0 = no Steam identity (LAN join)
+    const char*        name;    // UTF-8
+    const char*        tag;     // "host", "you", "connected", "in lobby", ...
+};
+struct LobbySave {
+    const char* name;     // folder name as Kenshi loads it
+    const char* display;  // UTF-8 for the list
+    const char* when;     // "2026-10-17 22:58"
+};
+struct LobbyState {
+    bool               steamUp;      // Steam lobby layer ready
+    bool               inLobby;      // in a Steam lobby (host or join)
+    bool               lobbyHost;    // ... and we own it
+    bool               opening;      // lobby creation in flight
+    bool               running;      // a co-op connection is up / connecting
+    bool               isHost;       // armed role of that connection
+    bool               peerPresent;  // connected to at least one player
+    const char*        hostName;     // join view: who we are waiting for ("" = none)
+    const char*        status;       // one-line status
+    const char*        transfer;     // join world-transfer progress (0 = none)
+    const LobbyMember* members;
+    int                memberCount;
+    const CoopPanelFriend* friends;  // online friends, hosting > in Kenshi > online
+    const unsigned char*   invited;  // parallel to friends: 1 = invited into our lobby
+    int                friendCount;
+    const LobbySave*   saves;
+    int                saveCount;
+    unsigned           joinedSerial; // bumped on entering a friend's lobby (auto-open)
+};
+struct LobbyActions {
+    void (*host)();                                   // open a Steam lobby
+    void (*invite)(unsigned long long friendId);
+    void (*join)(unsigned long long friendId);
+    void (*leave)();                                  // leave the lobby / session
+    bool (*loadSave)(const char* name);               // host: load for everyone
+    // Steam medium avatar as RGBA into out (false = not available yet).
+    bool (*avatar)(unsigned long long id, unsigned char* out, int cap, int* w, int* h);
+};
+void lobbyTick(const LobbyState* st, const LobbyActions* act);
+// True while the lobby window is open (the plugin keeps the friend list fresh).
+bool lobbyIsOpen();
+// KENSHICOOP_TEST_LOBBY continues outside the title screen (Kenshi's New Game
+// character editor is part of the world, where the title screen no longer
+// ticks): steps like "confirm" run from here. No-op without the env script.
+void lobbyTestTick();
+
 // Persistent co-op connection-status banner: a single screen-space label fixed 10
 // px in from the top-left corner (a createFloatingLabel MyGUI::Window on the
 // spike-48 screenshot-proven "Info" layer) whose caption shows the live session

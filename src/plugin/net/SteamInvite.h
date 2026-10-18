@@ -89,6 +89,27 @@ void tick();
 // One-line human status for the panel/overlay (never null; "" when idle).
 const char* status();
 
+// ---- Lobby view for the main-menu lobby window (main thread) ----------------
+// The lobby we are in (as host or joining player): owner + members straight
+// from Steam lobby membership, so the window shows exactly who is in the game.
+bool        inLobby();          // in a lobby (host or join)
+bool        lobbyHost();        // ... and we own it
+SteamId     lobbyOwner();       // 0 when not in a lobby
+int         lobbyMemberCount(); // members incl. us (0 = no lobby)
+SteamId     lobbyMember(int i);
+// UTF-8 persona name of a user Steam knows (friend, lobby member, ourselves),
+// copied into out ("" when unknown).
+void        nameOf(SteamId id, char* out, int cap);
+// The user's Steam medium avatar as tightly packed RGBA (64x64 on Steam).
+// False while Steam is still downloading it (the first miss asks Steam for it)
+// or when the user has none - call again later. out must hold w*h*4 bytes.
+bool        avatarRGBA(SteamId id, unsigned char* out, int cap, int* w, int* h);
+// We sent this friend an invite into the current lobby.
+bool        invited(SteamId id);
+// Bumped each time we enter a friend's lobby as the joining player (accepted
+// invite, Join button, launch argument) - the menu opens the lobby window then.
+unsigned    joinedSerial();
+
 // Leave any lobby and clear invite state (called on disconnect / teardown).
 void reset();
 

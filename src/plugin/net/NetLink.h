@@ -217,6 +217,16 @@ public:
     // that token, so a reconnect lands on the same player id / squad tab.
     // Must be called before startClient.
     void setIdentity(const std::string& identity) { identity_ = identity; }
+    // MAIN thread (host): which player ids are held by a connected join right
+    // now, and the steamid64 of that join from its HELLO identity token (0 = a
+    // join without Steam). Valid at the title screen too, before the session
+    // layer has drained the connect events.
+    bool peerConnected(u32 id) const {
+        return id > 0 && id < MAX_PLAYERS && peerUp_[id] != 0;
+    }
+    unsigned long long peerSteamId(u32 id) const {
+        return (id > 0 && id < MAX_PLAYERS) ? peerSteam_[id] : 0;
+    }
 
     // MAIN thread: advance this peer's session epoch (protocol 44). Called on
     // every session-reset edge (coordinated world reload, connect/disconnect
@@ -373,6 +383,9 @@ private:
     // identity token was given this session, reserved for its reconnect.
     bool                     idInUse_[MAX_PLAYERS];
     std::map<std::string, u32> idByIdentity_;
+    // Written by the NET thread on welcome/leave, read by the MAIN thread.
+    volatile LONG               peerUp_[MAX_PLAYERS];
+    volatile unsigned long long peerSteam_[MAX_PLAYERS];
     u32 allocPlayerId(const std::string& identity);
 
     HANDLE        thread_;

@@ -18,6 +18,7 @@
 #define KENSHICOOP_SAVEXFER_H
 
 #include <string>
+#include <vector>
 #include "../../netproto/Wire.h"
 
 namespace coop {
@@ -33,6 +34,17 @@ namespace savexfer {
 // runtime getters resolve (spike 39, validated by save_probe), else the
 // %LOCALAPPDATA%\kenshi\save\<name> convention every harness script assumes.
 std::string saveFolderFor(const std::string& name);
+
+// One save offered by the main-menu lobby's Load list.
+struct SaveListEntry {
+    std::string      name;      // folder name in the ANSI code page (what Kenshi loads)
+    std::string      display;   // the same name as UTF-8 (for the GUI)
+    unsigned __int64 writeTime; // quick.save last-write FILETIME (newest first)
+};
+// Every loadable save (a folder holding quick.save) under the save root,
+// newest first, at most maxOut. A transfer's <name>__incoming / __old staging
+// folders are skipped.
+void listSaves(std::vector<SaveListEntry>& out, unsigned int maxOut);
 
 #ifdef KENSHICOOP_PROTOTEST
 // Prototest-only seam: pin the save-root to a caller-owned temp dir so the

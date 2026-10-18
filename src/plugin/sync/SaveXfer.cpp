@@ -286,6 +286,38 @@ std::string saveFolderFor(const std::string& name) {
     return pathJoin(U8(W(root).c_str()), name);
 }
 
+void listSaves(std::vector<SaveListEntry>& out, unsigned int maxOut) {
+    out.clear();
+    const std::string root = saveFolderFor(""); // ends with a separator
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(W(root + "*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+        const std::wstring nameW(fd.cFileName);
+        const size_t n = nameW.size();
+        if ((n > 10 && nameW.compare(n - 10, 10, L"__incoming") == 0) ||
+            (n > 5 && nameW.compare(n - 5, 5, L"__old") == 0)) continue;
+        WIN32_FILE_ATTRIBUTE_DATA qa;
+        const std::wstring quick = W(root) + nameW + L"\\quick.save";
+        if (!GetFileAttributesExW(quick.c_str(), GetFileExInfoStandard, &qa)) continue;
+        char ansi[260];
+        BOOL lossy = FALSE;
+        int an = WideCharToMultiByte(CP_ACP, 0, nameW.c_str(), -1, ansi, sizeof(ansi), 0, &lossy);
+        if (an <= 1 || lossy) continue; // Kenshi's own loader could not name it either
+        SaveListEntry e;
+        e.name      = ansi;
+        e.display   = U8(nameW.c_str());
+        e.writeTime = ((unsigned __int64)qa.ftLastWriteTime.dwHighDateTime << 32) |
+                      qa.ftLastWriteTime.dwLowDateTime;
+        std::vector<SaveListEntry>::iterator it = out.begin(); // newest first
+        while (it != out.end() && it->writeTime >= e.writeTime) ++it;
+        out.insert(it, e);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (out.size() > maxOut) out.resize(maxOut);
+}
+
 bool folderInventory(const std::string& folder, unsigned int* outFiles,
                      unsigned __int64* outBytes, unsigned __int64* outLatestWrite) {
     unsigned int files = 0;

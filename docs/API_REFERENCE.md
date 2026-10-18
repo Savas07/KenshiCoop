@@ -904,11 +904,18 @@ game created over creating your own.
 
 ### 15.5 MyGUI (3.2.3)
 
-Kenshi's UI toolkit. Reach the singleton with `MyGUI::Gui::getInstancePtr()` (add
-`MyGUIEngine_x64.lib` to link MyGUI calls directly). Use raw MyGUI to add your own
-windows/overlays; use the `kenshi/gui` wrappers (§15.6) to drive Kenshi's existing UI.
+Kenshi's UI toolkit (`MyGUIEngine_x64.dll`; add `MyGUIEngine_x64.lib` to link
+MyGUI calls directly). The singletons' `getInstance()` / `getInstancePtr()`
+do **not** link from a plugin: the DLL exports each `Singleton<T>::msInstance`
+as data only (`__imp_` symbol) and the MSVC branch of `MyGUI_Singleton.h` does
+not declare it dllimport. Read the exported variable instead -
+`GetProcAddress(GetModuleHandleA("MyGUIEngine_x64.dll"),
+"?msInstance@?$Singleton@VGui@MyGUI@@@MyGUI@@0PEAVGui@2@EA")` points at the
+`Gui*` (same pattern for `WidgetManager` / `RenderManager`; see
+`EngineLobby.cpp`). Use raw MyGUI to add your own windows/overlays; use the
+`kenshi/gui` wrappers (§15.6) to drive Kenshi's existing UI.
 
-- **`MyGUI::Gui`** *(singleton)* — `getInstancePtr()`;
+- **`MyGUI::Gui`** *(singleton, see above)*;
   `Widget* createWidgetT(const std::string& type, const std::string& skin, const IntCoord& coord, Align align, const std::string& layer, const std::string& name = "")`
   (and `int left,top,width,height` / `createWidgetReal*` variants);
   `destroyWidget(Widget*)`, `destroyWidgets(...)`.

@@ -112,6 +112,15 @@ void autoConfirmBody(CharacterEditWindow* w, const char* name) {
     w->confirmButton(0);
 }
 
+void confirmBody(CharacterEditWindow* w) {
+    unsigned int n = w->characters.size();
+    w->multipleCharactersChangedCheck = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    w->confirmButton(0);
+}
+bool confirmSeh(CharacterEditWindow* w) {
+    __try { confirmBody(w); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // ---- SEH frames (POD only) -----------------------------------------------
 
 bool markerReadSeh(Character* c) {
@@ -214,6 +223,11 @@ bool chargenAutoConfirm(const char* name) {
     CharacterEditWindow* w = editorSeh();
     if (!w) return false;
     return autoConfirmSeh(w, name ? name : "Coop Wanderer");
+}
+
+bool chargenConfirmEditor() {
+    CharacterEditWindow* w = editorSeh();
+    return w ? confirmSeh(w) : false;
 }
 
 bool chargenExport(Character* c, std::vector<unsigned char>& out) {
