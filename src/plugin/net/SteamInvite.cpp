@@ -49,12 +49,17 @@ const int k_iSteamNetworkingCallbacks  = 1200;
 const int cb_LobbyCreated           = k_iSteamMatchmakingCallbacks + 13; // 513
 const int cb_LobbyEnter             = k_iSteamMatchmakingCallbacks + 4;  // 504
 const int cb_GameLobbyJoinRequested = k_iSteamMatchmakingCallbacks + 33; // 533
+const int k_iSteamFriendsCallbacks  = 300;
+// "Join Game" on a friend whose rich presence has a "connect" string, while our
+// game is running (cold launches get it on the command line instead).
+const int cb_GameRichPresenceJoinRequested = k_iSteamFriendsCallbacks + 37; // 337
 const int cb_P2PSessionRequest      = k_iSteamNetworkingCallbacks  + 2;  // 1202
 
 // ---- Callback param structs (Steamworks #pragma pack(8) layouts) -------------
 #pragma pack(push, 8)
 struct LobbyCreated_t          { int m_eResult; unsigned long long m_ulSteamIDLobby; };
 struct GameLobbyJoinRequested_t{ unsigned long long m_steamIDLobby; unsigned long long m_steamIDFriend; };
+struct GameRichPresenceJoinRequested_t { unsigned long long m_steamIDFriend; char m_rgchConnect[256]; };
 struct P2PSessionRequest_t     { unsigned long long m_steamIDRemote; };
 struct LobbyEnter_t {
     unsigned long long m_ulSteamIDLobby;
@@ -99,6 +104,10 @@ struct FriendGameInfo_t {
 };
 #pragma pack(pop)
 typedef bool  (*FrGetGamePlayedFn)(void* friends, unsigned long long id, FriendGameInfo_t* out);
+typedef bool  (*FrSetRichPresenceFn)(void* friends, const char* key, const char* value);
+typedef void  (*FrClearRichPresenceFn)(void* friends);
+typedef const char* (*FrGetFriendRichPresenceFn)(void* friends, unsigned long long id, const char* key);
+typedef void  (*FrRequestFriendRichPresenceFn)(void* friends, unsigned long long id);
 typedef const char* (*FrGetSelfNameFn)(void* friends);
 typedef int   (*FrGetAvatarFn)(void* friends, unsigned long long id);
 typedef bool  (*FrReqUserInfoFn)(void* friends, unsigned long long id, bool nameOnly);
@@ -129,6 +138,10 @@ FrGetByIndexFn        g_frByIndex   = 0;
 FrGetNameFn           g_frName      = 0;
 FrGetStateFn          g_frState     = 0;
 FrGetGamePlayedFn     g_frGame      = 0;
+FrSetRichPresenceFn           g_frSetRP   = 0;
+FrClearRichPresenceFn         g_frClearRP = 0;
+FrGetFriendRichPresenceFn     g_frGetRP   = 0;
+FrRequestFriendRichPresenceFn g_frReqRP   = 0;
 FrGetSelfNameFn       g_frSelfName  = 0;
 FrGetAvatarFn         g_frAvatar    = 0;
 FrReqUserInfoFn       g_frReqInfo   = 0;
@@ -212,6 +225,7 @@ unsigned int       g_lastFriendRefresh = 0;
 SteamCallback g_cbLobbyCreated;
 SteamCallback g_cbLobbyEnter;
 SteamCallback g_cbJoinRequested;
+SteamCallback g_cbRichJoin;
 SteamCallback g_cbP2PRequest;
 
 void steamLog(const char* msg) {
@@ -244,11 +258,53 @@ int lobbyVersion(unsigned long long lobby) {
     return ((unsigned)atoi(v) == (unsigned)coop::PROTOCOL_VERSION) ? 1 : -1;
 }
 
+// "+connect_lobby <id>" anywhere in s -> id (0 = none).
+unsigned long long lobbyFromConnect(const char* s) {
+    const char* p = s ? strstr(s, "+connect_lobby") : 0;
+    if (!p) return 0;
+    p += strlen("+connect_lobby");
+    while (*p == ' ' || *p == '\t' || *p == '"') ++p;
+    return _strtoui64(p, 0, 10);
+}
+
+// Diagnostics: per friend, the last (gameID, lobby, connect) seen, logged when
+// it changes - for Kenshi players and for friends we invited. Answers "did Steam
+// attribute their game to Kenshi" and "did Steam hand us the host's lobby".
+struct FriendDiag { unsigned long long id, game, lobby; char connect[48]; };
+const int  MAX_DIAG = 64;
+FriendDiag g_diag[MAX_DIAG];
+int        g_diagN = 0;
+bool invitedId(unsigned long long id) {
+    for (int i = 0; i < g_invitedN; ++i) if (g_invited[i] == id) return true;
+    return false;
+}
+void diagFriend(unsigned long long id, const char* name, unsigned long long game,
+                unsigned long long lobby, const char* connect) {
+    int i = 0;
+    while (i < g_diagN && g_diag[i].id != id) ++i;
+    if (i == g_diagN) {
+        if (g_diagN >= MAX_DIAG) return;
+        std::memset(&g_diag[i], 0, sizeof(g_diag[i]));
+        g_diag[i].id = id; g_diag[i].game = ~0ull; ++g_diagN;
+    }
+    FriendDiag& d = g_diag[i];
+    if (d.game == game && d.lobby == lobby && strncmp(d.connect, connect, sizeof(d.connect) - 1) == 0) return;
+    d.game = game; d.lobby = lobby;
+    _snprintf(d.connect, sizeof(d.connect) - 1, "%s", connect);
+    d.connect[sizeof(d.connect) - 1] = '\0';
+    char b[256];
+    _snprintf(b, sizeof(b) - 1, "friend %llu (%s): gameID=%llu app=%u lobby=%llu connect='%s'",
+              id, name ? name : "?", game, (unsigned)(game & 0xFFFFFFu), lobby, connect);
+    b[sizeof(b) - 1] = '\0';
+    steamLog(b);
+}
+
 // (Re)build the friend cache: enumerate immediate friends, skip offline ones,
 // copy names into our own buffers, tag state (3 = hosting co-op, 2 = in Kenshi,
-// 1 = online), and sort so the useful ones surface first. A Kenshi friend with a
-// lobby is hosting co-op: Kenshi has no lobbies of its own, and friend game info
-// only carries a lobby id when that lobby is joinable by us.
+// 1 = online), and sort so the useful ones surface first. A Kenshi friend in a
+// lobby is hosting co-op: Kenshi has no lobbies of its own. The lobby comes from
+// friend game info, or else from their rich presence "connect" string (the host
+// publishes it), since game info does not always carry the lobby.
 void refreshFriends() {
     g_friendN = 0;
     if (!g_frCount || !g_frByIndex || !g_frName || !g_frState) return;
@@ -262,20 +318,30 @@ void refreshFriends() {
         r.lobby = 0;
         r.version = 0;
         r.state = 1;
-        FriendGameInfo_t gi;
-        std::memset(&gi, 0, sizeof(gi));
-        if (g_frGame && g_frGame(g_friends, fid, &gi) &&
-            (unsigned)(gi.m_gameID & 0xFFFFFFu) == KENSHI_APPID) {
-            r.state = 2;
-            if (gi.m_steamIDLobby != 0) {
-                r.state   = 3;
-                r.lobby   = gi.m_steamIDLobby;
-                r.version = lobbyVersion(r.lobby);
-            }
-        }
         const char* nm = g_frName(g_friends, fid);
         _snprintf(r.name, sizeof(r.name) - 1, "%s", nm ? nm : "(unknown)");
         r.name[sizeof(r.name) - 1] = '\0';
+        FriendGameInfo_t gi;
+        std::memset(&gi, 0, sizeof(gi));
+        const bool playing = g_frGame && g_frGame(g_friends, fid, &gi);
+        const bool kenshi  = playing && (unsigned)(gi.m_gameID & 0xFFFFFFu) == KENSHI_APPID;
+        const char* connect = "";
+        if (kenshi && g_frGetRP) {
+            if (g_frReqRP) g_frReqRP(g_friends, fid); // async; answer lands on a later refresh
+            const char* c = g_frGetRP(g_friends, fid, "connect");
+            if (c) connect = c;
+        }
+        if (kenshi) {
+            r.state = 2;
+            unsigned long long lobby = gi.m_steamIDLobby ? gi.m_steamIDLobby : lobbyFromConnect(connect);
+            if (lobby != 0) {
+                r.state   = 3;
+                r.lobby   = lobby;
+                r.version = lobbyVersion(r.lobby);
+            }
+        }
+        if (kenshi || invitedId(fid))
+            diagFriend(fid, r.name, playing ? gi.m_gameID : 0, gi.m_steamIDLobby, connect);
         ++g_friendN;
     }
     // Insertion sort by state descending (small N, stable for equal states).
@@ -287,12 +353,31 @@ void refreshFriends() {
     }
 }
 
+// Host: advertise the lobby in rich presence so Steam's own "Join Game" works and
+// friends find it even when friend game info carries no lobby. Cleared on leave.
+void publishPresence() {
+    if (!g_frSetRP || g_lobby == 0) return;
+    char c[64];
+    _snprintf(c, sizeof(c) - 1, "+connect_lobby %llu", g_lobby);
+    c[sizeof(c) - 1] = '\0';
+    const bool ok1 = g_frSetRP(g_friends, "connect", c);
+    const bool ok2 = g_frSetRP(g_friends, "status", "Hosting KenshiCoop");
+    char b[128];
+    _snprintf(b, sizeof(b) - 1, "rich presence connect='%s' set=%d status=%d", c, ok1 ? 1 : 0, ok2 ? 1 : 0);
+    b[sizeof(b) - 1] = '\0';
+    steamLog(b);
+}
+void clearPresence() {
+    if (g_frClearRP) { g_frClearRP(g_friends); steamLog("rich presence cleared"); }
+}
+
 // Enter a lobby as the joining player. Leaves a lobby we were hosting first:
 // accepting an invite while our own lobby is open must not leave it dangling
 // (a friend could still enter it and get hosted for).
 void enterLobby(unsigned long long lobby) {
     if (g_lobby != 0 && g_lobby != lobby && g_leaveLobby) {
         g_leaveLobby(g_mm, g_lobby);
+        if (g_weAreHost) clearPresence();
         steamLog("left our own lobby to join a friend's");
     }
     g_lobby     = 0;
@@ -333,13 +418,14 @@ void onLobbyCreated(LobbyCreated_t* r, bool ioFailure) {
     _snprintf(b, sizeof(b) - 1, "lobby created %llu (protocol %s)", g_lobby, pv);
     b[sizeof(b) - 1] = '\0';
     steamLog(b);
+    publishPresence();
     // If a friend was picked before the lobby existed, invite them now.
     if (g_pendingInvitee != 0) {
         unsigned long long who = g_pendingInvitee;
         g_pendingInvitee = 0;
-        if (g_inviteToLobby) g_inviteToLobby(g_mm, g_lobby, who);
+        const bool ok = g_inviteToLobby ? g_inviteToLobby(g_mm, g_lobby, who) : false;
         char c[96];
-        _snprintf(c, sizeof(c) - 1, "sent lobby invite to %llu", who);
+        _snprintf(c, sizeof(c) - 1, "sent lobby invite to %llu ok=%d", who, ok ? 1 : 0);
         c[sizeof(c) - 1] = '\0';
         steamLog(c);
         setStatus("Invite sent - waiting for your friend to accept...");
@@ -352,13 +438,30 @@ void onGameLobbyJoinRequested(GameLobbyJoinRequested_t* r) {
     if (!r || !g_joinLobby) return;
     // The player clicked a friend's invite / Steam "Join Game". Enter their lobby;
     // the actual connect happens in onLobbyEnter once membership + owner are known.
-    char b[96];
-    _snprintf(b, sizeof(b) - 1, "join requested for lobby %llu - entering...",
-              r->m_steamIDLobby);
+    char b[128];
+    _snprintf(b, sizeof(b) - 1, "CALLBACK 533 join requested for lobby %llu by friend %llu - entering...",
+              r->m_steamIDLobby, r->m_steamIDFriend);
     b[sizeof(b) - 1] = '\0';
     steamLog(b);
     setStatus("Joining friend's game...");
     enterLobby(r->m_steamIDLobby);
+}
+
+// Steam's "Join Game" on a friend's rich presence while our game runs.
+void onRichPresenceJoinRequested(GameRichPresenceJoinRequested_t* r) {
+    if (!r || !g_joinLobby) return;
+    char connect[257];
+    memcpy(connect, r->m_rgchConnect, 256);
+    connect[256] = '\0';
+    const unsigned long long lobby = lobbyFromConnect(connect);
+    char b[360];
+    _snprintf(b, sizeof(b) - 1, "CALLBACK 337 rich presence join by friend %llu connect='%s' lobby=%llu",
+              r->m_steamIDFriend, connect, lobby);
+    b[sizeof(b) - 1] = '\0';
+    steamLog(b);
+    if (lobby == 0) return;
+    setStatus("Joining friend's game...");
+    enterLobby(lobby);
 }
 
 void onLobbyEnter(LobbyEnter_t* r) {
@@ -433,6 +536,7 @@ void dispatch(int iCallback, void* param, bool ioFailure) {
         case cb_LobbyCreated:           onLobbyCreated((LobbyCreated_t*)param, ioFailure); break;
         case cb_LobbyEnter:             onLobbyEnter((LobbyEnter_t*)param); break;
         case cb_GameLobbyJoinRequested: onGameLobbyJoinRequested((GameLobbyJoinRequested_t*)param); break;
+        case cb_GameRichPresenceJoinRequested: onRichPresenceJoinRequested((GameRichPresenceJoinRequested_t*)param); break;
         case cb_P2PSessionRequest:      onP2PSessionRequest((P2PSessionRequest_t*)param); break;
         default: break;
     }
@@ -511,6 +615,10 @@ bool init(ConnectFn onConnect) {
     g_frName      = (FrGetNameFn)          GetProcAddress(mod, "SteamAPI_ISteamFriends_GetFriendPersonaName");
     g_frState     = (FrGetStateFn)         GetProcAddress(mod, "SteamAPI_ISteamFriends_GetFriendPersonaState");
     g_frGame      = (FrGetGamePlayedFn)    GetProcAddress(mod, "SteamAPI_ISteamFriends_GetFriendGamePlayed");
+    g_frSetRP     = (FrSetRichPresenceFn)  GetProcAddress(mod, "SteamAPI_ISteamFriends_SetRichPresence");
+    g_frClearRP   = (FrClearRichPresenceFn)GetProcAddress(mod, "SteamAPI_ISteamFriends_ClearRichPresence");
+    g_frGetRP     = (FrGetFriendRichPresenceFn)GetProcAddress(mod, "SteamAPI_ISteamFriends_GetFriendRichPresence");
+    g_frReqRP     = (FrRequestFriendRichPresenceFn)GetProcAddress(mod, "SteamAPI_ISteamFriends_RequestFriendRichPresence");
     // Lobby window extras (names + avatars). Optional: missing ones only cost
     // the avatar pictures / own name, never the lobby itself.
     g_frSelfName  = (FrGetSelfNameFn)      GetProcAddress(mod, "SteamAPI_ISteamFriends_GetPersonaName");
@@ -551,6 +659,8 @@ bool init(ConnectFn onConnect) {
     g_cbP2PRequest.arm(cb_P2PSessionRequest, sizeof(P2PSessionRequest_t));
     g_regCb(&g_cbLobbyEnter, cb_LobbyEnter);
     g_regCb(&g_cbJoinRequested, cb_GameLobbyJoinRequested);
+    g_cbRichJoin.arm(cb_GameRichPresenceJoinRequested, sizeof(GameRichPresenceJoinRequested_t));
+    g_regCb(&g_cbRichJoin, cb_GameRichPresenceJoinRequested);
     g_regCb(&g_cbP2PRequest, cb_P2PSessionRequest);
 
     if (getUtIf) {
@@ -560,6 +670,14 @@ bool init(ConnectFn onConnect) {
     if (!g_utils || !g_frAvatar || !g_utImgSize || !g_utImgRGBA)
         steamLog("avatars unavailable (ISteamUtils / avatar exports missing)");
 
+    {   // Diagnostics: how this process was started (an accepted invite on a
+        // cold launch arrives as "+connect_lobby <id>" here).
+        const char* cl = GetCommandLineA();
+        char c[400];
+        _snprintf(c, sizeof(c) - 1, "command line: %s", cl ? cl : "(none)");
+        c[sizeof(c) - 1] = '\0';
+        steamLog(c);
+    }
     g_launchLobby = parseLaunchLobby();
 
     g_ready = true;
@@ -589,9 +707,9 @@ void inviteFriend(SteamId id) {
     const FriendRow* f = findFriend(id);
     const char* nm = f ? f->name : "friend";
     if (g_lobby != 0 && g_weAreHost && g_inviteToLobby) {
-        g_inviteToLobby(g_mm, g_lobby, id);
+        const bool ok = g_inviteToLobby(g_mm, g_lobby, id);
         char b[128];
-        _snprintf(b, sizeof(b) - 1, "sent lobby invite to %llu (%s)", id, nm);
+        _snprintf(b, sizeof(b) - 1, "sent lobby invite to %llu (%s) ok=%d", id, nm, ok ? 1 : 0);
         b[sizeof(b) - 1] = '\0';
         steamLog(b);
     } else {
@@ -836,6 +954,7 @@ const char* status() { return g_status; }
 
 void reset() {
     if (g_ready && g_lobby != 0 && g_leaveLobby) g_leaveLobby(g_mm, g_lobby);
+    if (g_ready && g_weAreHost) clearPresence();
     g_lobby     = 0;
     g_weAreHost = false;
     g_hostFired = false;

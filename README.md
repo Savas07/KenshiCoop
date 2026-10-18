@@ -62,7 +62,7 @@ only needed for LAN / direct-UDP games.)
 
 ### 1. Install the mod
 
-Grab `KenshiCoop-kit-v0.56.1.zip` from the
+Grab `KenshiCoop-kit-v0.56.2.zip` from the
 [latest release](https://github.com/Savas07/KenshiCoop/releases/latest) and
 unzip it anywhere (every player). You do not need to clone this repository -
 but if you did, the same kit is in [dist/mod-kit](dist/mod-kit).
