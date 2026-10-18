@@ -189,6 +189,16 @@ struct MoveDiag {
     float dx, dy, dz;     // destination
 };
 bool readMoveDiag(Character* c, MoveDiag* out);
+// Where the MODEL is: world position of the rendered skeleton's pelvis bone
+// (CharMovement::pos, which getPosition/the nameplate follow, can move while the
+// mesh stays behind), plus the left-right foot distance - it swings while a gait
+// clip plays and stays constant on a body that slides without animation.
+struct MeshProbe {
+    bool  valid;
+    float px, py, pz;
+    float footSep;        // -1 = feet not readable
+};
+bool readMeshProbe(Character* c, MeshProbe* out);
 
 // SEH-guarded: fetch the local player's squad leader (playerCharacters[0]) or 0.
 Character* leader(GameWorld* gw);

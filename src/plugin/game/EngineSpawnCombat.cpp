@@ -1347,6 +1347,34 @@ static bool readPelvisDelta(Character* c, const std::string* boneName, float* ou
     }
 }
 
+// SEH half of readMeshProbe: no destructible objects in this frame.
+static bool readBoneWorld(Character* c, const std::string* boneName, Ogre::Vector3* out) {
+    __try {
+        g_getBoneWorldFn(c, out, boneName);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool readMeshProbe(Character* c, MeshProbe* out) {
+    if (!c || !out || !g_getBoneWorldFn) return false;
+    out->valid = false;
+    static const std::string pelvis("Bip01 Pelvis");
+    static const std::string lfoot("Bip01 L Foot");
+    static const std::string rfoot("Bip01 R Foot");
+    Ogre::Vector3 p(0, 0, 0), l(0, 0, 0), r(0, 0, 0);
+    if (!readBoneWorld(c, &pelvis, &p)) return false;
+    out->px = p.x; out->py = p.y; out->pz = p.z;
+    out->footSep = -1.0f;
+    if (readBoneWorld(c, &lfoot, &l) && readBoneWorld(c, &rfoot, &r)) {
+        float dx = l.x - r.x, dy = l.y - r.y, dz = l.z - r.z;
+        out->footSep = (float)sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    out->valid = true;
+    return true;
+}
+
 static bool readCharBodyFlags(Character* c, int* idle, int* crouched, int* task) {
     __try {
         CharBody* b = c->body;

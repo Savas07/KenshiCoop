@@ -881,20 +881,17 @@ void Replicator::applyTargets(GameWorld* gw) {
         // carried, furniture and crawl branches above all continue out). Kenshi
         // destroys a character's Havok controller when it stops being a free
         // walker (KO ragdoll, shoulder carry) and the body's own recovery rebuilds
-        // it; an AI-suspended copy never runs that recovery. Without a controller
-        // the copy can be placed but ignores every walk order. Field report
-        // 2026-10-18: after the host put the join's character down, the host's
-        // copy stood at the drop point while the join walked away, snapping only
-        // at the 150 u gate; carry_walk reproduced havok=0 after the drop. Same
-        // repair the crawl drive uses (restoreMovement = CharMovement::restore).
-        // Default OFF (KENSHICOOP_EXP_MOVEHEAL=1) until a test shows it firing
-        // and fixing the carry case.
-        static int s_expMoveHeal = -1;
-        if (s_expMoveHeal < 0) {
-            const char* e = getenv("KENSHICOOP_EXP_MOVEHEAL");
-            s_expMoveHeal = (e && e[0] == '1') ? 1 : 0;
-        }
-        if (s_expMoveHeal && isSquad && (now - d.physHealTick) >= PHYS_HEAL_MS &&
+        // it; an AI-suspended copy never runs that recovery. The MODEL is rendered
+        // from that controller, so without one every placement moves only
+        // CharMovement::pos: the nameplate wanders off while the mesh stays where
+        // the controller died, and walk orders are ignored. Field report
+        // 2026-10-19 (carry, put down, walk off: frozen model, wandering
+        // nameplate, on both screens after a carry each way); carry_swap with a
+        // pre-pickup KO measured pelvis-to-nameplate 245-615 u with hk=0 for the
+        // whole walk, 0.1 u with this restore. Same repair as the crawl drive
+        // (restoreMovement = CharMovement::restore); the glide branch repeats it
+        // per frame for a moving copy.
+        if (isSquad && (now - d.physHealTick) >= PHYS_HEAL_MS &&
             !engine::hasPhysicsBody(c) && !coop::bodyIsDown(engine::readBodyState(c))) {
             d.physHealTick = now;
             bool restored = engine::restoreMovement(c);
@@ -1858,8 +1855,19 @@ void Replicator::applyTargets(GameWorld* gw) {
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
             ++d.glideFrames; ++glideFrames_;
+            // Placement moves CharMovement::pos (nameplate) but the MODEL is
+            // rendered from the physics character: without one the mesh stays
+            // where the controller died - the field report's frozen model with a
+            // wandering nameplate after a put-down. Same repair as the crawl drive.
+            if (!engine::hasPhysicsBody(c) && engine::restoreMovement(c)) {
+                ++physHeal_;
+                char b[128]; _snprintf(b, sizeof(b) - 1, "[glide] PHYS restore hand=%u,%u",
+                                       out.hIndex, out.hSerial);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
             engine::applyRaw(c, out);
             engine::applyMotion(c, true, out.cSpeed, out.cMotionX, out.cMotionY, out.cMotionZ);
+            engine::applyPhysMotion(c, out.cMotionX, out.cMotionY, out.cMotionZ, out.cSpeed);
             d.parked = false; d.haveDest = false;
         } else if (genuinelyMoving && haveActual && gapNewest > snapGate && snapOk) {
             // Fell behind / source warped: hard-snap to the true position

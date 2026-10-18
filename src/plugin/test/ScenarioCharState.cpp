@@ -404,6 +404,160 @@ private:
     unsigned int l0_[5], l1_[5];
 };
 
+// ---- Shared model-vs-nameplate tracking (field report 2026-10-19) ----------
+// "SCENARIO MESH <who> t= np=x,y,z mesh=x,y,z foot=f hk=0|1 bs= carry=a/b":
+// np = Character::getPosition (what the nameplate and every position oracle
+// follow), mesh = the rendered pelvis bone, foot = left-right foot distance
+// (swings while a gait clip plays). A frozen model shows as mesh != np; a body
+// sliding without animation as a constant foot while np moves.
+static void logMeshTrack(const char* who, const unsigned int h[5], unsigned long t) {
+    Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+    if (!c) return;
+    float x = 0, y = 0, z = 0;
+    engine::readPos(c, &x, &y, &z);
+    engine::MeshProbe mp;
+    bool haveMp = engine::readMeshProbe(c, &mp);
+    engine::CarryRead cr;
+    bool haveCr = engine::readCarry(c, &cr) && cr.valid;
+    char b[300];
+    _snprintf(b, sizeof(b) - 1,
+              "SCENARIO MESH %s t=%lu np=%.1f,%.1f,%.1f mesh=%.1f,%.1f,%.1f foot=%.2f hk=%d bs=%u carry=%d/%d task=%d",
+              who, t, x, y, z, haveMp ? mp.px : 0.0f, haveMp ? mp.py : 0.0f, haveMp ? mp.pz : 0.0f,
+              haveMp ? mp.footSep : -2.0f, engine::hasPhysicsBody(c) ? 1 : 0,
+              (unsigned)engine::readBodyState(c),
+              haveCr && cr.carrying ? 1 : 0, haveCr && cr.beingCarried ? 1 : 0, engine::readTaskKey(c));
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+static void logScenarioAct(const char* scen, const char* what, bool ok) {
+    char b[128];
+    _snprintf(b, sizeof(b) - 1, "SCENARIO %s %s ok=%d", scen, what, ok ? 1 : 0);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+// Order a leader to run dx,dz from where it stands now.
+static bool runLeg(const unsigned int h[5], float dx, float dz) {
+    Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+    float x, y, z;
+    return c && engine::readPos(c, &x, &y, &z) && engine::orderMoveTo(c, x + dx, y, z + dz);
+}
+
+// carry_swap (field report 2026-10-19, the user's exact sequence): host's L0
+// picks up the join's conscious L1, carries it, puts it down; the join walks L1
+// off on long legs; then L1 picks up the host's L0, carries it, puts it down;
+// then both walk. Expected: on both screens each model stays visible and with
+// its nameplate (mesh == np) and animates. Field: after the first drop the
+// host saw L1's model frozen at the drop point with only the nameplate moving;
+// after the second drop both models were frozen in different places.
+class CarrySwapScenario : public TimedScenario {
+public:
+    CarrySwapScenario() : TimedScenario("carry_swap", 0), lastLogMs_(0), have_(false), koDone_(false), step_(0) {}
+    virtual void onStart(const ScenarioContext&) {}
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned long t = ctx.elapsedMs;
+        if (!have_) {
+            EntityState sq[32];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, 32);
+            int i0 = tabLeaderIdx(sq, n, 0), i1 = tabLeaderIdx(sq, n, 1);
+            if (i0 >= 0 && i1 >= 0) { handFromEntity(sq[i0], l0_); handFromEntity(sq[i1], l1_); have_ = true; }
+        }
+        // Timeline: {time, side (0 host / 1 join), action}
+        static const struct { unsigned long at; int side; int act; } T[] = {
+            { 10000, 0, 1 },  // host L0 picks up L1
+            { 12000, 0, 2 },  // L0 carry walk
+            { 20000, 0, 3 },  // L0 puts L1 down
+            { 23000, 1, 4 }, { 30000, 1, 5 }, { 37000, 1, 6 },   // join walks L1 (3 legs)
+            { 44000, 1, 7 },  // join L1 picks up host L0
+            { 46000, 1, 8 },  // L1 carry walk
+            { 54000, 1, 9 },  // L1 puts L0 down
+            { 57000, 0, 10 }, { 57000, 1, 11 },                  // both walk
+            { 64000, 0, 12 }, { 64000, 1, 13 },
+        };
+        const int N = (int)(sizeof(T) / sizeof(T[0]));
+        // KENSHICOOP_CS_KO=1: the join KO's its own L1 at 6 s and lets it wake
+        // on its own before the pickup - the shape that left the dropped copy
+        // without a physics character (carry_walk field variant).
+        const char* ko = getenv("KENSHICOOP_CS_KO");
+        if (!ctx.isHost && have_ && !koDone_ && ko && ko[0] == '1' && t >= 6000) {
+            logScenarioAct("carry_swap", "join KO L1", engine::orderDownSubject(ctx.gw, l1_));
+            koDone_ = true;
+        }
+        while (have_ && step_ < N && t >= T[step_].at) {
+            const int mine = ctx.isHost ? 0 : 1;
+            if (T[step_].side == mine) {
+                switch (T[step_].act) {
+                case 1:  logScenarioAct("carry_swap", "host pickup L1", engine::carrySubject(ctx.gw, l0_, l1_)); break;
+                case 2:  logScenarioAct("carry_swap", "host carrywalk", runLeg(l0_, 60.0f, 0.0f)); break;
+                case 3:  logScenarioAct("carry_swap", "host putdown", engine::dropSubject(ctx.gw, l0_, false)); break;
+                case 4:  logScenarioAct("carry_swap", "join leg1", runLeg(l1_, 400.0f, 0.0f)); break;
+                case 5:  logScenarioAct("carry_swap", "join leg2", runLeg(l1_, 0.0f, 400.0f)); break;
+                case 6:  logScenarioAct("carry_swap", "join leg3", runLeg(l1_, -400.0f, -400.0f)); break;
+                case 7:  logScenarioAct("carry_swap", "join pickup L0", engine::carrySubject(ctx.gw, l1_, l0_)); break;
+                case 8:  logScenarioAct("carry_swap", "join carrywalk", runLeg(l1_, -60.0f, 0.0f)); break;
+                case 9:  logScenarioAct("carry_swap", "join putdown", engine::dropSubject(ctx.gw, l1_, false)); break;
+                case 10: logScenarioAct("carry_swap", "host leg1", runLeg(l0_, 0.0f, -400.0f)); break;
+                case 11: logScenarioAct("carry_swap", "join leg4", runLeg(l1_, 400.0f, 0.0f)); break;
+                case 12: logScenarioAct("carry_swap", "host leg2", runLeg(l0_, 0.0f, 400.0f)); break;
+                case 13: logScenarioAct("carry_swap", "join leg5", runLeg(l1_, -400.0f, 0.0f)); break;
+                }
+            }
+            ++step_;
+        }
+        if (have_ && (t - lastLogMs_ >= 250 || lastLogMs_ == 0)) {
+            lastLogMs_ = t;
+            logMeshTrack("L0", l0_, t);
+            logMeshTrack("L1", l1_, t);
+        }
+        if (t >= 74000) { passed_ = have_ && step_ == N; return true; }
+        return false;
+    }
+private:
+    unsigned long lastLogMs_;
+    bool have_;
+    bool koDone_;
+    int  step_;
+    unsigned int l0_[5], l1_[5];
+};
+
+// far_run (field report 2026-10-19 item 1): on the host's screen the join's
+// character kept moving but stopped animating once it was far from the host.
+// The host stands still; the join runs FAR_U straight out, waits, runs back.
+// Same SCENARIO MESH series; the host's foot series for L1 against distance.
+class FarRunScenario : public TimedScenario {
+public:
+    FarRunScenario() : TimedScenario("far_run", 0), lastLogMs_(0), have_(false), out_(false), back_(false) {}
+    virtual void onStart(const ScenarioContext&) {}
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned long t = ctx.elapsedMs;
+        if (!have_) {
+            EntityState sq[32];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, 32);
+            int i0 = tabLeaderIdx(sq, n, 0), i1 = tabLeaderIdx(sq, n, 1);
+            if (i0 >= 0 && i1 >= 0) { handFromEntity(sq[i0], l0_); handFromEntity(sq[i1], l1_); have_ = true; }
+        }
+        const char* fe = getenv("KENSHICOOP_FAR_U");
+        const float farU = (fe && fe[0]) ? (float)atof(fe) : 3000.0f;
+        if (!ctx.isHost && have_ && !out_ && t >= 8000) {
+            logScenarioAct("far_run", "out", runLeg(l1_, farU, 0.0f)); out_ = true;
+        }
+        if (!ctx.isHost && have_ && !back_ && t >= 8000 + OUT_MS) {
+            logScenarioAct("far_run", "back", runLeg(l1_, -farU, 0.0f)); back_ = true;
+        }
+        if (have_ && (t - lastLogMs_ >= 250 || lastLogMs_ == 0)) {
+            lastLogMs_ = t;
+            logMeshTrack("L0", l0_, t);
+            logMeshTrack("L1", l1_, t);
+        }
+        if (t >= 8000 + 2 * OUT_MS + 5000) { passed_ = have_ && out_ && back_; return true; }
+        return false;
+    }
+private:
+    static const unsigned long OUT_MS = 55000;
+    unsigned long lastLogMs_;
+    bool have_, out_, back_;
+    unsigned int l0_[5], l1_[5];
+};
+
 // npc_carry (protocol 18, world-NPC carrier extension): the 2026-07-07 remote
 // session's third gap - a HOST-side world NPC hauling a downed player character
 // never replicated to the join. One window: the host KO's its second member
@@ -2555,6 +2709,8 @@ Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "carry_order")  return new CarryOrderScenario();
     if (name == "carry_walk")   return new CarryWalkScenario();
     if (name == "npc_carry")    return new NpcCarryScenario();
+    if (name == "carry_swap")   return new CarrySwapScenario();
+    if (name == "far_run")      return new FarRunScenario();
     if (name == "bed_pose")     return new BedPoseScenario();
     if (name == "bed_wake")     return new BedWakeScenario();
     if (name == "bed_lay")      return new BedLayScenario();
