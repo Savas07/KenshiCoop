@@ -423,6 +423,12 @@ public:
     // legacy per-tick sorted ranking (the squad_probe baseline).
     void setSquadSync(bool v) { squadSync_ = v; }
 
+    // Squad naming (protocol 59): every squad tab of the last census whose rank
+    // means the same tab on every client (the save's own tabs), as its container
+    // hand with that rank - player r is named on rank r. Tabs appended
+    // mid-session have client-local ranks and are left out.
+    void sharedTabs(std::vector<std::pair<std::pair<u32, u32>, u32> >& out) const;
+
     // BEFORE engine (protocol 24, both clients): sample the player-faction
     // relation table (~1 Hz, immediately when the affectRelations detour saw a
     // mutation) and stream every row whose value MOVED since the seeded
@@ -2355,6 +2361,8 @@ private:
     // or accept a mint (the duplicate-proxy race, run 192211).
     bool          squadSync_;
     std::map<std::pair<u32, u32>, unsigned int> tabRank_;
+    // The last census's distinct sorted tab containers (sharedTabs reads it).
+    std::vector<std::pair<u32, u32> > lastCtnrs_;
     std::map<Key, unsigned long> rekeyedOld_;
     // Per-TAB ownership verdict, keyed on the container hand and decided ONCE
     // when the tab is first seen. The rank latch above stops ranks reshuffling,

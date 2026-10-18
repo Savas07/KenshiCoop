@@ -570,6 +570,15 @@ bool holdWorkerAtFixture(GameWorld* gw, const unsigned int workerHand[5]);
 // containerSerial, index, serial). Used to log spawned objects.
 bool readObjectHand(RootObject* obj, unsigned int out[5]);
 
+// Squad tab naming (protocol 59). Rename the player squad tab whose members' hand
+// container is (cont, contSerial) to 'name' - only while its current name is the
+// player faction's default ("<faction>" / "<faction>_<digits>") or a name this
+// mod gave earlier (an entry of 'replaceable', optionally + " <digits>"); a name
+// a player typed is never touched. Returns 1 renamed, 0 left as is, -1 no such
+// tab / fault. curOut gets the tab's name before the call.
+int renameSquadTab(GameWorld* gw, u32 cont, u32 contSerial, const std::string& name,
+                   const std::vector<std::string>& replaceable, std::string* curOut);
+
 // ---- Phase 4a: container-contents (inventory) replication ------------------
 // World objects carry the same save-stable hand as Characters, so a container that
 // EXISTS in the shared save resolves cross-client. But runtime-minted items (craft

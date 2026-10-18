@@ -196,6 +196,8 @@ public:
     // (a suppressed local load forwarded for arbitration); NACK join -> host
     // (copy missing/diverged - answer with a SaveXfer). All on CH_BULK.
     void queueLoadGo(const LoadGoPacket& pkt, u32 targetMask = PEER_MASK_ALL);
+    // Host, MAIN thread: one roster row (protocol 59) to the joins in targetMask.
+    void queueRoster(const RosterPacket& pkt, u32 targetMask = PEER_MASK_ALL);
     void queueLoadReq(const LoadReqPacket& pkt);
     void queueLoadNack(const LoadNackPacket& pkt);
 
@@ -217,6 +219,10 @@ public:
     // that token, so a reconnect lands on the same player id / squad tab.
     // Must be called before startClient.
     void setIdentity(const std::string& identity) { identity_ = identity; }
+    // Host, MAIN thread: identity token -> player id remembered with the save, so
+    // a returning player is given their own squad tab back (any connect order).
+    // Thread-safe; applied at session start and whenever it changes.
+    void setReservedIds(const std::map<std::string, u32>& ids);
     // MAIN thread (host): which player ids are held by a connected join right
     // now, and the steamid64 of that join from its HELLO identity token (0 = a
     // join without Steam). Valid at the title screen too, before the session
@@ -362,6 +368,8 @@ private:
     // Reliable coordinated-load packets (protocol 32). Guarded by outCs_.
     struct OutLoadGo { LoadGoPacket pkt; u32 mask; };
     std::vector<OutLoadGo>       outLoadGo_;
+    struct OutRoster { RosterPacket pkt; u32 mask; };
+    std::vector<OutRoster>       outRoster_;
     std::vector<LoadReqPacket>   outLoadReq_;
     std::vector<LoadNackPacket>  outLoadNack_;
 
@@ -387,6 +395,10 @@ private:
     volatile LONG               peerUp_[MAX_PLAYERS];
     volatile unsigned long long peerSteam_[MAX_PLAYERS];
     u32 allocPlayerId(const std::string& identity);
+    // setReservedIds hand-off (guarded by outCs_) and its NET-thread application.
+    std::map<std::string, u32> reservedIds_;
+    volatile LONG              reservedDirty_;
+    void applyReservedIds();
 
     HANDLE        thread_;
     volatile LONG running_;

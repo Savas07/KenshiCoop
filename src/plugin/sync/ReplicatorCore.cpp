@@ -295,6 +295,7 @@ void Replicator::resetSession() {
     // describe the OLD world (containers and Character* dangle after a swap);
     // the reloaded save re-seeds them at first census/poll.
     tabRank_.clear();
+    lastCtnrs_.clear();
     tabOwned_.clear();
     tabsSeeded_ = 0;
     rekeyedOld_.clear();
@@ -666,6 +667,15 @@ bool Replicator::ownsTab(const std::pair<u32, u32>& key, unsigned int rank) cons
     // Not yet decided (squadSync_ off, or the first tick of a fresh container):
     // the historical rule, so this is never MORE permissive than before.
     return ownRanks_.empty() ? (rank == 0u) : (ownRanks_.count(rank) != 0);
+}
+
+void Replicator::sharedTabs(std::vector<std::pair<std::pair<u32, u32>, u32> >& out) const {
+    out.clear();
+    for (unsigned int i = 0; i < lastCtnrs_.size(); ++i) {
+        const unsigned int rank = tabRankFor(lastCtnrs_[i], lastCtnrs_);
+        if (squadSync_ && !rankIsShared(rank)) continue;
+        out.push_back(std::make_pair(lastCtnrs_[i], (u32)rank));
+    }
 }
 
 u32 Replicator::tabOwnerOf(const std::pair<u32, u32>& key, unsigned int rank) const {

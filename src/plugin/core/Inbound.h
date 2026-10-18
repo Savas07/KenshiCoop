@@ -337,6 +337,11 @@ struct InboundLoadGo {
     LoadGoPacket pkt;
 };
 
+// One received roster row (protocol 59, join side).
+struct InboundRoster {
+    RosterPacket pkt;
+};
+
 // One received join load request (protocol 32, host side): the join's player
 // pressed load (suppressed locally); the host arbitrates.
 struct InboundLoadReq {
@@ -704,6 +709,11 @@ public:
         InboundLoadGo lg; lg.ownerId = ownerId; lg.pkt = pkt;
         EnterCriticalSection(&cs_); loadGo_.push_back(lg); LeaveCriticalSection(&cs_);
     }
+    // NET thread: roster rows (protocol 59).
+    void pushRoster(const RosterPacket& pkt) {
+        InboundRoster r; r.pkt = pkt;
+        EnterCriticalSection(&cs_); roster_.push_back(r); LeaveCriticalSection(&cs_);
+    }
     void pushLoadReq(u32 ownerId, const LoadReqPacket& pkt) {
         InboundLoadReq lr; lr.ownerId = ownerId; lr.pkt = pkt;
         EnterCriticalSection(&cs_); loadReq_.push_back(lr); LeaveCriticalSection(&cs_);
@@ -847,6 +857,9 @@ public:
     void drainLoadGos(std::deque<InboundLoadGo>& out) {
         EnterCriticalSection(&cs_); out.swap(loadGo_); LeaveCriticalSection(&cs_);
     }
+    void drainRosters(std::deque<InboundRoster>& out) {
+        EnterCriticalSection(&cs_); out.swap(roster_); LeaveCriticalSection(&cs_);
+    }
     void drainLoadReqs(std::deque<InboundLoadReq>& out) {
         EnterCriticalSection(&cs_); out.swap(loadReq_); LeaveCriticalSection(&cs_);
     }
@@ -951,6 +964,7 @@ private:
     SessionQ<InboundSaveDone>      saveDone_;
     SessionQ<InboundSaveAck>       saveAck_;
     SessionQ<InboundLoadGo>        loadGo_;
+    std::deque<InboundRoster>      roster_;  // not a world-state queue: survives reloads
     SessionQ<InboundLoadReq>       loadReq_;
     SessionQ<InboundLoadNack>      loadNack_;
 

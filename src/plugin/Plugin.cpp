@@ -344,6 +344,207 @@ void applyHostRanks() {
     coopLog(b);
 }
 
+// ---- Player roster + squad tab names (protocol 59) -----------------------------
+// Who is player N (Steam id + name), on every client. The host builds it from its
+// own Steam identity and each join's HELLO identity, sends it to the joins
+// (PKT_ROSTER) and keeps it in the save as kenshicoop_players.txt. Reloading that
+// save pins the ids again (NetLink::setReservedIds), so a returning player gets
+// their own squad tab back whatever order people connect in; Kenshi's own save
+// leaves the file alone and the save transfer carries it to the joins. Every
+// client then names each squad tab after the player who drives it - replacing
+// only Kenshi's default tab names or names this mod gave earlier.
+struct RosterRow { unsigned long long steamId; std::string name; };
+std::map<coop::u32, RosterRow> g_roster;
+std::vector<std::string>       g_rosterNames; // every tab name this mod has used
+
+// A Steam name as a tab name: MyGUI reads '#' as a colour code, control
+// characters break the tab, and long names are cut on a UTF-8 boundary.
+std::string tabNameFor(const std::string& persona) {
+    std::string s;
+    for (size_t i = 0; i < persona.size(); ++i) {
+        unsigned char c = (unsigned char)persona[i];
+        if (c == '#' || c < 0x20) continue;
+        s += (char)c;
+    }
+    while (!s.empty() && s[0] == ' ') s.erase(0, 1);
+    while (!s.empty() && s[s.size() - 1] == ' ') s.erase(s.size() - 1);
+    if (s.size() > 32) {
+        size_t cut = 32;
+        while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) --cut;
+        s.erase(cut);
+    }
+    return s;
+}
+
+void rosterRemember(const std::string& tabName) {
+    if (tabName.empty()) return;
+    for (size_t i = 0; i < g_rosterNames.size(); ++i) if (g_rosterNames[i] == tabName) return;
+    g_rosterNames.push_back(tabName);
+}
+
+void rosterSet(coop::u32 id, unsigned long long steamId, const std::string& name) {
+    if (id >= coop::MAX_PLAYERS || name.empty()) return;
+    RosterRow& r = g_roster[id];
+    if (r.steamId == steamId && r.name == name) return;
+    r.steamId = steamId;
+    r.name = name;
+    rosterRemember(tabNameFor(name));
+    char b[160];
+    _snprintf(b, sizeof(b) - 1, "[roster] player %u = %llu '%s'", (unsigned)id, steamId, name.c_str());
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+}
+
+std::wstring wideOf(const std::string& u8) {
+    wchar_t w[600];
+    if (!MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), -1, w, 600)) return std::wstring();
+    return w;
+}
+
+std::string rosterFileOf(const std::string& save) {
+    return coop::savexfer::saveFolderFor(save) + "\\kenshicoop_players.txt";
+}
+
+// World went live: start from the loaded save's roster (or empty for a New
+// Game) and hand its ids to the net layer as reservations. Any role - a join
+// that later hosts this world needs the same table.
+void rosterLoadForWorld(bool fresh) {
+    g_roster.clear();
+    std::map<std::string, coop::u32> reserved;
+    char cur[96] = "";
+    coop::engine::saveInfo(cur, sizeof(cur), 0, 0);
+    unsigned int rows = 0;
+    if (!fresh && cur[0]) {
+        FILE* f = _wfopen(wideOf(rosterFileOf(cur)).c_str(), L"rb");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                unsigned int id = 0;
+                unsigned long long sid = 0;
+                int used = 0;
+                if (sscanf(line, "%u %llu %n", &id, &sid, &used) < 2 || used <= 0) continue;
+                std::string name(line + used);
+                while (!name.empty() && (name[name.size() - 1] == '\n' || name[name.size() - 1] == '\r'))
+                    name.erase(name.size() - 1);
+                rosterSet(id, sid, name);
+                if (id != 0 && sid != 0) {
+                    char k[32];
+                    _snprintf(k, sizeof(k) - 1, "%llu", sid);
+                    k[sizeof(k) - 1] = '\0';
+                    reserved[k] = id;
+                }
+                ++rows;
+            }
+            fclose(f);
+        }
+    }
+    g_net.setReservedIds(reserved);
+    char b[192];
+    _snprintf(b, sizeof(b) - 1, "[roster] %s: %u player row(s) from '%s'", fresh ? "new game" : "loaded save",
+              rows, cur);
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+}
+
+// Host: keep the save's roster file current. Called on every host save edge
+// (menu, autosave, the connect push), before the transfer watch fingerprints
+// the folder, so the joins' copies carry it too.
+void rosterWrite(const std::string& save) {
+    if (g_roster.empty()) return;
+    const std::string folder = coop::savexfer::saveFolderFor(save);
+    CreateDirectoryW(wideOf(folder).c_str(), 0);
+    FILE* f = _wfopen(wideOf(rosterFileOf(save)).c_str(), L"wb");
+    if (!f) { coopErr("[roster] could not write kenshicoop_players.txt"); return; }
+    for (std::map<coop::u32, RosterRow>::const_iterator it = g_roster.begin(); it != g_roster.end(); ++it)
+        fprintf(f, "%u %llu %s\n", (unsigned)it->first, it->second.steamId, it->second.name.c_str());
+    fclose(f);
+    char b[160];
+    _snprintf(b, sizeof(b) - 1, "[roster] %u row(s) saved with '%s'", (unsigned)g_roster.size(), save.c_str());
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+}
+
+// Host: refresh our own row and each connected join's (Steam names), then send
+// the whole table to the joins in mask.
+void rosterHostUpdate(coop::u32 mask) {
+    char nb[96];
+    const unsigned long long self = (unsigned long long)coop::steamp2p::selfId();
+    coop::steaminvite::nameOf(self, nb, sizeof(nb));
+    if (nb[0]) rosterSet(0, self, nb);
+    for (coop::u32 pid = 1; pid < coop::MAX_PLAYERS; ++pid) {
+        if (!g_net.peerConnected(pid)) continue;
+        const unsigned long long sid = g_net.peerSteamId(pid);
+        nb[0] = '\0';
+        if (sid) coop::steaminvite::nameOf(sid, nb, sizeof(nb));
+        if (nb[0]) rosterSet(pid, sid, nb);
+        else if (g_roster.find(pid) == g_roster.end() || g_roster[pid].steamId != sid) {
+            char pn[32];
+            _snprintf(pn, sizeof(pn) - 1, "Player %u", (unsigned)pid);
+            pn[sizeof(pn) - 1] = '\0';
+            rosterSet(pid, sid, pn);
+        }
+    }
+    if (mask == 0 || !g_net.isRunning()) return;
+    for (std::map<coop::u32, RosterRow>::const_iterator it = g_roster.begin(); it != g_roster.end(); ++it) {
+        coop::RosterPacket p;
+        memset(&p, 0, sizeof(p));
+        p.type     = (coop::u8)coop::PKT_ROSTER;
+        p.playerId = it->first;
+        p.steamId  = it->second.steamId;
+        strncpy(p.name, it->second.name.c_str(), sizeof(p.name) - 1);
+        g_net.queueRoster(p, mask);
+    }
+}
+
+// Join: take the host's rows.
+void rosterDrainInbound() {
+    std::deque<coop::InboundRoster> rows;
+    g_inbound.drainRosters(rows);
+    for (std::deque<coop::InboundRoster>::iterator it = rows.begin(); it != rows.end(); ++it)
+        rosterSet(it->pkt.playerId, it->pkt.steamId, it->pkt.name);
+}
+
+// Every client, ~every 2 s in-game: name each of the save's squad tabs after the
+// player whose id is its rank (the ownership rule: player r drives rank r). A
+// rank with no known player keeps its name. Two players with the same Steam name
+// get " 2", " 3", ... so tab names stay unique.
+void applySquadNames(GameWorld* gw) {
+    static DWORD s_last = 0;
+    static std::set<std::pair<coop::u32, coop::u32> > s_keptLogged;
+    const DWORD now = GetTickCount();
+    if (g_roster.empty() || now - s_last < 2000) return;
+    s_last = now;
+    std::vector<std::pair<std::pair<coop::u32, coop::u32>, coop::u32> > tabs;
+    g_repl.sharedTabs(tabs);
+    std::vector<std::string> used;
+    for (size_t i = 0; i < tabs.size(); ++i) {
+        std::map<coop::u32, RosterRow>::const_iterator r = g_roster.find(tabs[i].second);
+        if (r == g_roster.end()) continue;
+        const std::string base = tabNameFor(r->second.name);
+        if (base.empty()) continue;
+        std::string name = base;
+        for (int n = 2; std::find(used.begin(), used.end(), name) != used.end(); ++n) {
+            char sfx[16];
+            _snprintf(sfx, sizeof(sfx) - 1, " %d", n);
+            sfx[sizeof(sfx) - 1] = '\0';
+            name = base + sfx;
+        }
+        used.push_back(name);
+        std::string before;
+        const int rc = coop::engine::renameSquadTab(gw, tabs[i].first.first, tabs[i].first.second,
+                                                     name, g_rosterNames, &before);
+        char b[256];
+        if (rc == 1) {
+            rosterRemember(name);
+            _snprintf(b, sizeof(b) - 1, "[roster] squad tab rank %u named '%s' (was '%s')",
+                      (unsigned)tabs[i].second, name.c_str(), before.c_str());
+        } else if (rc == 0 && before != name && s_keptLogged.insert(tabs[i].first).second) {
+            _snprintf(b, sizeof(b) - 1, "[roster] squad tab rank %u keeps its own name '%s' (player name '%s')",
+                      (unsigned)tabs[i].second, before.c_str(), name.c_str());
+        } else {
+            continue;
+        }
+        b[sizeof(b) - 1] = '\0'; coopLog(b);
+    }
+}
+
 // Drain peer connect/leave events and surface a single game-thread confirmation
 // per event. The net thread already logs the handshake; this proves the event
 // reached the game thread cleanly (and is where later stages spawn/sweep).
@@ -353,6 +554,7 @@ void processNetEvents(GameWorld* gw) {
     std::deque<coop::u32> conns, leaves;
     g_inbound.drainConnects(conns);
     g_inbound.drainLeaves(leaves);
+    rosterDrainInbound();
     for (std::deque<coop::u32>::iterator it = conns.begin(); it != conns.end(); ++it) {
         const coop::u32 id = *it;
         char b[96];
@@ -393,6 +595,7 @@ void processNetEvents(GameWorld* gw) {
         // (joins already playing are not sent back through a load). If the
         // host is NOT yet in-game (title/loading), the gameplay-start edge in
         // mainLoop_hook arms this instead - covers either connect ordering.
+        if (g_cfg.isHost) rosterHostUpdate(joinMask());
         if (g_cfg.isHost && g_cfg.saveSync && g_gameStarted)
             armConnectPush(coop::peerBit(id));
     }
@@ -500,6 +703,7 @@ void driveSaveSync() {
         std::string name = edges[i].name[0] ? edges[i].name : "coopresume";
         if (g_cfg.isHost) {
             g_savePending = name;
+            rosterWrite(name);
             coop::savexfer::armWatch(name);
         } else if (edges[i].suppressed && !edges[i].autosave) {
             coop::SaveReqPacket rq;
@@ -1209,6 +1413,8 @@ void noteWorldLive() {
                          : "[chargen] world source: SAVE (no character creation)");
     if (g_worldFresh) nameFreshWorld();
     else              g_freshPushName.clear(); // a loaded world: push under its own name
+    rosterLoadForWorld(g_worldFresh);
+    if (g_cfg.isHost) rosterHostUpdate(joinMask());
 }
 
 // Protocol 32 world-swap edge detection. Runs FIRST so the reload edge (and,
@@ -2264,6 +2470,8 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     tickReplicatePublish(gw, worldLive);
     // CharCreate: join character editor + apply received creations (protocol 57).
     tickCharGen(gw, worldLive);
+    // Squad tab names after the players who drive them (protocol 59).
+    if (worldLive) applySquadNames(gw);
 
     // Coordinated save + load (protocols 31/32): run under g_gameStarted (NOT
     // worldLive) so they keep pumping DURING a world swap - they only touch net
@@ -2422,8 +2630,12 @@ void startNetworking() {
 
     // Player identity for the host's id reservation (reconnect = same squad
     // tab). Steam's id when Steam is up, else none (lowest free id).
+    // KENSHICOOP_TEST_IDENTITY=<steamid64> stands in for it, so several windows
+    // on ONE Steam account can test the remembered player ids.
     {
         unsigned long long self = (unsigned long long)coop::steamp2p::selfId();
+        const char* fake = getenv("KENSHICOOP_TEST_IDENTITY");
+        if (fake && fake[0]) self = _strtoui64(fake, 0, 10);
         char idb[24] = "";
         if (self != 0) { _snprintf(idb, sizeof(idb) - 1, "%llu", self); idb[sizeof(idb) - 1] = '\0'; }
         g_net.setIdentity(idb);

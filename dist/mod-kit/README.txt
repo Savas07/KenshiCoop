@@ -1,5 +1,5 @@
-﻿KenshiCoop v0.56.2 - co-op mod
-==============================
+﻿KenshiCoop v0.57 - co-op mod
+============================
 
 This zip contains ONE folder: "KenshiCoop". That folder IS the mod.
 
@@ -29,7 +29,9 @@ PLAY (Steam - recommended)
 --------------------------
   Kenshi's MAIN MENU has a MULTIPLAYER button: it opens the co-op lobby. Up to
   8 players (host + 7 friends); everyone needs this same release. Each player
-  drives one squad tab in join order (host = tab 1, first friend = tab 2, ...).
+  drives one squad tab (host = tab 1, first friend = tab 2, ...), named after
+  that player's Steam name. The save remembers who had which squad, so next
+  time everyone gets their own squad back whatever order you join in.
   1. HOST: main menu > MULTIPLAYER > HOST GAME. The lobby lists everyone in it
      (Steam name + avatar) and your online Steam friends (friends already in
      Kenshi first; < and > page through). Click INVITE next to each friend -
@@ -56,6 +58,10 @@ PLAY (Steam - recommended)
      a save never opens it - established characters are never re-rolled.
    * When a friend joins a new game, the host's world is first saved as
      "KenshiCoop YYYY-MM-DD HHMM" - it never overwrites an existing save.
+   * Squad tabs you renamed yourself keep your name.
+   * Before playing, check that the lobby window's top-right corner shows the
+     SAME version for everyone. Steam does not always fetch a Workshop update
+     right away: restart Steam, or unsubscribe and subscribe again.
 
 PLAY (Advanced - manual Steam ID or LAN / direct UDP)
 -----------------------------------------------------

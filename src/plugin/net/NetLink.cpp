@@ -99,7 +99,7 @@ NetLink::NetLink()
       thread_(0), running_(0), stopFlag_(0), myId_(0),
       sendEpoch_(0),
       steamPeer_(0),
-      simDelayMs_(0), simJitterMs_(0), simLossPct_(0) {
+      simDelayMs_(0), simJitterMs_(0), simLossPct_(0), reservedDirty_(0) {
     InitializeCriticalSection(&outCs_);
     for (u32 i = 0; i < MAX_PLAYERS; ++i) { peerUp_[i] = 0; peerSteam_[i] = 0; }
 }
@@ -307,6 +307,11 @@ void NetLink::queueLoadGo(const LoadGoPacket& pkt, u32 targetMask) {
     pushLocked(outCs_, outLoadGo_, og);
 }
 
+void NetLink::queueRoster(const RosterPacket& pkt, u32 targetMask) {
+    OutRoster r; r.pkt = pkt; r.mask = targetMask;
+    pushLocked(outCs_, outRoster_, r);
+}
+
 void NetLink::queueLoadReq(const LoadReqPacket& pkt) { pushLocked(outCs_, outLoadReq_, pkt); }
 
 void NetLink::queueLoadNack(const LoadNackPacket& pkt) { pushLocked(outCs_, outLoadNack_, pkt); }
@@ -405,6 +410,38 @@ u32 NetLink::allocPlayerId(const std::string& identity) {
         if (fallback == 0) fallback = id;
     }
     return fallback;
+}
+
+// Host (main thread): the identity -> player id table remembered with the save
+// (kenshicoop_players.txt), so a returning player gets their own squad tab back
+// whatever order everyone connects in. Applied by the net thread at session
+// start and whenever it changes (a save loaded while hosting).
+void NetLink::setReservedIds(const std::map<std::string, u32>& ids) {
+    EnterCriticalSection(&outCs_);
+    reservedIds_ = ids;
+    LeaveCriticalSection(&outCs_);
+    InterlockedExchange(&reservedDirty_, 1);
+}
+
+// NET thread: fold the reserved table into idByIdentity_. A connected player
+// keeps the id it already holds; everyone else is pinned to their reserved id.
+void NetLink::applyReservedIds() {
+    std::map<std::string, u32> ids;
+    EnterCriticalSection(&outCs_);
+    ids = reservedIds_;
+    LeaveCriticalSection(&outCs_);
+    unsigned int n = 0;
+    for (std::map<std::string, u32>::const_iterator it = ids.begin(); it != ids.end(); ++it) {
+        if (it->second == 0 || it->second >= MAX_PLAYERS) continue;
+        std::map<std::string, u32>::iterator cur = idByIdentity_.find(it->first);
+        if (cur != idByIdentity_.end() && idInUse_[cur->second]) continue; // connected now
+        idByIdentity_[it->first] = it->second;
+        ++n;
+    }
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "reserved player ids applied: %u", n);
+    b[sizeof(b) - 1] = '\0';
+    netLog(b);
 }
 
 // Deliver one received entity to the game thread, applying the WAN sim if enabled.
@@ -520,6 +557,8 @@ void NetLink::threadLoop() {
 
     for (u32 i = 0; i < MAX_PLAYERS; ++i) { idInUse_[i] = false; peerUp_[i] = 0; peerSteam_[i] = 0; }
     idByIdentity_.clear();
+    InterlockedExchange(&reservedDirty_, 0);
+    applyReservedIds();
     DWORD lastConnectAttempt = GetTickCount();
 
     // Wall-clock time-sync state (client only). The join pings every ~2 s; each
@@ -536,6 +575,7 @@ void NetLink::threadLoop() {
     u32           nextTx        = monoMs() + (u32)TICK_MS; // transmit slot (serviceUntil)
 
     while (!stopFlag_) {
+        if (InterlockedCompareExchange(&reservedDirty_, 0, 1) == 1) applyReservedIds();
         // Steam heartbeat: spike ping/echo + session-state change logging.
         // Cheap no-op when Steam isn't initialised (pure-UDP sessions).
         steamp2p::tick();
@@ -1085,6 +1125,14 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sa)
                             && inbound_) {
                             inbound_->pushSaveAck(sa.ownerId, sa);
+                        }
+                    } else if (!isHost_ && type == PKT_ROSTER) {
+                        // Who is player N (protocol 59, host -> join).
+                        RosterPacket rp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
+                            && inbound_) {
+                            rp.name[sizeof(rp.name) - 1] = '\0';
+                            inbound_->pushRoster(rp);
                         }
                     } else if (type == PKT_LOAD_GO) {
                         // Reliable coordinated-load order (protocol 32, host -> join).
@@ -1772,10 +1820,12 @@ void NetLink::threadLoop() {
         // stream must stay ordered behind its GO), and off CH_RELIABLE so they
         // do not queue behind - or ahead of - live game events.
         std::vector<OutLoadGo>      loadGos;
+        std::vector<OutRoster>      rosters;
         std::vector<LoadReqPacket>  loadReqs;
         std::vector<LoadNackPacket> loadNacks;
         EnterCriticalSection(&outCs_);
         loadGos.swap(outLoadGo_);
+        rosters.swap(outRoster_);
         loadReqs.swap(outLoadReq_);
         loadNacks.swap(outLoadNack_);
         LeaveCriticalSection(&outCs_);
@@ -1783,6 +1833,11 @@ void NetLink::threadLoop() {
             ENetPacket* out = enet_packet_create(&loadGos[i].pkt, sizeof(LoadGoPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             sendOut(out, CH_BULK, loadGos[i].mask);
+        }
+        for (size_t i = 0; i < rosters.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&rosters[i].pkt, sizeof(RosterPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_BULK, rosters[i].mask);
         }
         for (size_t i = 0; i < loadReqs.size(); ++i) {
             ENetPacket* out = enet_packet_create(&loadReqs[i], sizeof(LoadReqPacket),

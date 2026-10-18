@@ -62,7 +62,7 @@ only needed for LAN / direct-UDP games.)
 
 ### 1. Install the mod
 
-Grab `KenshiCoop-kit-v0.56.2.zip` from the
+Grab `KenshiCoop-kit-v0.57.zip` from the
 [latest release](https://github.com/Savas07/KenshiCoop/releases/latest) and
 unzip it anywhere (every player). You do not need to clone this repository -
 but if you did, the same kit is in [dist/mod-kit](dist/mod-kit).
@@ -113,12 +113,15 @@ re-read whenever you go ONLINE, so no restart is needed after an edit.
 
 ### Good to know
 
-- **You each control your own squad.** One squad tab per player, in join
-  order: the host runs squad 1, the first friend to join squad 2, the next
-  squad 3, and so on (a reconnecting friend gets the same squad back). Other
-  players' squads are visible and synced on your screen, but answer only to
-  them. Your save needs at least as many squad tabs as players - use a
-  Wanderer x8 start, or split units into extra squad tabs in-game.
+- **You each control your own squad.** One squad tab per player: the host runs
+  squad 1, the first friend to join squad 2, the next squad 3, and so on. Each
+  squad tab is named after the Steam name of the player who controls it, and the
+  save remembers who had which squad - next session everyone gets their own
+  squad back, whatever order you join in. Other players' squads are visible and
+  synced on your screen, but answer only to them. Your save needs at least as
+  many squad tabs as players - start with the matching Multiplayer start (the
+  lobby's NEW GAME picks it for you), or split units into extra squad tabs.
+  Tabs you renamed yourself keep your name.
 - **More than two players.** The host relays every player's state to the
   others, so the host's upload carries everyone - the host should have the
   best connection. A friend joining mid-game loads into the host's world; the

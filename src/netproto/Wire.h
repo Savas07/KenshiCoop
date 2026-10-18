@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 58;
+const u16 PROTOCOL_VERSION = 59;
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -88,7 +88,8 @@ enum PacketType {
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
     PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
     PKT_PEER_STATE       = 49,// RELIABLE roster edge: another join arrived/left (host -> joins, protocol 56); PeerStatePacket
-    PKT_CHARGEN          = 50 // RELIABLE join character-creation result (join -> host -> joins, protocol 57); CharGenHeader + tail
+    PKT_CHARGEN          = 50,// RELIABLE join character-creation result (join -> host -> joins, protocol 57); CharGenHeader + tail
+    PKT_ROSTER           = 51 // RELIABLE who is player N (host -> joins, protocol 59); RosterPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -167,6 +168,18 @@ struct PeerStatePacket {
     u8  type;    // = PKT_PEER_STATE
     u32 peerId;  // the join that arrived / left
     u8  present; // 1 = arrived, 0 = left
+};
+
+// Player roster row (protocol 59, host -> joins): player id N is this Steam user.
+// The host sends every known row when a join connects and when its world goes
+// live; each client names the squad tab player N drives after that player.
+// Rows survive across sessions through the save's kenshicoop_players.txt, which
+// also pins the player ids (returning players get their own squad tab back).
+struct RosterPacket {
+    u8                 type;     // = PKT_ROSTER
+    u32                playerId; // 0 = host
+    unsigned long long steamId;  // 0 = no Steam identity (LAN)
+    char               name[48]; // UTF-8 persona name ('\0'-padded)
 };
 
 // A reliable one-shot transition. 'subject' is the hand the event happened TO; the

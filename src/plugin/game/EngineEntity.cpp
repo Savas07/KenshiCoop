@@ -1321,6 +1321,71 @@ bool readObjectHand(RootObject* obj, unsigned int out[5]) {
     return true;
 }
 
+// ---- Squad tab naming (protocol 59) -------------------------------------------
+namespace {
+// The ActivePlatoon whose members' hand container is (cont, contSerial).
+ActivePlatoon* tabPlatoonSeh(GameWorld* gw, u32 cont, u32 contSerial) {
+    __try {
+        if (!gw || !gw->player) return 0;
+        unsigned int size = (unsigned int)gw->player->playerCharacters.size();
+        for (unsigned int i = 0; i < size; ++i) {
+            Character* c = gw->player->playerCharacters[i];
+            if (!c) continue;
+            const hand& h = c->handle;
+            if (h.container == cont && h.containerSerial == contSerial) return c->getPlatoon();
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+// Copy the tab's name and the player faction's name (out buffers, POD only).
+bool tabNamesSeh(GameWorld* gw, ActivePlatoon* p, char* tab, unsigned int tabCap,
+                 char* fac, unsigned int facCap) {
+    __try {
+        const std::string& n = p->getName();
+        strncpy(tab, n.c_str(), tabCap - 1); tab[tabCap - 1] = '\0';
+        fac[0] = '\0';
+        Faction* f = gw->player ? gw->player->getFaction() : 0;
+        if (f) { const std::string& fn = f->getName(); strncpy(fac, fn.c_str(), facCap - 1); fac[facCap - 1] = '\0'; }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool setTabNameSeh(ActivePlatoon* p, const std::string* name) {
+    __try { p->setName(*name); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// "<faction>" or "<faction>_<digits>": the name Kenshi gave the tab.
+bool isDefaultTabName(const std::string& n, const std::string& faction) {
+    if (faction.empty() || n.compare(0, faction.size(), faction) != 0) return false;
+    if (n.size() == faction.size()) return true;
+    if (n[faction.size()] != '_' || n.size() == faction.size() + 1) return false;
+    for (size_t i = faction.size() + 1; i < n.size(); ++i) if (n[i] < '0' || n[i] > '9') return false;
+    return true;
+}
+// "<r>" or "<r> <digits>" for a name this mod gave (the " 2" duplicate suffix).
+bool isModTabName(const std::string& n, const std::string& r) {
+    if (r.empty() || n.compare(0, r.size(), r) != 0) return false;
+    if (n.size() == r.size()) return true;
+    if (n[r.size()] != ' ' || n.size() == r.size() + 1) return false;
+    for (size_t i = r.size() + 1; i < n.size(); ++i) if (n[i] < '0' || n[i] > '9') return false;
+    return true;
+}
+} // namespace
+
+int renameSquadTab(GameWorld* gw, u32 cont, u32 contSerial, const std::string& name,
+                   const std::vector<std::string>& replaceable, std::string* curOut) {
+    ActivePlatoon* p = tabPlatoonSeh(gw, cont, contSerial);
+    if (!p) return -1;
+    char tab[128], fac[128];
+    if (!tabNamesSeh(gw, p, tab, sizeof(tab), fac, sizeof(fac))) return -1;
+    const std::string cur(tab);
+    if (curOut) *curOut = cur;
+    if (cur == name) return 0;
+    bool replace = isDefaultTabName(cur, fac);
+    for (size_t i = 0; !replace && i < replaceable.size(); ++i) replace = isModTabName(cur, replaceable[i]);
+    if (!replace) return 0;
+    if (!setTabNameSeh(p, &name)) return -1;
+    return 1;
+}
+
 // ---- In-game co-op session panel + status overlay --------------------------
 // Moved to EngineUi.cpp (Phase 5e code motion): the DatapanelGUI panel (clipboard
 // helpers, CoopPanelUi state, button callbacks, panelBuildSeh/uiPanelArmSeh/
