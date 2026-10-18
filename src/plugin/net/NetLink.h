@@ -223,6 +223,9 @@ public:
     // a returning player is given their own squad tab back (any connect order).
     // Thread-safe; applied at session start and whenever it changes.
     void setReservedIds(const std::map<std::string, u32>& ids);
+    // Host, MAIN thread: squad tab count of the live world, so a newcomer gets an
+    // id that has a squad (an absent player's tab before a tab-less id).
+    void setTabCount(u32 n);
     // MAIN thread (host): which player ids are held by a connected join right
     // now, and the steamid64 of that join from its HELLO identity token (0 = a
     // join without Steam). Valid at the title screen too, before the session
@@ -398,6 +401,7 @@ private:
     // setReservedIds hand-off (guarded by outCs_) and its NET-thread application.
     std::map<std::string, u32> reservedIds_;
     volatile LONG              reservedDirty_;
+    volatile LONG              tabCount_;
     void applyReservedIds();
 
     HANDLE        thread_;

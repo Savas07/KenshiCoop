@@ -62,7 +62,7 @@ only needed for LAN / direct-UDP games.)
 
 ### 1. Install the mod
 
-Grab `KenshiCoop-kit-v0.57.zip` from the
+Grab `KenshiCoop-kit-v0.57.1.zip` from the
 [latest release](https://github.com/Savas07/KenshiCoop/releases/latest) and
 unzip it anywhere (every player). You do not need to clone this repository -
 but if you did, the same kit is in [dist/mod-kit](dist/mod-kit).
@@ -117,7 +117,8 @@ re-read whenever you go ONLINE, so no restart is needed after an edit.
   squad 1, the first friend to join squad 2, the next squad 3, and so on. Each
   squad tab is named after the Steam name of the player who controls it, and the
   save remembers who had which squad - next session everyone gets their own
-  squad back, whatever order you join in. Other players' squads are visible and
+  squad back, whatever order you join in. Someone new playing instead of a
+  regular takes over the absent player's squad. Other players' squads are visible and
   synced on your screen, but answer only to them. Your save needs at least as
   many squad tabs as players - start with the matching Multiplayer start (the
   lobby's NEW GAME picks it for you), or split units into extra squad tabs.

@@ -99,7 +99,7 @@ NetLink::NetLink()
       thread_(0), running_(0), stopFlag_(0), myId_(0),
       sendEpoch_(0),
       steamPeer_(0),
-      simDelayMs_(0), simJitterMs_(0), simLossPct_(0), reservedDirty_(0) {
+      simDelayMs_(0), simJitterMs_(0), simLossPct_(0), reservedDirty_(0), tabCount_(0) {
     InitializeCriticalSection(&outCs_);
     for (u32 i = 0; i < MAX_PLAYERS; ++i) { peerUp_[i] = 0; peerSteam_[i] = 0; }
 }
@@ -391,26 +391,54 @@ void NetLink::sendPeerState(u32 peerId, bool present, u32 targetMask) {
 
 // NET thread (host): pick the player id for a HELLO. An identity seen earlier
 // this session gets its old id back when that id is free (reconnect = same
-// squad tab); otherwise the lowest id that is neither in use nor reserved by
-// another identity, falling back to the lowest free one. 0 = session full.
+// squad tab). Ids >= the host's squad tab count (setTabCount) have no squad to
+// drive, so the order is: own reserved id that has a tab; a free unreserved id
+// with a tab; a free id with a tab reserved by a player who is not here (the
+// tab passes to the newcomer - its reservation moves to them, so the roster and
+// tab name follow the person actually playing it); own reserved id without a
+// tab; any free id. 0 = session full.
 u32 NetLink::allocPlayerId(const std::string& identity) {
+    const u32 tabs = (u32)tabCount_ ? (u32)tabCount_ : MAX_PLAYERS; // 0 = unknown: all count
+    u32 own = 0;
     if (!identity.empty()) {
         std::map<std::string, u32>::const_iterator it = idByIdentity_.find(identity);
-        if (it != idByIdentity_.end() && !idInUse_[it->second]) return it->second;
+        if (it != idByIdentity_.end() && !idInUse_[it->second]) own = it->second;
     }
-    u32 fallback = 0;
+    if (own != 0 && own < tabs) return own;
+    u32 borrow = 0, spare = 0;
     for (u32 id = 1; id < MAX_PLAYERS; ++id) {
         if (idInUse_[id]) continue;
         bool reserved = false;
         for (std::map<std::string, u32>::const_iterator it = idByIdentity_.begin();
              it != idByIdentity_.end(); ++it) {
-            if (it->second == id) { reserved = true; break; }
+            if (it->second == id && it->first != identity) { reserved = true; break; }
         }
-        if (!reserved) return id;
-        if (fallback == 0) fallback = id;
+        if (id < tabs) {
+            if (!reserved) return id;
+            if (borrow == 0) borrow = id;
+        } else if (spare == 0 && !reserved) {
+            spare = id;
+        }
     }
-    return fallback;
+    if (borrow != 0) {
+        for (std::map<std::string, u32>::iterator it = idByIdentity_.begin(); it != idByIdentity_.end(); ) {
+            if (it->second == borrow && it->first != identity) idByIdentity_.erase(it++); else ++it;
+        }
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "player id %u: absent player's squad tab passes to the newcomer", borrow);
+        b[sizeof(b) - 1] = '\0';
+        netLog(b);
+        return borrow;
+    }
+    if (own != 0) return own;
+    if (spare != 0) return spare;
+    for (u32 id = 1; id < MAX_PLAYERS; ++id) if (!idInUse_[id]) return id;
+    return 0;
 }
+
+// Host (main thread): how many squad tabs the live world has (ids 1..n-1 can
+// drive one). 0 = unknown.
+void NetLink::setTabCount(u32 n) { InterlockedExchange(&tabCount_, (LONG)n); }
 
 // Host (main thread): the identity -> player id table remembered with the save
 // (kenshicoop_players.txt), so a returning player gets their own squad tab back

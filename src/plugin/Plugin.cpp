@@ -2472,6 +2472,13 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     tickCharGen(gw, worldLive);
     // Squad tab names after the players who drive them (protocol 59).
     if (worldLive) applySquadNames(gw);
+    // Host: tell the net layer how many squad tabs exist, so a newcomer gets an
+    // id with a squad (protocol 59 id allocation).
+    if (worldLive && g_cfg.isHost) {
+        std::vector<std::pair<std::pair<coop::u32, coop::u32>, coop::u32> > tabs;
+        g_repl.sharedTabs(tabs);
+        if (!tabs.empty()) g_net.setTabCount((coop::u32)tabs.size());
+    }
 
     // Coordinated save + load (protocols 31/32): run under g_gameStarted (NOT
     // worldLive) so they keep pumping DURING a world swap - they only touch net
