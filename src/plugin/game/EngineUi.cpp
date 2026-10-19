@@ -153,6 +153,99 @@ void markerDestroy(void* label) {
     markerDestroySeh(g, (ScreenLabel*)label);
 }
 
+// ---- Dev overlay labels (devtools/DevOverlay.cpp) ----------------------------
+// The dev overlay needs two things the Replicator's markers do not: a caption
+// pinned at a caller-chosen height (so it can sit above a KENSHICOOP_DEBUG_MARKERS
+// head label when both are on), and labels parked at a FIXED world point (the
+// pelvis bone / the Havok body) that it moves every tick.
+//
+// Fixed labels ride ScreenLabel::setPosition. Disassembly of the Steam build
+// (ScreenLabel vtable located via RTTI; slot 0x18 setPosition, slot 0x08
+// update, 2026-10-19): setPosition stores the point, copies the NULL hand
+// (type 11) into trackingHandle and zeroes trackingOffset; update() skips the
+// handle resolve for type 11 and projects position + risingHeight directly.
+// So an untracked label never self-destroys for "target gone" (a TRACKED label
+// destroys itself the frame its handle stops resolving) - the only remaining
+// self-destroy is risingHeight passing its limit, which RS_STOPPED (speed 0)
+// never reaches. The GUI can still drop every label on a world teardown, so
+// all entry points re-ask the registry (markerAlive) before dereferencing.
+
+namespace {
+
+ScreenLabel* markerCreateFixedSeh(ForgottenGUI* g, const std::string* text,
+                                  const MyGUI::Colour* col, const Ogre::Vector3* p) {
+    __try {
+        ScreenLabel* l = g->createScreenLabel(*text, *col, ScreenLabel::LS_SMALL,
+                                              ScreenLabel::RS_STOPPED);
+        if (l) {
+            l->_NV_setRisingSpeed(ScreenLabel::RS_STOPPED);
+            l->_NV_setPosition(*p);
+        }
+        return l;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// setVisible is a plain byte store the next update() forwards to the widget;
+// hiding instead of destroying keeps a label that flickers around the
+// overlay's show threshold from churning the GUI's add/remove queues.
+bool markerPlaceSeh(ScreenLabel* l, const Ogre::Vector3* p, bool visible) {
+    __try {
+        l->_NV_setPosition(*p);
+        l->_NV_setVisible(visible);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// setCaption assigns ScreenLabel::caption immediately (the widget text follows
+// on the next update), so the field is an exact record of the last caption set.
+bool markerCaptionIsSeh(const ScreenLabel* l, const char* text, unsigned int n) {
+    __try {
+        if (l->destroyed) return false;
+        if (l->caption.size() != n) return false;
+        const char* s = l->caption.c_str();
+        for (unsigned int i = 0; i < n; ++i)
+            if (s[i] != text[i]) return false;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+} // namespace
+
+void* markerCreateTracked(Character* c, const char* text, int colorId, float offY) {
+    if (!c || !text) return 0;
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return 0;
+    std::string t(text);
+    MyGUI::Colour col;
+    markerColour(colorId, &col);
+    Ogre::Vector3 off(0.0f, offY, 0.0f);
+    return markerCreateSeh(g, c, &t, &col, &off);
+}
+
+void* markerCreateFixed(const char* text, int colorId, float x, float y, float z) {
+    if (!text) return 0;
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return 0;
+    std::string t(text);
+    MyGUI::Colour col;
+    markerColour(colorId, &col);
+    Ogre::Vector3 p(x, y, z);
+    return markerCreateFixedSeh(g, &t, &col, &p);
+}
+
+bool markerPlace(void* label, float x, float y, float z, bool visible) {
+    if (!label || !markerAlive(label)) return false;
+    Ogre::Vector3 p(x, y, z);
+    return markerPlaceSeh((ScreenLabel*)label, &p, visible);
+}
+
+bool markerCaptionIs(void* label, const char* text) {
+    if (!label || !text || !markerAlive(label)) return false;
+    unsigned int n = 0;
+    while (text[n]) ++n;
+    return markerCaptionIsSeh((const ScreenLabel*)label, text, n);
+}
+
 // ---- In-game co-op session panel (spike-50 DatapanelGUI stack) ---------------
 // A native DatapanelGUI window toggled with F2, built only from BUTTON and text
 // rows (buttons are the only DatapanelGUI control with a callable RVA callback;

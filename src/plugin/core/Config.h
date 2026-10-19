@@ -339,6 +339,18 @@ struct Config {
     // trailing to the 150 u snap. 0 = walk drive + snap gate only.
     bool          glide;
 
+    // Developer tools (docs/DEVTOOLS.md), coop_config.json / env:
+    //   devtools (KENSHICOOP_DEVTOOLS)        master switch, default OFF
+    //   devOverlay (KENSHICOOP_DEV_OVERLAY)   in-world debug markers at start (Ctrl+F9 toggles)
+    //   devRecord (KENSHICOOP_DEV_RECORD)     record every session's packets to kc_records\
+    //   devWatchdog (KENSHICOOP_DEV_WATCHDOG) desync rules + dumps to kc_dumps\ (default on with devtools)
+    //   devPort (KENSHICOOP_DEV_PORT)         telemetry UDP target on 127.0.0.1 (default 27850)
+    bool          devtools;
+    bool          devOverlay;
+    bool          devRecord;
+    bool          devWatchdog;
+    int           devTelemetryPort;
+
     // KENSHICOOP_FURN_SYNC (default ON): furniture-occupancy sync (protocol 19)
     // - reliable bed/cage enter/exit edges + self-healing occupancy state,
     // executed engine-native (setBedMode/setPrisonMode) between each machine's

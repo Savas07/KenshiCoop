@@ -36,6 +36,8 @@ class RootObject;
 
 namespace coop {
 
+struct DevBody;   // devtools/DevTools.h
+
 // "No known author" for a stream-keyed record (a Driven placeholder an event
 // created before any sample, a spawn REQ with no recorded target). Never a
 // player id: ids are 0..MAX_PLAYERS-1.
@@ -163,6 +165,14 @@ public:
     // native on each machine's local pair. KENSHICOOP_CARRY_SYNC=0 disables.
     void setCarrySync(bool v) { carrySync_ = v; }
     void setGlide(bool v) { glide_ = v; }
+
+    // Developer tools (devtools/DevTools.h): every player-squad character as
+    // this client sees it this tick - own bodies from the local squad, driven
+    // ones with the drive state applyTargets recorded. Main thread, after
+    // applyTargets. Only called when the devtools are on.
+    void devSnapshot(GameWorld* gw, std::vector<DevBody>& out);
+    float devTimeSlew() const { return timeSlew_; }
+    float devSpeed() const { return speedLastSet_; }   // < 0 = no consensus yet
 
     // Peer-left sweep (carried-body sync): any driven copy still carrying a body
     // after its AUTHOR disconnected gets a local drop, so the carried body is
@@ -933,6 +943,12 @@ private:
         unsigned long glideStallSinceMs;        // copy has not left the anchor since (0 = off)
         bool          glideActive;    // in the glide regime (edge log + walk re-issue)
         unsigned long glideFrames;    // frames of the current glide episode
+        // Devtools drive record (written by applyTargets every driven tick):
+        int           dbgRegime;      // DevRegime of the branch taken
+        unsigned long dbgMs;          // tick it was written
+        float         dbgGap, dbgVlen;
+        float         dbgNx, dbgNy, dbgNz;  // newest stream sample
+        bool          dbgHaveNewest;
         unsigned long carryNoSeeTick; // first tick a locally-carrying copy's stream
                                       //   stopped reporting TASK_CARRY_BODY (the
                                       //   debounced host-side-drop detector)
@@ -1033,6 +1049,8 @@ private:
                    carryHealTick(0), physHealTick(0), getUpHealTick(0),
                    glideUntilMs(0), glideFastSinceMs(0), glideStallX(0), glideStallZ(0),
                    glideStallSinceMs(0), glideActive(false), glideFrames(0),
+                   dbgRegime(0), dbgMs(0), dbgGap(0), dbgVlen(0), dbgNx(0), dbgNy(0), dbgNz(0),
+                   dbgHaveNewest(false),
                    carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
                    haveChainOwner(false), chainHealTick(0),

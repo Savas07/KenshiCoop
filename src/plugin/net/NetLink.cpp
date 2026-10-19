@@ -3,6 +3,7 @@
 #include "NetLink.h"
 #include "SteamP2P.h"
 #include "../CoopLog.h"
+#include "../devtools/PacketRecorder.h"
 
 #include <cstring>
 #include <cstdio>
@@ -77,6 +78,25 @@ int serviceUntil(ENetHost* h, ENetEvent* ev, u32 deadline) {
     if (rem < 0) rem = 0;
     if (rem > TICK_MS) rem = TICK_MS;
     return enet_host_service(h, ev, (enet_uint32)rem);
+}
+
+// Packet recorder taps (devtools/PacketRecorder.h). Each is one interlocked
+// read when no .kcrec file is open, so the hot send/receive paths stay free.
+// recordSend is called BEFORE enet_peer_send: the packet is still ours (and
+// unfragmented) there, and the bytes are what the application handed ENet.
+void recordSend(const ENetPacket* p, u32 peerId, enet_uint8 ch) {
+    if (!p || !rec::active()) return;
+    rec::packet(rec::DIR_OUT, peerId, ch, (p->flags & ENET_PACKET_FLAG_RELIABLE) ? 1u : 0u,
+                p->data, (unsigned)p->dataLength);
+}
+// Host side: the sender's player id (0 = connected but HELLO not yet answered,
+// which is exactly what a HELLO arrives as). Join side: always the host (0).
+void recordReceive(const ENetEvent& ev, bool isHost) {
+    if (!rec::active()) return;
+    const u32 from = isHost ? (u32)(size_t)ev.peer->data : 0u;
+    rec::packet(rec::DIR_IN, from, ev.channelID,
+                (ev.packet->flags & ENET_PACKET_FLAG_RELIABLE) ? 1u : 0u,
+                ev.packet->data, (unsigned)ev.packet->dataLength);
 }
 
 // The fixed-POD queueX methods are all the same MAIN-thread enqueue: take the
@@ -355,10 +375,12 @@ bool relayToJoins(u8 type) {
 
 void NetLink::sendOut(ENetPacket* out, enet_uint8 ch, u32 targetMask, ENetPeer* except) {
     if (!isHost_) {
-        if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED)
+        if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+            recordSend(out, 0, ch);
             enet_peer_send(serverPeer_, ch, out);
-        else
+        } else {
             enet_packet_destroy(out); // no one to send to yet
+        }
         return;
     }
     for (size_t i = 0; i < enetHost_->peerCount; ++i) {
@@ -367,11 +389,15 @@ void NetLink::sendOut(ENetPacket* out, enet_uint8 ch, u32 targetMask, ENetPeer* 
         u32 id = (u32)(size_t)p->data;
         if (id == 0) continue; // HELLO not answered yet: not a session member
         if ((targetMask & peerBit(id)) == 0) continue;
+        // A targeted send is recorded per recipient; a send to everyone is
+        // recorded once below as PEER_ANY (one copy, not one per join).
+        if (targetMask != PEER_MASK_ALL) recordSend(out, id, ch);
         enet_peer_send(p, ch, out);
     }
     // ENet refcounts a packet per queued send; an unsent one is ours to free
     // (the same rule enet_host_broadcast applies).
     if (out->referenceCount == 0) enet_packet_destroy(out);
+    else if (targetMask == PEER_MASK_ALL) recordSend(out, rec::PEER_ANY, ch);
 }
 
 void NetLink::relay(const ENetEvent& ev) {
@@ -575,6 +601,17 @@ void NetLink::threadLoop() {
         else              netLog("connecting");
     }
 
+    // Packet recorder: one .kcrec per net-thread session when armed (no-op
+    // otherwise). Begun only once the ENet host exists, so a failed create
+    // leaves no empty file; ended after enet_host_destroy at thread exit.
+    {
+        char note[64];
+        if (isHost_) _snprintf(note, sizeof(note) - 1, "host port=%d%s", port_, steam ? " steam" : "");
+        else         _snprintf(note, sizeof(note) - 1, "join %s:%d%s", ip_.c_str(), port_, steam ? " steam" : "");
+        note[sizeof(note) - 1] = '\0';
+        rec::sessionBegin(isHost_, note);
+    }
+
     // Steam's unreliable P2P packets cap at 1200 bytes; clamp the MTU so every
     // ENet datagram (including fragments of large reliable packets) fits one
     // P2P packet. Set before any peer negotiates its own MTU from ours.
@@ -652,12 +689,16 @@ void NetLink::threadLoop() {
                         h.type = (u8)PKT_HELLO; h.version = PROTOCOL_VERSION; h.nameLen = (u8)nameLen;
                         std::memcpy(out->data, &h, sizeof(h));
                         if (nameLen > 0) std::memcpy(out->data + sizeof(h), identity_.data(), nameLen);
+                        recordSend(out, 0, CH_RELIABLE);
                         enet_peer_send(ev.peer, CH_RELIABLE, out);
                         netLog("connected to host; sent HELLO");
                     }
                     break;
                 }
                 case ENET_EVENT_TYPE_RECEIVE: {
+                    // Record before any early drop below, so a pre-WELCOME
+                    // packet (peer 0) and the HELLO itself are in the file.
+                    recordReceive(ev, isHost_);
                     const u8 type = packetType(ev.packet->data, (unsigned)ev.packet->dataLength);
                     if (isHost_ && type != PKT_HELLO) {
                         // Only a welcomed join is a session member: drop what it
@@ -707,6 +748,7 @@ void NetLink::threadLoop() {
                                 w.type = (u8)PKT_WELCOME; w.version = PROTOCOL_VERSION; w.playerId = id;
                                 ENetPacket* out =
                                     enet_packet_create(&w, sizeof(w), ENET_PACKET_FLAG_RELIABLE);
+                                recordSend(out, id, CH_RELIABLE);
                                 enet_peer_send(ev.peer, CH_RELIABLE, out);
                                 // Roster: the other joins learn the newcomer, and the
                                 // newcomer learns every join already here (after its
@@ -1214,6 +1256,7 @@ void NetLink::threadLoop() {
                             po.echoWallMs = tp.senderWallMs;
                             po.responderWallMs = (u32)coop::wallClockMs();
                             ENetPacket* out = enet_packet_create(&po, sizeof(po), 0 /*unreliable*/);
+                            recordSend(out, (u32)(size_t)ev.peer->data, CH_UNRELIABLE);
                             enet_peer_send(ev.peer, CH_UNRELIABLE, out);
                         }
                     } else if (type == PKT_TIME_PONG) {
@@ -1291,6 +1334,7 @@ void NetLink::threadLoop() {
                 tp.nonce = pingNonce++;
                 tp.senderWallMs = (u32)coop::wallClockMs();
                 ENetPacket* out = enet_packet_create(&tp, sizeof(tp), 0 /*unreliable*/);
+                recordSend(out, 0, CH_UNRELIABLE);
                 enet_peer_send(serverPeer_, CH_UNRELIABLE, out);
             }
             if (syncSamples > 0 && (lastClockLog == 0 || nowTick - lastClockLog >= 5000)) {
@@ -1916,6 +1960,7 @@ void NetLink::threadLoop() {
 
     if (enetHost_) { enet_host_destroy(enetHost_); enetHost_ = 0; }
     if (steam) steamp2p::removeEnetHooks();
+    rec::sessionEnd();
     InterlockedExchange(&running_, 0);
 }
 

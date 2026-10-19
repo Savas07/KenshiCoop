@@ -212,6 +212,17 @@ void loadConfig(Config& c) {
         std::string g = envOr("KENSHICOOP_GLIDE", fileOr(f, "glide", "1").c_str());
         c.glide = !(g == "0" || g == "false" || g == "off");
     }
+    // Developer tools (docs/DEVTOOLS.md). Master switch "devtools" (default OFF:
+    // no sockets, hooks, files or per-tick probes); the rest refine it.
+    {
+        struct Flag { static bool on(const std::string& v) { return v == "1" || v == "true" || v == "on"; } };
+        c.devtools    = Flag::on(envOr("KENSHICOOP_DEVTOOLS",     fileOr(f, "devtools", "0").c_str()));
+        c.devOverlay  = Flag::on(envOr("KENSHICOOP_DEV_OVERLAY",  fileOr(f, "devOverlay", "0").c_str()));
+        c.devRecord   = Flag::on(envOr("KENSHICOOP_DEV_RECORD",   fileOr(f, "devRecord", "0").c_str()));
+        c.devWatchdog = Flag::on(envOr("KENSHICOOP_DEV_WATCHDOG", fileOr(f, "devWatchdog", "1").c_str()));
+        c.devTelemetryPort = std::atoi(envOr("KENSHICOOP_DEV_PORT", fileOr(f, "devPort", "27850").c_str()).c_str());
+        if (!c.devtools) { c.devOverlay = false; c.devRecord = false; c.devWatchdog = false; }
+    }
 
     // Furniture occupancy sync (protocol 19, DEFAULT ON): reliable enter/exit
     // edges + self-healing BODY_IN_BED/BODY_IN_CAGE state, executed engine-
@@ -447,7 +458,7 @@ std::string describeConfig(const Config& c) {
         { "med",     c.medSync },      { "speed",   c.speedSync },
         { "speedCombatCap", c.speedCombatCap },
         { "stats",   c.statsSync },    { "carry",   c.carrySync },
-        { "glide",   c.glide },
+        { "glide",   c.glide },        { "devtools", c.devtools },
         { "furn",    c.furnSync },     { "chain",   c.chainSync },
         { "stealth", c.stealthSync },  { "prone",   c.proneSync },
         { "money",   c.moneySync },

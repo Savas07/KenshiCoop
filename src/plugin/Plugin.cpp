@@ -37,6 +37,8 @@
 #include "net/SteamInvite.h"
 #include "game/Engine.h"
 #include "game/EngineUi.h"       // Phase 5a: F2 co-op panel + status overlay
+#include "devtools/DevTools.h"   // developer tools (docs/DEVTOOLS.md), off unless "devtools": 1
+#include "devtools/PacketRecorder.h"
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
@@ -2184,6 +2186,29 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         g_repl.syncCamHint(gw, g_inbound, g_net, g_net.localId());
         g_repl.syncCellClaims(gw, g_inbound, g_net, g_net.localId());
         trackMove(gw);
+        // Developer tools: snapshot + telemetry/watchdog/overlay (off = no work).
+        if (coop::dev::enabled()) {
+            static std::vector<coop::DevBody> s_devBodies; // main thread only
+            g_repl.devSnapshot(gw, s_devBodies);
+            coop::DevGlobal dg;
+            dg.isHost = g_cfg.isHost;
+            dg.localId = g_net.localId();
+            dg.peers = 0;
+            if (g_cfg.isHost) {
+                for (coop::u32 id = 1; id < coop::MAX_PLAYERS; ++id)
+                    if (g_net.peerConnected(id)) ++dg.peers;
+            } else if (g_peerPresent) {
+                dg.peers = 1;
+            }
+            dg.netRunning = g_net.isRunning();
+            dg.worldLive = true;
+            dg.timeSlew = g_repl.devTimeSlew();
+            dg.speed = g_repl.devSpeed();
+            dg.paused = dg.speed >= 0.0f && dg.speed < 0.001f;
+            coop::dev::tick(gw, g_repl, s_devBodies, dg);
+        }
+    } else if (coop::dev::enabled()) {
+        coop::dev::idleTick();
     }
 }
 
@@ -2694,6 +2719,7 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     sessionResetForUi();
 
     g_cfg.isHost    = isHost;
+    coop::dev::setRole(isHost);
     coop::logSetTag(isHost ? "HOST" : "JOIN");
     g_cfg.transport = useSteam ? "steam" : "udp";
     // Re-read the UDP endpoint (ip/port) from coop_config.json so editing it then
@@ -3205,6 +3231,33 @@ __declspec(dllexport) void startPlugin() {
     }
 
     logStartupBanner();
+
+    // Developer tools (docs/DEVTOOLS.md): off unless coop_config.json
+    // "devtools": 1. Files go next to the log (kc_records\, kc_dumps\).
+    {
+        std::string dir = g_cfg.logPath;
+        size_t cut = dir.find_last_of("\\/");
+        dir = (cut == std::string::npos) ? std::string(".") : dir.substr(0, cut);
+        coop::dev::DevConfig dc;
+        dc.enabled = g_cfg.devtools;
+        dc.overlay = g_cfg.devOverlay;
+        dc.record = g_cfg.devRecord;
+        dc.watchdog = g_cfg.devWatchdog;
+        dc.telemetryPort = g_cfg.devTelemetryPort;
+        dc.isHost = g_cfg.isHost;
+        dc.baseDir = dir;
+        dc.version = KENSHICOOP_VERSION;
+        coop::dev::init(dc);
+        if (g_cfg.devRecord) coop::rec::arm((dir + "\\kc_records").c_str(), KENSHICOOP_VERSION);
+        if (g_cfg.devtools) {
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "[dev] devtools ON overlay=%d record=%d watchdog=%d port=%d dir='%s'",
+                      g_cfg.devOverlay ? 1 : 0, g_cfg.devRecord ? 1 : 0, g_cfg.devWatchdog ? 1 : 0,
+                      g_cfg.devTelemetryPort, dir.c_str());
+            b[sizeof(b) - 1] = '\0';
+            coopLog(b);
+        }
+    }
 
     // Hook the main-thread tick FIRST (early-return on failure), then wire the
     // replicator, engine detours and UI hooks as named install phases.

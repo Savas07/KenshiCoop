@@ -203,6 +203,10 @@ scenario, and produces a numeric PASS/FAIL verdict from the two logs.
 `regress.ps1` runs the scenario regression suite. See
 [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md) Parts D-E for details.
 
+Sync debugging tools (in-world markers, live dashboard, desync watchdog,
+packet recording and replay) are built into every DLL and switched on with
+`"devtools": 1` in `coop_config.json` - see [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
+
 ## Credits
 
 - [BFrizzleFoShizzle](https://github.com/BFrizzleFoShizzle) - RE_Kenshi and

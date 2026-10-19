@@ -63,6 +63,9 @@ tools/baseline/
 # Downloaded toolchain installers (large Microsoft binaries)
 tools/*.exe
 
+# Devkit replay tool build output (tools/devkit/replay/build.cmd)
+tools/devkit/replay/bin/
+
 # Root-level run logs (build/deploy/run drivers)
 /*.log
 

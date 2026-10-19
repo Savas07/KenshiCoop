@@ -355,6 +355,21 @@ void  markerDestroy(void* label);
 // this before dereferencing and callers holding a handle across ticks should
 // too. Cheap (a pointer scan of the GUI's own label registry).
 bool  markerAlive(void* label);
+// Dev overlay labels (devtools/DevOverlay.cpp). Same ScreenLabel substrate and
+// lifetime rules as the marker* family above (every call re-asks markerAlive;
+// markerUpdate/markerDestroy/markerAlive work on these handles too).
+// markerCreateTracked: markerCreate with the head offset chosen by the caller.
+// markerCreateFixed: an UNTRACKED label at world (x,y,z); ScreenLabel::setPosition
+//   detaches it from any hand, so it never self-destroys for a missing target.
+// markerPlace: move a label to (x,y,z) (this also untracks it) and show/hide it;
+//   false when the label is dead or faulted.
+// markerCaptionIs: alive AND its caption equals text exactly. An identity check
+//   for handles held across ticks: a recycled label address passes markerAlive
+//   but not this, so callers can drop the handle without touching a stranger's.
+void* markerCreateTracked(Character* c, const char* text, int colorId, float offY);
+void* markerCreateFixed(const char* text, int colorId, float x, float y, float z);
+bool  markerPlace(void* label, float x, float y, float z, bool visible);
+bool  markerCaptionIs(void* label, const char* text);
 
 // ---- In-game co-op session panel ---------------------------------------------
 // Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,

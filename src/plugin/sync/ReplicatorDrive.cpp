@@ -12,6 +12,7 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../devtools/DevTools.h"   // DevRegime tags on the drive record
 
 namespace coop {
 
@@ -286,10 +287,12 @@ void Replicator::applyTargets(GameWorld* gw) {
             if (engine::readPos(c, &hx, &hy, &hz) &&
                 weAuthor(gw, localId_, hx, hz)) {
                 ++hostDriveRefusals_;
+                d.dbgRegime = DR_REFUSED; d.dbgMs = now;
                 continue;
             }
         }
         drivenChars_.insert(c);
+        d.dbgRegime = DR_NONE; d.dbgMs = now;
         drivenSeen_[c] = now; // recently-driven grace for the authority passes
         canonicalOf_[c] = it->first; // capture translation (combat subjects)
         debugMark(c, 0, "DRV");
@@ -488,6 +491,7 @@ void Replicator::applyTargets(GameWorld* gw) {
             // not have an upright frame either. No attach, no carve-out: fall
             // through and let the down path knock it down and co-locate it.
             if (locallyCarried) {
+                d.dbgRegime = DR_CARRIED;
                 // Quiet the passenger's own AI like every other carve-out that
                 // skips the drive (the furniture branch below, and the main path
                 // at the walk-drive). This `continue` used to leave a driven
@@ -730,6 +734,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 }
                 d.parked = false; d.haveDest = false;
                 if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                d.dbgRegime = DR_FURN;
                 continue;
             } else if (localKind == 1 && hostMoving) {
                 // Bed fast-exit (conscious sleep wake): a bed pose has NO
@@ -810,6 +815,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                     d.furnNoSeeTick = 0; // never self-heal-eject a host placement
                     d.parked = false; d.haveDest = false;
                     if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                    d.dbgRegime = DR_FURN;
                     continue;
                 }
                 if (d.furnNoSeeTick == 0) {
@@ -826,6 +832,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // the debounced exit (or a fresh stream bit) resolves it.
                 d.parked = false; d.haveDest = false;
                 if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                d.dbgRegime = DR_FURN;
                 continue;
             } else {
                 d.furnNoSeeTick = 0;
@@ -868,6 +875,7 @@ void Replicator::applyTargets(GameWorld* gw) {
             if (haveActual && dist3(ax, ay, az, out.x, out.y, out.z) > 2.0f)
                 engine::applyRaw(c, out);
             d.downApplied = true;
+            d.dbgRegime = DR_DOWN;
             d.parked = false; d.haveDest = false;
             if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
             continue;
@@ -994,6 +1002,7 @@ void Replicator::applyTargets(GameWorld* gw) {
         // AI-suspend path below (their AI must run to animate), reached only via this
         // early `continue`.
         if (coop::taskIsCombat(out.task)) {
+            d.dbgRegime = DR_COMBAT;
             bool hostWaiting = coop::taskIsCombatWait(out.task);
             d.combatSeenTick = now; // feeds the disarm debounce below
             // Detach only WORLD NPCs from their town AI. A driven SQUAD member must
@@ -1302,6 +1311,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                     if (ok) haveCr = engine::readCarry(c, &lcr);
                 }
                 if (!isSquad && haveCr && lcr.carrying) {
+                    d.dbgRegime = DR_CARRIER;
                     // NPC carrier with a live local attach: position band only.
                     // Under the soft band the local carry walk owns the feet;
                     // drifted past it, converge with a real walk (walkTo keeps
@@ -1488,6 +1498,8 @@ void Replicator::applyTargets(GameWorld* gw) {
         if (segMs * 5 > moveHold) moveHold = segMs * 5; // survive sample droughts
         if (moveHold > 5000) moveHold = 5000;
         float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
+        d.dbgGap = gapNewest; d.dbgVlen = vlen; d.dbgHaveNewest = haveNewest;
+        if (haveNewest) { d.dbgNx = newest.x; d.dbgNy = newest.y; d.dbgNz = newest.z; }
         // Consensus sim paused (protocol 25 speed SET 0). Nothing local moves -
         // neither our walk orders nor, measurably, our teleports: the
         // 2026-10-17 Steam session hard-snapped 'Plank' every frame for 5 s of
@@ -1858,6 +1870,7 @@ void Replicator::applyTargets(GameWorld* gw) {
             // per-frame retries were the snap storm above. Unpausing resumes the
             // drive from the live state on the next tick.
             ++pauseHold_;
+            d.dbgRegime = DR_PAUSED;
         } else if (squadGlide && genuinelyMoving && haveActual) {
             if (!d.glideActive) {
                 d.glideActive = true; d.glideFrames = 0;
@@ -1868,6 +1881,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
             ++d.glideFrames; ++glideFrames_;
+            d.dbgRegime = DR_GLIDE;
             // Placement moves CharMovement::pos (nameplate) but the MODEL is
             // rendered from the physics character: without one the mesh stays
             // where the controller died - the field report's frozen model with a
@@ -1886,6 +1900,7 @@ void Replicator::applyTargets(GameWorld* gw) {
             // Fell behind / source warped: hard-snap to the true position
             // (no-halt teleport keeps the clip phase advancing).
             engine::applyRaw(c, newest);
+            d.dbgRegime = DR_SNAP;
             if (isSquad) {
                 ++hardSnapSquad_;
                 d.sqSnapMs = now;
@@ -1922,6 +1937,7 @@ void Replicator::applyTargets(GameWorld* gw) {
             }
             d.parked = false; d.haveDest = false;
         } else if (genuinelyMoving && crawling) {
+            d.dbgRegime = DR_CRAWL;
             // ---- Crawl drive (protocol 53) --------------------------------------
             // A crawler obeys no move-order: the engine will not locomote a body
             // that reports Character::isDown(), so the walkTo below is issued and
@@ -1981,6 +1997,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         } else if (genuinelyMoving) {
+            d.dbgRegime = carrierNow ? DR_CARRIER : DR_WALK;
             float tx = newest.x, ty = newest.y, tz = newest.z;
             // Lead only while the instantaneous velocity is meaningful: the
             // debounced classifier keeps the walk verdict through mid-walk
@@ -2140,6 +2157,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 }
             }
         } else {
+            d.dbgRegime = DR_REST;
             // At rest, task-authoritative: reproduce the host's sit/idle pose
             // at the same fixture, else quiet + park. Bar patrons sit
             // DYNAMICALLY (walk in and SIT_AROUND a stool), so the seat must

@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>KenshiCoop devtools</title>
+<style>
+  :root {
+    --bg: #15171c; --panel: #1e2128; --line: #2c313b; --fg: #d8dce4; --dim: #7d8594;
+    --bad: #5a1f24; --badfg: #ff8a8a; --ok: #7fd68a; --warn: #f0c060; --acc: #4fc3f7;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 12px/1.35 Consolas, "Cascadia Mono", monospace; }
+  header { display: flex; align-items: center; gap: 12px; padding: 6px 10px; background: #101216; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  #conn { padding: 1px 6px; border-radius: 3px; background: #333; }
+  #conn.on { background: #1f4d2a; color: var(--ok); }
+  #conn.off { background: var(--bad); color: var(--badfg); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 8px; padding: 8px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; min-width: 0; }
+  h2 { font-size: 12px; margin: 0 0 6px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+  #instances { display: flex; flex-wrap: wrap; gap: 8px; }
+  .inst { flex: 1 1 360px; border: 1px solid var(--line); border-left: 4px solid var(--c, var(--acc)); border-radius: 4px; padding: 6px 8px; background: #191c22; }
+  .inst.stale { opacity: .55; }
+  .inst .title { font-weight: 600; font-size: 13px; }
+  .inst .title .badge { font-weight: normal; }
+  .inst .facts { color: var(--dim); margin: 3px 0 5px; }
+  .inst .facts b { color: var(--fg); font-weight: normal; }
+  .badge { display: inline-block; padding: 0 5px; border-radius: 3px; background: #333; margin-left: 4px; }
+  .badge.on { background: #1f4d2a; color: var(--ok); }
+  .badge.stale { background: var(--bad); color: var(--badfg); }
+  .row { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 3px; }
+  button { font: inherit; color: var(--fg); background: #2a303a; border: 1px solid #3a414d; border-radius: 3px; padding: 2px 7px; cursor: pointer; }
+  button:hover { background: #36404d; }
+  button:active { background: #445062; }
+  input[type=text], select { font: inherit; color: var(--fg); background: #101216; border: 1px solid #3a414d; border-radius: 3px; padding: 2px 5px; }
+  input[type=text] { flex: 1 1 120px; min-width: 80px; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; white-space: nowrap; }
+  th, td { padding: 2px 5px; border-bottom: 1px solid var(--line); text-align: right; }
+  th { color: var(--dim); font-weight: normal; position: sticky; top: 0; background: var(--panel); }
+  th.grp { text-align: center; border-bottom: 2px solid var(--c, var(--acc)); color: var(--fg); }
+  td.l, th.l { text-align: left; }
+  td.sep, th.sep { border-left: 1px solid #3a414d; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #252a33; }
+  tbody tr.sel { outline: 1px solid var(--acc); outline-offset: -1px; }
+  tbody tr.bad { background: var(--bad); }
+  tbody tr.bad:hover { background: #6b252b; }
+  td.badcell { color: var(--badfg); font-weight: 600; }
+  td.dim { color: #555c68; }
+  td.own { color: var(--acc); }
+  #sel h3 { margin: 0 0 4px; font-size: 13px; }
+  #sel .legend span { margin-right: 10px; }
+  #sel .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  canvas { display: block; width: 100%; height: 120px; background: #121419; border: 1px solid var(--line); border-radius: 3px; margin-top: 4px; }
+  #events { max-height: 420px; overflow-y: auto; }
+  .ev { padding: 3px 2px; border-bottom: 1px solid var(--line); word-break: break-word; }
+  .ev .ts { color: var(--dim); }
+  .ev .k { display: inline-block; min-width: 42px; text-align: center; border-radius: 3px; padding: 0 3px; margin: 0 4px; background: #333; }
+  .ev.trip .k { background: var(--bad); color: var(--badfg); }
+  .ev.mark .k { background: #4a3d12; color: var(--warn); }
+  .ev.reply .k { background: #1f4d2a; color: var(--ok); }
+  .ev.replyfail .k, .ev.err .k { background: var(--bad); color: var(--badfg); }
+  .ev.sent .k { background: #1d3550; color: var(--acc); }
+  .ev .dump { color: var(--warn); }
+  .ev.clickable { cursor: pointer; }
+  .muted { color: var(--dim); }
+  .side { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>KenshiCoop devtools</h1>
+  <span id="conn">connecting</span>
+  <span class="muted" id="stats"></span>
+</header>
+<main>
+  <div class="side">
+    <section><h2>Instances</h2><div id="instances"><span class="muted" id="noinst">waiting for telemetry...</span></div></section>
+    <section>
+      <h2>Hands <span class="muted" style="text-transform:none">(red: |mesh-np| &gt; 15, or hk missing on a free upright body; click a row)</span></h2>
+      <div class="tablewrap"><table id="hands"><thead></thead><tbody></tbody></table></div>
+    </section>
+  </div>
+  <div class="side">
+    <section id="sel"><h2>Selected hand</h2><div class="muted">click a row in the hands table</div></section>
+    <section><h2>Events <span class="muted" style="text-transform:none">(newest first)</span></h2><div id="events"></div></section>
+  </div>
+</main>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Constants (mirror src/netproto/Wire.h and the DevTools contract)
+// ---------------------------------------------------------------------------
+const BODY_DOWN = 1, BODY_RAGDOLL = 2, BODY_DEAD = 4, BODY_CRAWL = 8, BODY_CARRIED = 16,
+      BODY_IN_BED = 32, BODY_IN_CAGE = 64, BODY_SNEAK = 128, BODY_CHAINED = 256;
+const MESH_BAD = 15;          // |mesh-np| horizontal threshold for a red row
+const HISTORY_MS = 30000;     // chart window
+const VIEW_STALE_MS = 2000;   // an instance's view of a hand older than this is dimmed
+const INST_STALE_MS = 5000;
+const COLORS = ["#4fc3f7", "#ffb74d", "#ba68c8", "#81c784", "#e57373"];
+const EVENT_CAP = 300;
+
+const bodyIsDown = bs => (bs & (BODY_DOWN | BODY_RAGDOLL | BODY_DEAD)) !== 0;
+// "free": nothing else owns the transform (carry attach, bed/cage/pole).
+const bodyIsFree = b => !(b.bs & (BODY_CARRIED | BODY_IN_BED | BODY_IN_CAGE | BODY_CHAINED)) && !b.carried;
+function bsFlags(bs) {
+  const n = [];
+  if (bs & BODY_DOWN) n.push("down"); if (bs & BODY_RAGDOLL) n.push("ragdoll"); if (bs & BODY_DEAD) n.push("dead");
+  if (bs & BODY_CRAWL) n.push("crawl"); if (bs & BODY_CARRIED) n.push("carried"); if (bs & BODY_IN_BED) n.push("bed");
+  if (bs & BODY_IN_CAGE) n.push("cage"); if (bs & BODY_SNEAK) n.push("sneak"); if (bs & BODY_CHAINED) n.push("chained");
+  const prone = (bs >> 9) & 7; if (prone) n.push("prone=" + prone);
+  return n.length ? n.join(",") : "upright";
+}
+const hdist = (a, b) => Math.hypot(a[0] - b[0], a[2] - b[2]);
+const f1 = v => (v === null || v === undefined || Number.isNaN(v)) ? "-" : (+v).toFixed(1);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const S = {
+  inst: {},        // id -> {id, role, pid, global, lastRx, srvStale}
+  order: [],       // instance ids, host first
+  hands: {},       // hand -> {hand, name, views: {id: {b, rx, dm, spd}}, hist: {id: [samples]}}
+  selected: null,
+  events: [],
+  rx: 0,
+};
+const instId = o => o.role + ":" + o.pid;
+const instColor = id => COLORS[Math.max(0, S.order.indexOf(id)) % COLORS.length];
+
+function touchInstance(o) {
+  const id = instId(o);
+  let i = S.inst[id];
+  if (!i) {
+    i = S.inst[id] = { id, role: o.role, pid: o.pid, global: null, lastRx: 0, srvStale: false };
+    S.order = Object.keys(S.inst).sort((a, b) => {
+      const ra = S.inst[a].role === "host" ? 0 : 1, rb = S.inst[b].role === "host" ? 0 : 1;
+      return ra - rb || String(S.inst[a].pid).localeCompare(String(S.inst[b].pid));
+    });
+    layoutDirty = true;
+  }
+  i.lastRx = o._rx || Date.now();
+  return i;
+}
+
+function onBody(o) {
+  const id = instId(o);
+  touchInstance(o);
+  let h = S.hands[o.hand];
+  if (!h) { h = S.hands[o.hand] = { hand: o.hand, name: o.name, views: {}, hist: {} }; layoutDirty = true; }
+  h.name = o.name || h.name;
+  const rx = o._rx || Date.now();
+  const dm = (o.np && o.mesh) ? hdist(o.np, o.mesh) : null;
+  const hist = h.hist[id] || (h.hist[id] = []);
+  // np speed over ~250 ms of the instance's own clock (20 Hz jitter would swamp a 1-sample delta).
+  let spd = null;
+  if (o.np) {
+    for (let k = hist.length - 1; k >= 0; k--) {
+      const s = hist[k];
+      if (!s.np) continue;
+      const dt = o.t - s.t;
+      if (dt >= 250) { if (dt < 2000) spd = hdist(o.np, s.np) / (dt / 1000); break; }
+    }
+  }
+  hist.push({ rx, t: o.t, np: o.np, gap: o.gap, dm, foot: o.foot >= 0 ? o.foot : null, spd });
+  while (hist.length && hist[0].rx < rx - HISTORY_MS) hist.shift();
+  h.views[id] = { b: o, rx, dm, spd };
+}
+
+function addEvent(cls, id, kind, html, hand) {
+  S.events.unshift({ ts: Date.now(), cls, id, kind, html, hand });
+  if (S.events.length > EVENT_CAP) S.events.length = EVENT_CAP;
+  eventsDirty = true;
+}
+
+function onMessage(o) {
+  S.rx++;
+  switch (o.k) {
+    case "body": onBody(o); break;
+    case "global": touchInstance(o).global = o; break;
+    case "instances":
+      for (const it of o.list) {
+        const i = touchInstance(it);
+        i.lastRx = Date.now() - it.age * 1000;
+        i.srvStale = it.stale;
+        if (it.global) i.global = it.global;
+      }
+      break;
+    case "event": {
+      touchInstance(o);
+      const cls = o.ev === "trip" ? "trip" : o.ev === "mark" ? "mark" : "cmd";
+      let html = (o.rule ? "<b>" + esc(o.rule) + "</b> " : "") + (o.hand ? "hand " + esc(o.hand) + " " : "") + esc(o.msg || "");
+      if (o.dump) html += '<br><span class="dump">dump: ' + esc(o.dump) + "</span>";
+      addEvent(cls, instId(o), o.ev, html, o.hand || null);
+      break;
+    }
+    case "reply":
+      addEvent(o.ok ? "reply" : "replyfail", o.role ? instId(o) : "?", o.ok ? "reply" : "FAIL",
+               "<b>" + esc(o.cmd || "") + "</b> &rarr; " + esc(o.msg || ""), null);
+      break;
+    case "sent":
+      addEvent("sent", o.instance, "sent", esc(o.cmd) + ' <span class="muted">(udp :' + o.port + ")</span>", null);
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+async function sendCmd(instance, cmd) {
+  try {
+    const r = await fetch("/cmd", { method: "POST", headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ instance, cmd }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) addEvent("err", instance, "error", esc(cmd) + " &rarr; " + esc(j.error || ("HTTP " + r.status)), null);
+  } catch (e) {
+    addEvent("err", instance, "error", esc(cmd) + " &rarr; " + esc(e.message), null);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Instance cards
+// ---------------------------------------------------------------------------
+const cards = {};
+function buildCard(id) {
+  const el = document.createElement("div");
+  el.className = "inst";
+  el.style.setProperty("--c", instColor(id));
+  el.innerHTML =
+    '<div class="title"></div><div class="facts"></div>' +
+    '<div class="row">' +
+      '<button data-c="glide on">glide on</button><button data-c="glide off">glide off</button>' +
+      '<button data-c="overlay on">overlay on</button><button data-c="overlay off">overlay off</button>' +
+      '<button data-c="watchdog on">watchdog on</button><button data-c="watchdog off">watchdog off</button>' +
+    '</div><div class="row">' +
+      '<button data-c="record start">rec start</button><button data-c="record stop">rec stop</button>' +
+      '<button data-c="ping">ping</button>' +
+      '<input type="text" placeholder="mark text (Enter)"><button data-mark="1">mark</button>' +
+    "</div>";
+  const input = el.querySelector("input");
+  const mark = () => { const t = input.value.trim(); if (t) { sendCmd(id, "mark " + t); input.value = ""; } };
+  el.addEventListener("click", ev => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    if (b.dataset.mark) mark(); else sendCmd(id, b.dataset.c);
+  });
+  input.addEventListener("keydown", ev => { if (ev.key === "Enter") mark(); });
+  return el;
+}
+
+function renderInstances(now) {
+  const box = document.getElementById("instances");
+  const placeholder = document.getElementById("noinst");
+  if (S.order.length && placeholder) placeholder.remove();
+  for (const id of S.order) {
+    let el = cards[id];
+    if (!el) { el = cards[id] = buildCard(id); box.appendChild(el); }
+    el.style.setProperty("--c", instColor(id));
+    const i = S.inst[id], g = i.global || {};
+    const stale = now - i.lastRx > INST_STALE_MS;
+    el.classList.toggle("stale", stale);
+    const onb = (name, v) => '<span class="badge' + (v ? " on" : "") + '">' + name + (v ? " on" : " off") + "</span>";
+    el.querySelector(".title").innerHTML =
+      esc(i.role) + " <span class=\"muted\">pid " + esc(i.pid) + "</span>" +
+      (stale ? '<span class="badge stale">stale ' + ((now - i.lastRx) / 1000).toFixed(0) + "s</span>" : "") +
+      onb("overlay", g.overlay) + onb("watchdog", g.watchdog) +
+      '<span class="badge' + (g.rec ? " on" : "") + '">rec ' + (g.rec ? esc(g.rec) : "off") + "</span>";
+    el.querySelector(".facts").innerHTML = i.global
+      ? "ver <b>" + esc(g.ver) + "</b> &middot; peers <b>" + g.peers + "</b> &middot; localId <b>" + g.localId +
+        "</b> &middot; slew <b>" + f1(g.slew) + "</b> &middot; speed <b>" + f1(g.speed) + "</b>" +
+        (g.paused ? " &middot; <b>PAUSED</b>" : "") + " &middot; net <b>" + g.net + "</b> world <b>" + g.world +
+        "</b> &middot; cmdPort <b>" + g.cmdPort + "</b>"
+      : "no global datagram yet (commands unavailable)";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hands table
+// ---------------------------------------------------------------------------
+const COLS = [
+  ["own", "own/author"], ["reg", "regime"], ["dm", "|mesh-np|"], ["hk", "hk"], ["foot", "foot"],
+  ["gap", "gap"], ["vlen", "vlen"], ["cspd", "cspd"], ["task", "task/stask"], ["bs", "bs"],
+];
+let layoutDirty = true, eventsDirty = false;
+const rows = {};
+
+function viewBad(v) {
+  if (!v) return { dm: false, hk: false };
+  const b = v.b;
+  return { dm: v.dm !== null && v.dm > MESH_BAD,
+           hk: !b.hk && !bodyIsDown(b.bs) && bodyIsFree(b) };
+}
+
+function layoutTable() {
+  const thead = document.querySelector("#hands thead"), tbody = document.querySelector("#hands tbody");
+  let h1 = '<tr><th class="l" rowspan="2">hand</th><th class="l" rowspan="2">name</th>';
+  let h2 = "<tr>";
+  for (const id of S.order) {
+    h1 += '<th class="grp sep" colspan="' + COLS.length + '" style="--c:' + instColor(id) + '">' + esc(id) + " view</th>";
+    COLS.forEach(([, label], k) => { h2 += "<th" + (k === 0 ? ' class="sep"' : "") + ">" + label + "</th>"; });
+  }
+  thead.innerHTML = h1 + "</tr>" + h2 + "</tr>";
+  tbody.innerHTML = "";
+  for (const k in rows) delete rows[k];
+  for (const hand of Object.keys(S.hands).sort()) {
+    const tr = document.createElement("tr");
+    tr.dataset.hand = hand;
+    let html = '<td class="l">' + esc(hand) + '</td><td class="l"></td>';
+    for (let n = 0; n < S.order.length; n++)
+      COLS.forEach((c, k) => { html += "<td" + (k === 0 ? ' class="sep"' : "") + "></td>"; });
+    tr.innerHTML = html;
+    tbody.appendChild(tr);
+    rows[hand] = tr;
+  }
+  layoutDirty = false;
+  // New instance/hand: the selected panel's target list and legend must follow.
+  if (S.selected && S.hands[S.selected]) selectHand(S.selected);
+}
+
+function setCell(td, text, cls, title) {
+  if (td.textContent !== text) td.textContent = text;
+  const want = (td.classList.contains("sep") ? "sep " : "") + (cls || "");
+  if (td.className !== want.trim()) td.className = want.trim();
+  if (title !== undefined && td.title !== title) td.title = title;
+}
+
+function renderTable(now) {
+  if (layoutDirty) layoutTable();
+  for (const hand in rows) {
+    const tr = rows[hand], h = S.hands[hand], tds = tr.children;
+    setCell(tds[1], h.name || "", "l");
+    let bad = false;
+    S.order.forEach((id, n) => {
+      const v = h.views[id], base = 2 + n * COLS.length;
+      if (!v) { for (let k = 0; k < COLS.length; k++) setCell(tds[base + k], "", "dim"); return; }
+      const b = v.b, old = now - v.rx > VIEW_STALE_MS, vb = viewBad(v);
+      if (!old) bad = bad || vb.dm || vb.hk;
+      const d = old ? "dim" : "";
+      setCell(tds[base + 0], b.own ? "own" : "a:" + b.author, old ? "dim" : (b.own ? "own" : ""));
+      setCell(tds[base + 1], (b.reg || "-") + (b.fresh ? "" : (b.own ? "" : " (stale)")), d);
+      setCell(tds[base + 2], f1(v.dm), old ? "dim" : (vb.dm ? "badcell" : ""));
+      setCell(tds[base + 3], b.hk ? "yes" : "NONE", old ? "dim" : (vb.hk ? "badcell" : (b.hk ? "" : "dim")));
+      setCell(tds[base + 4], b.foot >= 0 ? f1(b.foot) : "?", d);
+      setCell(tds[base + 5], f1(b.gap), d);
+      setCell(tds[base + 6], f1(b.vlen), d);
+      setCell(tds[base + 7], f1(b.cspd), d);
+      setCell(tds[base + 8], b.task + "/" + b.stask, d);
+      setCell(tds[base + 9], String(b.bs) + (b.carrying ? " C>" : "") + (b.carried ? " <C" : ""), d,
+              bsFlags(b.bs) + " (stream bs " + b.sbs + ": " + bsFlags(b.sbs) + ")");
+    });
+    tr.classList.toggle("bad", bad);
+    tr.classList.toggle("sel", hand === S.selected);
+  }
+}
+
+document.querySelector("#hands tbody").addEventListener("click", ev => {
+  const tr = ev.target.closest("tr");
+  if (tr && tr.dataset.hand) selectHand(tr.dataset.hand);
+});
+
+// ---------------------------------------------------------------------------
+// Selected hand: commands + charts
+// ---------------------------------------------------------------------------
+const CHARTS = [
+  ["gap", "gap (stream sample - our position)", null],
+  ["dm", "|mesh-np| horizontal (model vs nameplate)", MESH_BAD],
+  ["foot", "foot distance (swings = gait clip playing)", null],
+  ["spd", "np speed (derived, units/s)", null],
+];
+
+function selectHand(hand) {
+  S.selected = hand;
+  const h = S.hands[hand];
+  const sel = document.getElementById("sel");
+  // Default target: the first instance where the hand is DRIVEN (that copy is the one that breaks).
+  const driven = S.order.find(id => h.views[id] && !h.views[id].b.own) || S.order[0];
+  let opts = S.order.map(id => '<option value="' + esc(id) + '"' + (id === driven ? " selected" : "") + ">" + esc(id) + "</option>").join("");
+  sel.innerHTML =
+    "<h2>Selected hand</h2><h3>" + esc(h.name || "") + ' <span class="muted">' + esc(hand) + "</span></h3>" +
+    '<div class="row">to <select id="selinst">' + opts + "</select>" +
+      '<button data-c="restore">restore</button><button data-c="endaction">endaction</button>' +
+      '<button data-c="knockdown" data-a="1">knockdown 1</button><button data-c="knockdown" data-a="0">knockdown 0</button>' +
+      '<button data-c="halt">halt</button><button data-c="dump">dump</button></div>' +
+    '<div class="legend row">' + S.order.map(id => '<span><i style="background:' + instColor(id) + '"></i>' + esc(id) + "</span>").join("") + "</div>" +
+    CHARTS.map(([k, label]) => '<div class="muted" style="margin-top:6px">' + label + '</div><canvas data-k="' + k + '"></canvas>').join("");
+  sel.querySelector(".row").addEventListener("click", ev => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    const target = document.getElementById("selinst").value;
+    sendCmd(target, b.dataset.c + " " + hand + (b.dataset.a ? " " + b.dataset.a : ""));
+  });
+  renderCharts(Date.now());
+  renderTable(Date.now());
+}
+
+function renderCharts(now) {
+  const h = S.selected && S.hands[S.selected];
+  if (!h) return;
+  const t0 = now - HISTORY_MS;
+  for (const cv of document.querySelectorAll("#sel canvas")) {
+    const key = cv.dataset.k, thr = CHARTS.find(c => c[0] === key)[2];
+    const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+    if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, W, H);
+    let lo = 0, hi = thr ? thr * 1.2 : 1;
+    for (const id of S.order) for (const s of (h.hist[id] || [])) {
+      const v = s[key];
+      if (v === null || v === undefined || s.rx < t0) continue;
+      if (v > hi) hi = v; if (v < lo) lo = v;
+    }
+    hi = hi + (hi - lo) * 0.08;
+    const L = 38, R = 4, T = 4, B = 14, pw = W - L - R, ph = H - T - B;
+    const X = t => L + (t - t0) / HISTORY_MS * pw, Y = v => T + ph - (v - lo) / (hi - lo) * ph;
+    // grid
+    g.strokeStyle = "#262b34"; g.fillStyle = "#7d8594"; g.lineWidth = 1; g.font = "10px Consolas, monospace";
+    for (let k = 0; k <= 4; k++) {
+      const v = lo + (hi - lo) * k / 4, y = Math.round(Y(v)) + .5;
+      g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke();
+      g.fillText(v >= 100 ? v.toFixed(0) : v.toFixed(1), 2, y + 3);
+    }
+    for (let s = 0; s <= 30; s += 5) {
+      const x = Math.round(X(now - s * 1000)) + .5;
+      g.beginPath(); g.moveTo(x, T); g.lineTo(x, T + ph); g.stroke();
+      g.fillText(s ? "-" + s + "s" : "now", Math.min(x - 8, W - 24), H - 2);
+    }
+    if (thr) {
+      g.strokeStyle = "#ff5a5a"; g.setLineDash([4, 3]);
+      g.beginPath(); g.moveTo(L, Y(thr)); g.lineTo(W - R, Y(thr)); g.stroke(); g.setLineDash([]);
+    }
+    // series: gaps in data (no sample or null value) break the line
+    for (const id of S.order) {
+      const hist = h.hist[id] || [];
+      g.strokeStyle = instColor(id); g.lineWidth = 1.5; g.beginPath();
+      let pen = false, prevRx = 0;
+      for (const s of hist) {
+        const v = s[key];
+        if (s.rx < t0 || v === null || v === undefined) { pen = false; continue; }
+        if (pen && s.rx - prevRx > 500) pen = false;
+        if (pen) g.lineTo(X(s.rx), Y(v)); else g.moveTo(X(s.rx), Y(v));
+        pen = true; prevRx = s.rx;
+      }
+      g.stroke();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+function renderEvents() {
+  if (!eventsDirty) return;
+  eventsDirty = false;
+  const box = document.getElementById("events");
+  box.innerHTML = S.events.map((e, n) => {
+    const t = new Date(e.ts), ts = t.toTimeString().slice(0, 8) + "." + String(t.getMilliseconds()).padStart(3, "0");
+    return '<div class="ev ' + e.cls + (e.hand ? " clickable" : "") + '" data-n="' + n + '"><span class="ts">' + ts +
+           '</span><span class="k">' + esc(e.kind) + '</span><span style="color:' + instColor(e.id) + '">' + esc(e.id) +
+           "</span> " + e.html + "</div>";
+  }).join("");
+}
+document.getElementById("events").addEventListener("click", ev => {
+  const d = ev.target.closest(".ev");
+  const e = d && S.events[+d.dataset.n];
+  if (e && e.hand && S.hands[e.hand]) selectHand(e.hand);
+});
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+function connect() {
+  const conn = document.getElementById("conn");
+  const es = new EventSource("/events");
+  es.onopen = () => { conn.textContent = "live"; conn.className = "on"; };
+  es.onerror = () => { conn.textContent = "disconnected (retrying)"; conn.className = "off"; };
+  es.onmessage = m => { try { onMessage(JSON.parse(m.data)); } catch (e) { console.error(e, m.data); } };
+}
+
+let lastRx = 0, lastRate = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  renderInstances(now);
+  renderTable(now);
+  renderEvents();
+  if (now - lastRate >= 1000) {
+    document.getElementById("stats").textContent =
+      (S.rx - lastRx) + " msg/s  ·  " + S.order.length + " instance(s)  ·  " + Object.keys(S.hands).length + " hand(s)";
+    lastRx = S.rx; lastRate = now;
+  }
+}, 200);
+setInterval(() => renderCharts(Date.now()), 150);
+connect();
+</script>
+</body>
+</html>

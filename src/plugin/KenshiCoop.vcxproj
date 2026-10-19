@@ -150,6 +150,12 @@
     <ClCompile Include="sync\ReplicatorItems.cpp" />
     <ClCompile Include="sync\ReplicatorChannels.cpp" />
     <ClCompile Include="sync\SaveXfer.cpp" />
+    <ClCompile Include="sync\ReplicatorDev.cpp" />
+    <!-- Developer tools (docs/DEVTOOLS.md): compiled in every configuration,
+         inert unless coop_config.json "devtools": 1. -->
+    <ClCompile Include="devtools\DevTools.cpp" />
+    <ClCompile Include="devtools\DevOverlay.cpp" />
+    <ClCompile Include="devtools\PacketRecorder.cpp" />
     <!-- Scenario harness: EXCLUDED from the shipped Release DLL, compiled in
          Debug + Harness. Keep this exclusion list in sync with the scenario
          drift check (scripts/tests/Contract.Tests.ps1). -->
@@ -209,6 +215,8 @@
     <ClInclude Include="sync\Interp.h" />
     <ClInclude Include="sync\Replicator.h" />
     <ClInclude Include="sync\SaveXfer.h" />
+    <ClInclude Include="devtools\DevTools.h" />
+    <ClInclude Include="devtools\PacketRecorder.h" />
     <ClInclude Include="test\Scenario.h" />
     <ClInclude Include="test\ScenarioTimed.h" />
     <ClInclude Include="test\ScenarioSupport.h" />
