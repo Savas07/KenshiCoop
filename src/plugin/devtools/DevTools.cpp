@@ -656,8 +656,8 @@ void resetRuleTimers() {
 
 const char* const kHelp =
     "ping | help | restore <i,s> | endaction <i,s> | knockdown <i,s> <0|1> | halt <i,s> | "
-    "glide <on|off> | overlay <on|off> | watchdog <on|off> | dump <i,s> | mark <text> | "
-    "record <start|stop>";
+    "move <i,s> <dx> <dz> | glide <on|off> | overlay <on|off> | watchdog <on|off> | dump <i,s> | "
+    "mark <text> | record <start|stop>";
 
 struct CmdCtx {
     GameWorld* gw;                          // null from idleTick
@@ -764,7 +764,7 @@ void execCommand(char* text, const sockaddr_in& from, const CmdCtx& ctx) {
         _snprintf(msg, sizeof(msg) - 1, "%s", kHelp);
     } else if (strcmp(verb, "restore") == 0 || strcmp(verb, "endaction") == 0 ||
                strcmp(verb, "knockdown") == 0 || strcmp(verb, "halt") == 0 ||
-               strcmp(verb, "dump") == 0) {
+               strcmp(verb, "move") == 0 || strcmp(verb, "dump") == 0) {
         char* handArg = nextTok(&rest);
         _snprintf(evHand, sizeof(evHand) - 1, "%s", handArg);
         evHand[sizeof(evHand) - 1] = 0;
@@ -803,6 +803,21 @@ void execCommand(char* text, const sockaddr_in& from, const CmdCtx& ctx) {
             } else if (strcmp(verb, "halt") == 0) {
                 ok = engine::haltMovement(c);
                 _snprintf(msg, sizeof(msg) - 1, "haltMovement '%s' -> %d", b->name, ok ? 1 : 0);
+            } else if (strcmp(verb, "move") == 0) {
+                // Player move order relative to where the body stands now: a
+                // scripted walk for reproducing a session from the dashboard.
+                float dx = 0.0f, dz = 0.0f, x = 0.0f, y = 0.0f, z = 0.0f;
+                const char* sx = nextTok(&rest);
+                const char* sz = nextTok(&rest);
+                if (sscanf_s(sx, "%f", &dx) != 1 || sscanf_s(sz, "%f", &dz) != 1) {
+                    _snprintf(msg, sizeof(msg) - 1, "usage: move <i,s> <dx> <dz>");
+                } else if (!engine::readPos(c, &x, &y, &z)) {
+                    _snprintf(msg, sizeof(msg) - 1, "move: cannot read position of '%s'", b->name);
+                } else {
+                    ok = engine::orderMoveTo(c, x + dx, y, z + dz);
+                    _snprintf(msg, sizeof(msg) - 1, "orderMoveTo '%s' (%.0f,%.0f) -> %d", b->name,
+                              x + dx, z + dz, ok ? 1 : 0);
+                }
             } else {
                 bool on = false;
                 if (!parseOnOff(nextTok(&rest), on)) {

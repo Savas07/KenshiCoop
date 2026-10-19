@@ -91,6 +91,7 @@ dashboard buttons. `<hand>` = `index,serial` as in log lines (`hand=1,3332275456
 | `endaction <hand>` | end the current task (e.g. a stuck get-up) |
 | `knockdown <hand> <0\|1>` | knock out / stand up |
 | `halt <hand>` | stop movement |
+| `move <hand> <dx> <dz>` | player move order to (current x+dx, z+dz): scripted walks for repros |
 | `glide <on\|off>` | squad glide regime on/off |
 | `overlay <on\|off>`, `watchdog <on\|off>` | toggles |
 | `dump <hand>` | write that character's last 6 s to `kc_dumps\` now |
