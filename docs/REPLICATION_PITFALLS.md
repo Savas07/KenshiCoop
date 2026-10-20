@@ -468,3 +468,33 @@ asserting a fact that can stop being true has to be re-asserted on a cadence and
 withdrawn when it lapses — otherwise the instrument manufactures the failure it
 was built to detect, and it does so most convincingly in exactly the long
 sessions where you are least able to check it.
+
+## 19. An identity edge must name its subject the way the receiver knows it
+
+EVT_RECRUIT said "the body at hand X is now my squad member at hand Y", with X
+the recruiter's LOCAL hand. That is right when the recruiter authored the body,
+and wrong whenever it was only driving a copy: the combat and sitter detaches
+re-container a driven NPC, so the join's copy of a bar NPC often lives under a
+hand the host has never seen. A join recruit then reached the host as an
+unresolvable subject — `[recruit] REKEY-FALLBACK` followed by `[spawn] proxy
+BOUND` for the new hand, i.e. a minted duplicate in the host's squad — while the
+host's real NPC kept streaming under its old key. That key still resolved to the
+join's recruit, so the join's drive kept steering the character its own player
+was ordering around (recruit_join `rj_before2`: `drv=1` in every sample). Only a
+host-side squad move, whose receiver runs the CONTROL-FLIP teardown, fixed it,
+which is exactly what players reported. The host never saw this, because the
+host authors the NPCs it recruits.
+
+The recruiter now sends the key the peer streams the body under
+(`canonicalOf_`, else its `proxyByKey_` binding), tears down its own drive state
+for that body, and moves the recruit into its own tab when the engine put it in
+someone else's. `[recruit] OWN local=... wire=... released=1` records the
+translation. Separately, the drive refuses any body whose LOCAL hand we own
+(`[drive] SKIP-OWNED`), because the key-based vetoes only ever see the wire key.
+
+**Rule.** Any edge that hands an object from one key space to another has to be
+written in the receiver's key space. A recruiter that was driving the body is a
+receiver of that body's identity, and an ownership change has to end every drive
+binding the old owner's stream created, not only the one the event names.
+A mirrored test arm (here, a host recruit run alongside the join recruit) is what
+separates "the receiver cannot resolve it" from "the feature is broken".
