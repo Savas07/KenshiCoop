@@ -1001,6 +1001,64 @@ function Test-NativePickup {
                 -Metrics @{ hostOk = $res['host'].ok; joinOk = $res['join'].ok; sent = $sent; applied = $applied })
 }
 
+# corpse_loot (protocol 62, upstream #40): one inventory per corpse. The host kills an NPC,
+# seeds `seeded` probe units into it and loots one; the join loots one from its own copy.
+# Judged against the host's c0 (probe units in the corpse before the seed):
+#   finalCorpse == c0+seeded-2 on BOTH sides  - both loots landed in the one inventory;
+#   maxCorpse   <= c0+seeded on both sides    - no side ever saw extra copies;
+#   each leader +1 on BOTH sides              - every looted unit exists exactly once.
+# A join that never finds its corpse (no probe ever arrived) is the unsynced baseline.
+function Test-CorpseLoot {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'CORPSE verdict role=(host|join) pass=(\d+) why=(\S+) sid=''([^'']*)'' c0=(-?\d+) seeded=(-?\d+) hostLoot=(-?\d+) joinLoot=(-?\d+) maxCorpse=(-?\d+) finalCorpse=(-?\d+) hostBag0=(-?\d+) hostBagF=(-?\d+) joinBag0=(-?\d+) joinBagF=(-?\d+) samples=(\d+)'
+    $res = @{}
+    foreach ($side in @(@{ role = 'host'; file = $HostFile }, @{ role = 'join'; file = $JoinFile })) {
+        $m = $null
+        if (Test-Path $side.file) {
+            $l = Select-String -Path $side.file -Pattern $rx -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Matches[0].Groups[1].Value -eq $side.role } | Select-Object -Last 1
+            if ($null -ne $l) {
+                $g = $l.Matches[0].Groups
+                $m = @{ pass = [int]$g[2].Value; why = $g[3].Value; c0 = [int]$g[5].Value
+                        seeded = [int]$g[6].Value; hostLoot = [int]$g[7].Value; joinLoot = [int]$g[8].Value
+                        maxC = [int]$g[9].Value; finalC = [int]$g[10].Value
+                        hostGain = [int]$g[12].Value - [int]$g[11].Value
+                        joinGain = [int]$g[14].Value - [int]$g[13].Value; samples = [int]$g[15].Value }
+            }
+        }
+        $res[$side.role] = $m
+    }
+    $h = $res['host']; $j = $res['join']
+    $ok = ($null -ne $h) -and ($null -ne $j) -and ($h.pass -eq 1) -and ($j.pass -eq 1) -and
+          ($h.c0 -ge 0) -and ($h.seeded -ge 1)
+    if ($ok) {
+        $want = $h.c0 + $h.seeded - 2
+        foreach ($r in @('host', 'join')) {
+            $m = $res[$r]
+            $sideOk = ($m.why -eq 'done') -and ($m.samples -gt 0) -and ($m.finalC -eq $want) -and
+                      ($m.maxC -le ($h.c0 + $h.seeded)) -and ($m.hostGain -eq 1) -and ($m.joinGain -eq 1)
+            Write-Host ("  CORPSE-LOOT [$r] " + $(if ($sideOk) { "PASS" } else { "FAIL" }) +
+                " - finalCorpse=$($m.finalC) (want $want) maxCorpse=$($m.maxC) hostGain=$($m.hostGain) joinGain=$($m.joinGain)")
+            $ok = $ok -and $sideOk
+        }
+    } else {
+        foreach ($r in @('host', 'join')) {
+            $m = $res[$r]
+            if ($null -eq $m) { Write-Host "  CORPSE-LOOT [$r] FAIL - no CORPSE verdict"; continue }
+            Write-Host ("  CORPSE-LOOT [$r] FAIL - pass=$($m.pass) why=$($m.why) seeded=$($m.seeded) hostLoot=$($m.hostLoot) joinLoot=$($m.joinLoot) finalCorpse=$($m.finalC)")
+        }
+        if ($null -ne $j -and -not (Select-String -Path $JoinFile -Pattern 'CORPSE found hand=' -Quiet)) {
+            Write-Host "    NOTE: the join never saw the host's seed in any corpse => corpse inventory not synced (#40)"
+        }
+    }
+    $tracked = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[inv\] CORPSE track key=' -Quiet)
+    $xfer    = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[xfer\] SEND' -Quiet)
+    Write-Host ("  CORPSE-LOOT trace: host CORPSE track=$tracked, join xfer authored=$xfer")
+    Write-Host ("  CORPSE-LOOT " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "corpse_loot" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ tracked = $tracked; xfer = $xfer })
+}
+
 # world_item_stale: the join's proxy is freed by the ENGINE (KENSHICOOP_WI_TEST_STALE
 # injects it at the exact moment a zone teardown would) and the cull about to run on
 # it must notice through the proxy's HAND rather than by touching the object.

@@ -578,6 +578,16 @@ struct Config {
     // shops. Layered on invSync + storeSync. "0" is the A/B escape hatch.
     bool          vendorSync;
 
+    // KENSHICOOP_CORPSE_SYNC (default ON): shared corpse inventories (protocol
+    // 62, upstream #40). A dead NPC's (or animal's) inventory was carried by no
+    // channel: looting it changed only the looter's copy, so every player could
+    // take the same items again. The host's container census also takes the
+    // DEAD non-squad characters near the interest centers and authors their
+    // inventories (INV_FLAG_CORPSE); a join's loot pairs as a protocol-37
+    // transfer like any drag out of a host-authored container. Layered on
+    // invSync + storeSync. "0" is the A/B escape hatch.
+    bool          corpseSync;
+
     // KENSHICOOP_SQUAD_SYNC (default ON): squad management sync (protocol 35)
     // - a squad-tab MOVE re-containers the body (its hand changes) exactly
     // like a recruit, but no engine function owns the UI path, so the roster

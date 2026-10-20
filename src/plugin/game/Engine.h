@@ -2181,6 +2181,24 @@ bool readShopCounterOwner(const unsigned int cHand[5], unsigned int owner[5]);
 // SEH-guarded single-container read by local hand. Returns false when the hand
 // does not resolve locally or is not a container-bearing building class.
 bool readContainerByHand(const unsigned int cHand[5], ContRead* out);
+// Protocol 62 (corpse census, upstream #40): one non-squad character (NPC or
+// animal) near an interest center. hand is the container layout
+// [type, container, containerSerial, index, serial] - a character's own hand
+// IS its inventory container hand. body lets the caller map a bound proxy to
+// the stream key it is driven under.
+struct CorpseRead {
+    unsigned int hand[5];
+    Character*   body;
+    float        x, y, z;
+};
+// SEH-guarded enumeration of non-squad characters that have an inventory within
+// radius of the interest centers (player squads excluded - their owners author
+// them), deduped across overlapping spheres. deadOnly keeps Character::isDead
+// bodies only - the host's corpse census. A peer's copy of a body the host
+// killed is only held DOWN (the death latch), never engine-dead, so a lookup on
+// that side passes false. Returns the count written.
+unsigned int enumNpcBodiesNear(GameWorld* gw, float radius, CorpseRead* out,
+                               unsigned int maxOut, bool deadOnly);
 
 // Nearest BCTYPE_PRODUCTION building (a resource mine) to the leader, or null.
 // Class-matched rather than name-matched, and searched wide, because a mine's

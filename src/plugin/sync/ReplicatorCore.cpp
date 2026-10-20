@@ -93,7 +93,7 @@ Replicator::Replicator()
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
       deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
       fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true),
-      storeSync_(false), contCensusMs_(0),
+      storeSync_(false), contCensusMs_(0), corpseSync_(false),
       vendorSync_(false), vendorScanMs_(0), nextVendorDeltaId_(1), vendorCashMs_(0),
       timeSync_(true), timeBrake_(true),
       timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
@@ -260,6 +260,7 @@ void Replicator::resetSession() {
     invRecv_.clear();
     ownedContainers_.clear();
     censusContainers_.clear(); // protocol 34: re-censused in the new world
+    censusCorpses_.clear();    // protocol 62: likewise
     // Protocol 60: every counter hand + baseline belongs to the old world.
     censusShops_.clear();
     vendorBase_.clear();
@@ -603,6 +604,7 @@ void Replicator::ingestInv(Inbound& in) {
         r.dirty     = true;
         r.truncated = (it->flags & INV_FLAG_TRUNCATED) != 0;
         r.shop      = (it->flags & INV_FLAG_SHOP) != 0;
+        r.corpse    = (it->flags & INV_FLAG_CORPSE) != 0;
         r.recvMs    = nowMs();
     }
 }

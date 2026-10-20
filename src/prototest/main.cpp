@@ -313,8 +313,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v61: save-native pickup notice)",
-             (int)PROTOCOL_VERSION, 61);
+    CHECK_EQ("PROTOCOL_VERSION (v62: corpse inventories)",
+             (int)PROTOCOL_VERSION, 62);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -390,6 +390,10 @@ static void testSizes() {
     // Protocol 60: the shop-counter flag shares the byte with TRUNCATED.
     CHECK_EQ("INV_FLAG_SHOP value", (int)INV_FLAG_SHOP, 2);
     CHECK("INV_FLAG_SHOP distinct from TRUNCATED", (INV_FLAG_SHOP & INV_FLAG_TRUNCATED) == 0);
+    // Protocol 62: the corpse flag shares the same byte.
+    CHECK_EQ("INV_FLAG_CORPSE value", (int)INV_FLAG_CORPSE, 4);
+    CHECK("INV_FLAG_CORPSE distinct from TRUNCATED|SHOP",
+          (INV_FLAG_CORPSE & (INV_FLAG_TRUNCATED | INV_FLAG_SHOP)) == 0);
     CHECK_EQ("PKT_VENDOR_DELTA id", (int)PKT_VENDOR_DELTA, 52);
     CHECK_EQ("PKT_VENDOR_CASH id", (int)PKT_VENDOR_CASH, 53);
     CHECK_EQ("PKT_NATIVE_TAKEN id", (int)PKT_NATIVE_TAKEN, 54);

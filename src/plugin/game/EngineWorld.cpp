@@ -1665,6 +1665,42 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
     return n;
 }
 
+unsigned int enumNpcBodiesNear(GameWorld* gw, float radius, CorpseRead* out,
+                               unsigned int maxOut, bool deadOnly) {
+    if (!gw || !out || maxOut == 0 || !g_getCharsFn) return 0;
+    if (deadOnly && !g_isDeadCharFn) return 0;
+    unsigned int n = 0;
+    __try {
+        Ogre::Vector3 centers[MAX_INTEREST_ANCHORS];
+        unsigned int nc = interestCenters(gw, centers);
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            // Same sphere query captureNpcs makes (it returns Characters as
+            // RootObject* bases), at the census radius.
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], radius, 120.0f, 30.0f, 96, 96, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                if (isPlayerSquad(gw, o)) continue; // the owner authors its squad
+                Character* c = static_cast<Character*>(o);
+                if (deadOnly && !g_isDeadCharFn(c)) continue;
+                if (!o->getInventory()) continue;   // nothing to author
+                bool dup = false; // the interest spheres can overlap
+                for (unsigned int k = 0; k < n; ++k)
+                    if (out[k].body == c) { dup = true; break; }
+                if (dup) continue;
+                if (!readObjectHand(o, out[n].hand)) continue;
+                Ogre::Vector3 p = o->getPosition();
+                out[n].body = c;
+                out[n].x = p.x; out[n].y = p.y; out[n].z = p.z;
+                ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
 bool readContainerByHand(const unsigned int cHand[5], ContRead* out) {
     if (!cHand || !out) return false;
     RootObject* ro = resolveObjectByHand(cHand);

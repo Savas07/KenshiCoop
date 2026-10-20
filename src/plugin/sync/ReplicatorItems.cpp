@@ -15,6 +15,28 @@
 
 namespace coop {
 
+bool Replicator::corpseLocalHand(const Key& k, unsigned int out[5]) const {
+    // Our own census corpse: the census recorded which body the key names.
+    std::map<Key, Key>::const_iterator ci = censusCorpses_.find(k);
+    if (ci != censusCorpses_.end()) {
+        out[0] = ci->second.t; out[1] = ci->second.c; out[2] = ci->second.cs;
+        out[3] = ci->second.i; out[4] = ci->second.s;
+        return true;
+    }
+    // A peer's corpse: its key is the stream key, which names our body directly
+    // unless we drive that stream with a minted/adopted proxy (its own hand
+    // differs). proxyByKey_ is liveness-swept ~1 Hz; readHand is SEH-guarded and
+    // every caller re-resolves the returned hand before touching it.
+    std::map<Key, InvRecv>::const_iterator ri = invRecv_.find(k);
+    if (ri == invRecv_.end() || !ri->second.corpse) return false;
+    std::map<Key, Character*>::const_iterator pi = proxyByKey_.find(k);
+    if (pi == proxyByKey_.end()) return false;
+    unsigned int h[5]; // char-key layout: index, serial, type, container, containerSerial
+    if (!engine::readHand(pi->second, h)) return false;
+    out[0] = h[2]; out[1] = h[3]; out[2] = h[4]; out[3] = h[0]; out[4] = h[1];
+    return true;
+}
+
 void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     // Author the inventory of every container we OWN. ownHands_ is the per-tick set of
     // owned squad-member hands (a character's own hand IS its personal-inventory
@@ -52,6 +74,29 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
                 censusContainers_.insert(k);
                 if (vendorSync_ && rows[i].shop) censusShops_.insert(k);
             }
+            // Protocol 62 (upstream #40): DEAD non-squad characters are
+            // containers too - looting one changed only the looter's copy. The
+            // wire key is the body's STREAM key: its own hand, or the key we
+            // drive it under when it is a bound proxy of a peer's stream (the
+            // peer resolves that key to its own body directly).
+            censusCorpses_.clear();
+            if (corpseSync_) {
+                const unsigned int MAX_CORPSE = 32;
+                static engine::CorpseRead crows[MAX_CORPSE]; // main-thread only
+                unsigned int nd = engine::enumNpcBodiesNear(gw, 100.0f, crows, MAX_CORPSE,
+                                                            /*deadOnly=*/true);
+                for (unsigned int i = 0; i < nd; ++i) {
+                    Key local; local.t = crows[i].hand[0]; local.c = crows[i].hand[1];
+                    local.cs = crows[i].hand[2]; local.i = crows[i].hand[3];
+                    local.s = crows[i].hand[4];
+                    Key wire = local;
+                    for (std::map<Key, Character*>::const_iterator pi = proxyByKey_.begin();
+                         pi != proxyByKey_.end(); ++pi)
+                        if (pi->second == crows[i].body) { wire = pi->first; break; }
+                    censusContainers_.insert(wire);
+                    censusCorpses_[wire] = local;
+                }
+            }
         }
         owned.insert(censusContainers_.begin(), censusContainers_.end());
     }
@@ -79,6 +124,8 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     for (std::set<Key>::iterator it = owned.begin();
          it != owned.end(); ++it) {
         unsigned int cHand[5] = { it->t, it->c, it->cs, it->i, it->s };
+        // Protocol 62: a census corpse is keyed by its stream key; read our body.
+        bool corpse = corpseLocalHand(*it, cHand);
         // Skip until the container actually resolves here (post-load it may not yet),
         // so we never blast a spurious "empty" snapshot that would wipe baked contents.
         if (engine::resolveObjectByHand(cHand) == 0) continue;
@@ -102,6 +149,13 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
             p.lastSentN = 0; p.lastSentUnits = 0;
             invPub_[*it] = p;
             pit = invPub_.find(*it);
+            if (corpse) {
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[inv] CORPSE track key=%u,%u,%u,%u,%u local=%u,%u,%u,%u,%u items=%u",
+                    it->t, it->c, it->cs, it->i, it->s,
+                    cHand[0], cHand[1], cHand[2], cHand[3], cHand[4], n);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
         }
         InvPub& pub = pit->second;
         bool sent = (pub.lastSendMs != 0) || (pub.hash != 0);
@@ -156,6 +210,7 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         }
         u8 sflags = trunc ? INV_FLAG_TRUNCATED : (u8)0;
         if (censusShops_.count(*it) != 0) sflags |= INV_FLAG_SHOP; // protocol 60
+        if (censusCorpses_.count(*it) != 0) sflags |= INV_FLAG_CORPSE; // protocol 62
         net.queueInvSnapshot(ownerId, keyKind, wireKey, items, n, sflags);
         pub.hash = hash; pub.lastSendMs = now; pub.lastSentN = n; pub.lastSentUnits = units;
         if (changed) {

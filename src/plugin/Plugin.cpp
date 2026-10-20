@@ -3197,6 +3197,8 @@ void installEngineDetours() {
     // (publishInventories is the carrier and is gated on it below).
     g_repl.setStoreSync(g_cfg.storeSync && g_cfg.isHost);
     g_repl.setVendorSync(g_cfg.vendorSync && g_cfg.invSync);
+    // Protocol 62: corpses ride the same host census (inert unless storeSync_).
+    g_repl.setCorpseSync(g_cfg.corpseSync);
     if (g_cfg.recruitSync) {
         if (coop::engine::installRecruitHook())
             coopLog("[recruit] recruit detour installed; recruitment sync ON");

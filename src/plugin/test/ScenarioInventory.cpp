@@ -2531,7 +2531,213 @@ private:
 };
 const float InvDumpAllScenario::RADIUS = 60.0f;
 
+// corpse_loot (protocol 62, upstream #40 "Looting corpse does not sync at all"): a
+// dead NPC's inventory must be ONE inventory for both players. The HOST pins the
+// nearest NPC, kills it, seeds PROBE_QTY of a stacking probe template into the
+// corpse and loots one into its leader; the JOIN finds its own copy of that corpse
+// (the dead body holding the probe) and loots one into ITS leader. Both moves use
+// the engine's UI-drag primitive with the trade veto live. Every 500 ms each side
+// logs its corpse and both leaders' probe counts; Test-CorpseLoot judges them
+// against the host's c0 (the corpse's probe count before the seed): final corpse
+// = c0 + PROBE_QTY - 2 on BOTH sides, never above c0 + PROBE_QTY, and each
+// leader exactly +1 on both sides (one copy per looted unit). CORPSE log contract.
+class CorpseLootScenario : public TimedScenario {
+public:
+    CorpseLootScenario()
+        : TimedScenario("corpse_loot", 0), have_(false), haveSubj_(false), haveLeaders_(false),
+          haveCorpse_(false), type_(0), killOk_(-1), c0_(-1), seeded_(-1), hostLoot_(-1),
+          joinLoot_(-1), lastKillMs_(0), lastLogMs_(0), lastSearchMs_(0), maxCorpse_(-1),
+          lastCorpse_(-1), hostBag0_(-1), joinBag0_(-1), hostBag_(-1), joinBag_(-1),
+          samples_(0) {
+        for (int i = 0; i < 5; ++i) { subj_[i] = 0; corpse_[i] = 0; hostL_[i] = 0; joinL_[i] = 0; }
+        sid_[0] = '\0';
+    }
+
+    // Pin pre-arm and park the subject until the kill (death_order's pattern): a baked
+    // NPC walks off after the reload, out of pickDownSubject's 30 u by arm time.
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        if (!ctx.isHost) return;
+        pinSubject(ctx);
+        if (haveSubj_) engine::holdSubjectUpright(ctx.gw, subj_);
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        have_ = engine::commonItemTemplate(ctx.gw, sid_, sizeof(sid_), &type_, PROBE_SID);
+        if (ctx.isHost) pinSubject(ctx);
+        char b[200]; _snprintf(b, sizeof(b) - 1,
+            "CORPSE start role=%s have=%d sid='%s' type=%u subj=%d hand=%u,%u,%u,%u,%u",
+            ctx.isHost ? "host" : "join", have_ ? 1 : 0, sid_, type_, haveSubj_ ? 1 : 0,
+            subj_[0], subj_[1], subj_[2], subj_[3], subj_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (!have_ || (ctx.isHost && !haveSubj_)) { logVerdict(ctx, "no-setup"); return true; }
+        if (!haveLeaders_) latchLeaders(ctx);
+        if (!haveLeaders_) {
+            if (ctx.elapsedMs >= 8000) { logVerdict(ctx, "no-leaders"); return true; }
+            return false;
+        }
+        if (hostBag0_ < 0) { hostBag0_ = countIn(ctx, hostL_); joinBag0_ = countIn(ctx, joinL_); }
+
+        if (ctx.isHost) {
+            if (ctx.elapsedMs < KILL_MS) engine::holdSubjectUpright(ctx.gw, subj_);
+            // Kill, re-asserted on a throttle so it stays dead (death_order's pattern).
+            if (ctx.elapsedMs >= KILL_MS && (killOk_ < 0 || ctx.elapsedMs - lastKillMs_ >= 3000)) {
+                lastKillMs_ = ctx.elapsedMs;
+                bool ok = engine::killSubject(ctx.gw, subj_);
+                if (killOk_ < 0) {
+                    killOk_ = ok ? 1 : 0;
+                    char b[96]; _snprintf(b, sizeof(b) - 1, "CORPSE kill ok=%d", killOk_);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+            if (seeded_ < 0 && ctx.elapsedMs >= SEED_MS) {
+                c0_ = countIn(ctx, subj_);
+                seeded_ = engine::addItemsToContainerBySid(ctx.gw, subj_, sid_, type_, PROBE_QTY,
+                                                          0, 0, 0);
+                haveCorpse_ = true;
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "CORPSE seed c0=%d got=%d now=%d", c0_, seeded_, countIn(ctx, subj_));
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (hostLoot_ < 0 && ctx.elapsedMs >= HOST_LOOT_MS)
+                hostLoot_ = loot(ctx, hostL_, "host");
+        } else {
+            // The join's copy of the corpse: the dead body near us holding the most of
+            // the probe (only the host's seed puts it there - through the sync).
+            if (!haveCorpse_ && ctx.elapsedMs >= SEARCH_MS && ctx.elapsedMs - lastSearchMs_ >= 500) {
+                lastSearchMs_ = ctx.elapsedMs;
+                findCorpse(ctx);
+            }
+            if (joinLoot_ < 0 && ctx.elapsedMs >= JOIN_LOOT_MS)
+                joinLoot_ = haveCorpse_ ? loot(ctx, joinL_, "join") : 0;
+        }
+
+        if (ctx.elapsedMs >= SEED_MS && ctx.elapsedMs - lastLogMs_ >= 500) {
+            lastLogMs_ = ctx.elapsedMs;
+            lastCorpse_ = haveCorpse_ ? countIn(ctx, corpse_) : -1;
+            if (lastCorpse_ > maxCorpse_) maxCorpse_ = lastCorpse_;
+            hostBag_ = countIn(ctx, hostL_);
+            joinBag_ = countIn(ctx, joinL_);
+            ++samples_;
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "CORPSE %s t=%lu corpse=%d hostBag=%d joinBag=%d", ctx.isHost ? "host" : "join",
+                (unsigned long)ctx.elapsedMs, lastCorpse_, hostBag_, joinBag_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.elapsedMs >= dur) { logVerdict(ctx, "done"); return true; }
+        return false;
+    }
+
+private:
+    void pinSubject(const ScenarioContext& ctx) {
+        if (haveSubj_) return;
+        haveSubj_ = engine::pickDownSubject(ctx.gw, subj_);
+        if (!haveSubj_) return;
+        for (int i = 0; i < 5; ++i) corpse_[i] = subj_[i];
+        char b[128]; _snprintf(b, sizeof(b) - 1, "CORPSE pinned hand=%u,%u,%u,%u,%u",
+                               subj_[0], subj_[1], subj_[2], subj_[3], subj_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchLeaders(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int h = tabLeaderIdx(sq, n, 0u), j = tabLeaderIdx(sq, n, 1u);
+        if (h < 0 || j < 0) return;
+        handFromEntity(sq[h], hostL_);
+        handFromEntity(sq[j], joinL_);
+        haveLeaders_ = true;
+        char b[128]; _snprintf(b, sizeof(b) - 1, "CORPSE leaders host=%u,%u join=%u,%u",
+                               hostL_[3], hostL_[4], joinL_[3], joinL_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The join's copy of the corpse is held DOWN by the death latch, not engine-dead,
+    // so any non-squad body qualifies; the probe (only the host's seed puts it there,
+    // through the sync) picks it out.
+    void findCorpse(const ScenarioContext& ctx) {
+        const unsigned int MAXC = 64;
+        static engine::CorpseRead rows[MAXC]; // main-thread only
+        unsigned int n = engine::enumNpcBodiesNear(ctx.gw, 100.0f, rows, MAXC,
+                                                   /*deadOnly=*/false);
+        int best = 0, bi = -1;
+        for (unsigned int i = 0; i < n; ++i) {
+            int c = countIn(ctx, rows[i].hand);
+            if (c > best) { best = c; bi = (int)i; }
+        }
+        if (bi < 0) return;
+        for (int i = 0; i < 5; ++i) corpse_[i] = rows[bi].hand[i];
+        haveCorpse_ = true;
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "CORPSE found hand=%u,%u,%u,%u,%u probe=%d bodies=%u",
+            corpse_[0], corpse_[1], corpse_[2], corpse_[3], corpse_[4], best, n);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    int loot(const ScenarioContext& ctx, const unsigned int dst[5], const char* who) {
+        // suspendVeto=false: exactly the UI drag, subject to the cross-owner veto.
+        int moved = engine::moveItemBetweenContainers(ctx.gw, corpse_, dst, sid_, type_, 1,
+                                                      /*suspendVeto=*/false);
+        char b[128]; _snprintf(b, sizeof(b) - 1, "CORPSE loot by=%s moved=%d corpse=%d",
+                               who, moved, countIn(ctx, corpse_));
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return moved;
+    }
+
+    // Probe units in the container at h (-1 when it does not resolve here).
+    int countIn(const ScenarioContext& ctx, const unsigned int h[5]) {
+        if (engine::resolveObjectByHand(h) == 0) return -1;
+        InvItemEntry items[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(ctx.gw, h, items, INV_ITEMS_MAX, 0);
+        int q = 0;
+        for (unsigned int i = 0; i < n; ++i)
+            if (items[i].itemType == type_ && strcmp(items[i].stringID, sid_) == 0)
+                q += (items[i].quantity < 1) ? 1 : (int)items[i].quantity;
+        return q;
+    }
+
+    void logVerdict(const ScenarioContext& ctx, const char* why) {
+        // Local mechanics only; the cross-client counts are the oracle's.
+        passed_ = ctx.isHost ? (killOk_ == 1 && seeded_ == PROBE_QTY && hostLoot_ == 1)
+                             : (haveCorpse_ && joinLoot_ == 1);
+        char b[320]; _snprintf(b, sizeof(b) - 1,
+            "CORPSE verdict role=%s pass=%d why=%s sid='%s' c0=%d seeded=%d hostLoot=%d "
+            "joinLoot=%d maxCorpse=%d finalCorpse=%d hostBag0=%d hostBagF=%d joinBag0=%d "
+            "joinBagF=%d samples=%u",
+            ctx.isHost ? "host" : "join", passed_ ? 1 : 0, why, sid_, c0_, seeded_, hostLoot_,
+            joinLoot_, maxCorpse_, lastCorpse_, hostBag0_, hostBag_, joinBag0_, joinBag_,
+            samples_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    static const char*         PROBE_SID;
+    static const int           PROBE_QTY        = 3;
+    static const unsigned long KILL_MS          = 8000;
+    static const unsigned long SEED_MS          = 12000;
+    static const unsigned long SEARCH_MS        = 14000;
+    static const unsigned long HOST_LOOT_MS     = 24000;
+    static const unsigned long JOIN_LOOT_MS     = 34000;
+    static const unsigned long JOIN_DURATION_MS = 54000;
+    static const unsigned long HOST_DURATION_MS = 56000;
+    static const unsigned int  MAX_SQUAD        = 32;
+    bool          have_, haveSubj_, haveLeaders_, haveCorpse_;
+    unsigned int  type_;
+    int           killOk_, c0_, seeded_, hostLoot_, joinLoot_;
+    unsigned long lastKillMs_, lastLogMs_, lastSearchMs_;
+    int           maxCorpse_, lastCorpse_, hostBag0_, joinBag0_, hostBag_, joinBag_;
+    unsigned int  samples_;
+    unsigned int  subj_[5], corpse_[5], hostL_[5], joinL_[5];
+    char          sid_[48];
+};
+// A stacking ITEM (created as single stacks of 2-4 in earlier runs).
+const char* CorpseLootScenario::PROBE_SID = "95781-rebirth.mod";
+
 Scenario* makeInventoryScenario(const std::string& name) {
+    if (name == "corpse_loot") return new CorpseLootScenario();
     // Same scenario twice: the plain run proves the round trip converges, and the
     // _refuse run drives it with the first re-home refused (KENSHICOOP_WD_REFUSE_REHOME),
     // which is the only deterministic way to exercise the retry + verify-then-destroy

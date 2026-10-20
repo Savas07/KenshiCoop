@@ -695,6 +695,13 @@ public:
     // PKT_VENDOR_DELTA and stay out of the protocol-37 transfer detector.
     void setVendorSync(bool v) { vendorSync_ = v; }
 
+    // Shared corpse inventories (protocol 62, KENSHICOOP_CORPSE_SYNC, upstream
+    // #40). Host: the storeSync_ census also takes the DEAD non-squad
+    // characters near the interest centers and authors their inventories
+    // (INV_FLAG_CORPSE) under the body's stream key. Join: nothing to enable -
+    // a flagged key resolves through proxyByKey_ (handForContainerKey).
+    void setCorpseSync(bool v) { corpseSync_ = v; }
+
     // Connect-edge resync (protocol 30, no wire change): called from the
     // game-thread connect drain (processNetEvents) when a peer appears (host
     // on HELLO, join on WELCOME - covers late joins AND quick reconnects).
@@ -1640,9 +1647,10 @@ private:
     // truncated (protocol 46): the author's container did not fit in INV_ITEMS_MAX, so
     // `items` is an INCOMPLETE description - reconcile additive-only, never delete.
     // shop (protocol 60): the author flagged the container INV_FLAG_SHOP;
+    // corpse (protocol 62): INV_FLAG_CORPSE - the key is a body's stream key;
     // recvMs: when its latest snapshot arrived (freshness of the mirror).
     struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; bool truncated;
-                     bool shop; unsigned long recvMs; };
+                     bool shop; bool corpse; unsigned long recvMs; };
     std::set<Key>          ownedContainers_;
     std::map<Key, InvPub>  invPub_;
     std::map<Key, InvRecv> invRecv_;
@@ -1655,6 +1663,12 @@ private:
     bool           storeSync_;
     unsigned long  contCensusMs_;
     std::set<Key>  censusContainers_;
+    // Protocol 62. Host: the census rows that are corpses, wire (stream) key ->
+    // LOCAL hand. They differ only for a body we drive as a bound proxy of a
+    // peer's stream (proxyByKey_); every other corpse maps to itself. The
+    // corpse keys are in censusContainers_ too (same authoring + gating).
+    bool           corpseSync_;
+    std::map<Key, Key> censusCorpses_;
     // Protocol 60. Host: the census rows that are shop counters (their
     // snapshots carry INV_FLAG_SHOP). Join: per mirrored counter, the per-item
     // totals the host last put there (vendorBase_) and the unsettled local
@@ -2492,13 +2506,22 @@ private:
     // where using the key verbatim reads and writes nothing. Keys WE author are
     // already local and are never translated, so an unlucky collision between
     // our hand for one fixture and the peer's for another cannot bite.
+    // Corpses (protocol 62) are the one translated case among keys we author: a
+    // census corpse we drive as a bound proxy is keyed by its stream key.
     void handForContainerKey(const Key& k, unsigned int out[5],
                              u32 sender = OWNER_ID_ALL) const {
+        if (corpseLocalHand(k, out))
+            return;
         if (ownedContainers_.count(k) == 0 && ownHands_.count(k) == 0 &&
             localHandForFixtureKey(k, out, sender))
             return;
         out[0] = k.t; out[1] = k.c; out[2] = k.cs; out[3] = k.i; out[4] = k.s;
     }
+    // Protocol 62: the LOCAL hand for a corpse key - our own census corpse
+    // (censusCorpses_) or a peer's flagged snapshot whose stream key we drive
+    // as a minted/adopted proxy (proxyByKey_). False for anything else, and for
+    // a flagged key that is not a proxy here (it resolves verbatim).
+    bool corpseLocalHand(const Key& k, unsigned int out[5]) const;
     // Protocol 56: which player authors a container we do NOT author - the
     // sender of its latest snapshot (InvRecv::ownerId). OWNER_ID_ALL = unknown
     // (no snapshot yet). Used to pick the fixture hand space and the expected

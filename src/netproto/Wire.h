@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 61;
+const u16 PROTOCOL_VERSION = 62;
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -592,6 +592,11 @@ const u8 INV_FLAG_TRUNCATED = 0x01;
 // host: every change it sees there that the host's snapshot did not put there
 // (a purchase, a sale) goes back as a PKT_VENDOR_DELTA.
 const u8 INV_FLAG_SHOP      = 0x02;
+// Protocol 62: the container is a DEAD non-squad character's inventory (a corpse)
+// the host censuses. The key is the body's STREAM key (the hand the author drives
+// it under), so a receiver whose copy is a minted/adopted proxy resolves it
+// through its proxy map instead of verbatim - the body's own local hand differs.
+const u8 INV_FLAG_CORPSE    = 0x04;
 
 // A full snapshot ([header][InvItemEntry*count]) can now exceed one datagram (each entry
 // carries two 48-byte template ids), but inv snapshots ride the RELIABLE channel, which

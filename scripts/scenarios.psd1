@@ -2369,6 +2369,17 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
+        # corpse_loot gates shared corpse inventories (upstream #40): the host kills an NPC,
+        # seeds probe units and loots one, the join loots one from its own copy - both
+        # sides must end on the same corpse count and each looted unit exist exactly once.
+        corpse_loot = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'down1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'corpse_loot'
+            Gating   = @('corpse_loot', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
         # inv_regear gates the W2 round trip's ONE-INSTANCE invariant: after the peer picks
         # up gear WE dropped, the item is in its bag AND gone from our ground - the manual
         # session's "a few items stayed on the host's ground" was the duplicate outcome.
