@@ -1955,6 +1955,104 @@ void closeTradeWindow() {
     __try { g_guiCloseTradeFn(g); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+namespace {
+// Occurrences of `it` in inv: its item list (*all) and its sections' grids
+// (*sec). Caller holds SEH.
+void heldCounts(Inventory* inv, Item* it, int* all, int* sec) {
+    *all = 0; *sec = 0;
+    if (!inv || !it) return;
+    lektor<Item*>& items = inv->_allItems;
+    unsigned int n = items.size();
+    for (unsigned int i = 0; i < n; ++i) if (items[i] == it) ++*all;
+    if (!g_getSectionsFn) return;
+    lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+    unsigned int ns = secs ? secs->size() : 0;
+    for (unsigned int s = 0; s < ns; ++s) {
+        InventorySection* sc = (*secs)[s];
+        if (!sc) continue;
+        const Ogre::vector<InventorySection::SectionItem>::type& si = sc->items;
+        for (unsigned int i = 0; i < (unsigned int)si.size(); ++i) if (si[i].item == it) ++*sec;
+    }
+}
+
+bool isHeld(Inventory* inv, Item* it) {
+    int a = 0, s = 0;
+    heldCounts(inv, it, &a, &s);
+    return a > 0 || s > 0;
+}
+
+// The drop half of the trade-window drag: put `got` into inv EXACTLY once.
+// Placement is judged by whether inv now holds the stack, not by the add's
+// return value - vs_after2 / vs_before3 / vs_before4: an add reported failure
+// after placing the stack, the next add placed the SAME Item* again, and the
+// buyer's bag listed one purchase twice (selling it later removed both).
+// Returns 1 already held (buyItem placed it), 2 a loose section, 3 the
+// inventory's own add (dropped at the feet when full). Caller holds SEH.
+int placeOnce(Inventory* inv, Item* got, int q, int* secRet) {
+    *secRet = -1;
+    if (isHeld(inv, got)) return 1;
+    if (g_getSectionsFn) {
+        GameData* gd = got->getGameData();
+        lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+        unsigned int ns = secs ? secs->size() : 0;
+        for (unsigned int s = 0; s < ns; ++s) {
+            InventorySection* sec = (*secs)[s];
+            if (!sec || sec->isAnEquippedItemSection || sec->containerSlot) continue;
+            if (gd && !sec->hasRoomForItem(gd, q)) continue;   // virtual
+            bool r = sec->addItem(got, q);                     // virtual
+            if (r || isHeld(inv, got)) { *secRet = r ? 1 : 0; return 2; }
+        }
+    }
+    inv->addItem(got, q, /*dropOnFail=*/true, /*destroyOnFail=*/false);
+    return 3;
+}
+
+// Total units of sid on inv's top level. Caller holds SEH.
+int unitsOf(Inventory* inv, const char* sid) {
+    InvItemEntry ent[96];
+    unsigned int ne = readInvItems(inv, ent, 0, 96);
+    int q = 0;
+    for (unsigned int i = 0; i < ne; ++i)
+        if (strcmp(ent[i].stringID, sid) == 0) q += (ent[i].quantity < 1) ? 1 : (int)ent[i].quantity;
+    return q;
+}
+
+// The trade window's shop view is a ShopTraderInventory: its vtable slot 0x78
+// is _addItem (KenshiLib ShopTraderInventory.h). A plain Inventory's vtable
+// ends at 0x68. Caller holds SEH.
+bool isShopTraderInv(Inventory* inv) {
+    if (!inv || !g_stiAddItemFn) return false;
+    void** vt = *reinterpret_cast<void***>(inv);
+    return vt && vt[0x78 / sizeof(void*)] == reinterpret_cast<void*>(g_stiAddItemFn);
+}
+
+// The open trade window's ShopTraderInventory: the ShopTrader the trade UI
+// shows (ForgottenGUI::inventoryWindowTrader), else a ShopTrader near the
+// counter whose shop view is built. *src: 1 trade UI, 2 nearby, 0 none.
+Inventory* openShopView(GameWorld* gw, RootObject* counter, int* src) {
+    *src = 0;
+    ForgottenGUI* g = ::gui;
+    if (g) {
+        const hand& h = g->inventoryWindowTrader;
+        unsigned int th[5] = { (unsigned int)h.type, h.container, h.containerSerial,
+                               h.index, h.serial };
+        RootObject* ro = resolveObjectByHand(th);
+        Inventory* inv = ro ? invOf(ro) : 0;
+        if (isShopTraderInv(inv)) { *src = 1; return inv; }
+    }
+    if (!g_getObjsFn || !counter) return 0;
+    Ogre::Vector3 center = counter->getPosition();
+    g_npcQuery.clear();
+    g_getObjsFn(gw, &g_npcQuery, &center, 100.0f, SHOP_TRADER_CLASS, 64, 0);
+    unsigned int total = g_npcQuery.size();
+    for (unsigned int i = 0; i < total; ++i) {
+        Inventory* inv = invOf(g_npcQuery[i]);
+        if (isShopTraderInv(inv)) { *src = 2; return inv; }
+    }
+    return 0;
+}
+} // namespace
+
 int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
                   const unsigned int buyerHand[5], bool pickLast,
                   char* outSid, unsigned int sidLen, int* outQty) {
@@ -1986,24 +2084,72 @@ int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
         if (!got) return 0;
         int q = got->quantity; if (q < 1) q = 1;
         if (outQty) *outQty = q;
-        // The drop half of the trade-window drag. ONE placement: a loose section
-        // of the receiver first (a shop counter refuses the inventory-level
-        // tryAddItem - vs_before4: the sold stack never reached the counter -
-        // and a failed tryAddItem followed by addItem placed one bought stack
-        // twice), else the inventory's own add, dropped at the feet if full.
-        bool placed = false;
-        if (g_getSectionsFn) {
-            GameData* gd = got->getGameData();
-            lektor<InventorySection*>* secs = g_getSectionsFn(binv);
-            unsigned int ns = secs ? secs->size() : 0;
-            for (unsigned int s = 0; s < ns && !placed; ++s) {
-                InventorySection* sec = (*secs)[s];
-                if (!sec || sec->isAnEquippedItemSection || sec->containerSlot) continue;
-                if (gd && !sec->hasRoomForItem(gd, q)) continue;   // virtual
-                placed = sec->addItem(got, q);                     // virtual
-            }
+        int secRet = -1;
+        int how = placeOnce(binv, got, q, &secRet);
+        int occAll = 0, occSec = 0;
+        heldCounts(binv, got, &occAll, &occSec);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[vendor] TRADE-PLACE sid='%s' q=%d same=%d how=%d secRet=%d occAll=%d occSec=%d",
+                  ent[pick].stringID, q, got == items[pick] ? 1 : 0, how, secRet, occAll, occSec);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int vendorSellTo(GameWorld* gw, const unsigned int sellerHand[5],
+                 const unsigned int counterHand[5],
+                 char* outSid, unsigned int sidLen, int* outQty) {
+    if (outSid && sidLen) outSid[0] = '\0';
+    if (outQty) *outQty = 0;
+    if (!gw || !sellerHand || !counterHand || !g_buyItemFn) return -1;
+    RootObject* seller  = resolveObjectByHand(sellerHand);
+    RootObject* counter = resolveObjectByHand(counterHand);
+    if (!seller || !counter) return -1;
+    __try {
+        Inventory* sinv = invOf(seller);
+        Inventory* cinv = invOf(counter);
+        if (!sinv || !cinv) return -1;
+        InvItemEntry ent[96];
+        Item* items[96];
+        unsigned int ne = readInvItems(sinv, ent, items, 96);
+        int pick = -1;
+        for (unsigned int i = 0; i < ne; ++i)
+            if (items[i] && !ent[i].equipped) pick = (int)i; // the last loose stack
+        if (pick < 0) return 0;
+        const char* sid = ent[pick].stringID;
+        if (outSid && sidLen) { strncpy(outSid, sid, sidLen - 1); outSid[sidLen - 1] = '\0'; }
+        int c0 = unitsOf(cinv, sid);
+        int view = 0;
+        Inventory* shop = openShopView(gw, counter, &view);
+        // The money half: buyItem on the seller's bag pays the seller from the
+        // counter's cash and takes the stack out of the bag.
+        Item* got = g_buyItemFn(sinv, items[pick], counter);
+        if (!got) return 0;
+        int q = got->quantity; if (q < 1) q = 1;
+        if (outQty) *outQty = q;
+        // The drop half, as the trade window performs it: the shop view's own
+        // add spreads the stack over the shop's counters.
+        int ret = -1;
+        if (shop) ret = g_stiAddItemFn(shop, got, q) ? 1 : 0;
+        int how = 0, secRet = -1;
+        if (ret != 1 && !isHeld(cinv, got) && !isHeld(sinv, got)) {
+            // The shop view did not take it. Unless it landed on another of the
+            // shop's counters (its owner hand moved off the seller), the
+            // counter's own placement - never a second copy.
+            const hand& wh = got->_whosInventoryWeAreIn;
+            unsigned int w[5] = { (unsigned int)wh.type, wh.container, wh.containerSerial,
+                                  wh.index, wh.serial };
+            bool stillSellers = memcmp(w, sellerHand, sizeof(w)) == 0;
+            if (shop == 0 || stillSellers) how = placeOnce(cinv, got, q, &secRet);
         }
-        if (!placed) binv->addItem(got, q, /*dropOnFail=*/true, /*destroyOnFail=*/false);
+        int c1 = unitsOf(cinv, sid);
+        char b[256];
+        _snprintf(b, sizeof(b) - 1,
+                  "[vendor] SELL-PLACE sid='%s' q=%d view=%d ret=%d fallback=%d secRet=%d "
+                  "counterQty=%d->%d",
+                  sid, q, view, ret, how, secRet, c0, c1);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         return 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }

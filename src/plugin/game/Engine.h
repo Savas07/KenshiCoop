@@ -2257,16 +2257,24 @@ void closeTradeWindow();
 // SEH-guarded: ONE purchase exactly as the trade window performs it - the
 // engine's Inventory::buyItem on the stock container at srcHand (debits the
 // player pool, credits the shop, takes the stack out of stock), then the
-// returned stack is put into the buyer's inventory (the drop half of the UI
-// drag; buyItem itself only hands the item back). pickLast selects the last
-// loose stack instead of the first. Writes the bought sid + units.
+// returned stack is put into the buyer's inventory EXACTLY once (the drop half
+// of the UI drag; buyItem itself only hands the item back). pickLast selects
+// the last loose stack instead of the first. Writes the bought sid + units and
+// logs "[vendor] TRADE-PLACE" (how the stack went in, how often it is held).
 // Returns 1 bought, 0 nothing to buy / refused, -1 fault or unresolved.
 int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
                   const unsigned int buyerHand[5], bool pickLast,
                   char* outSid, unsigned int sidLen, int* outQty);
-// A SALE is the same call with the roles swapped (srcHand = the seller's
-// character, buyerHand = the shop counter): the engine debits the counter's
-// cash, credits the player pool, and the stack lands on the counter.
+// SEH-guarded: ONE sale exactly as the trade window performs it - the seller's
+// last loose stack goes through Inventory::buyItem on the seller's bag with the
+// counter as the buyer (the counter's cash pays the player pool), then drops
+// into the open trade window's shop view, the ShopTraderInventory, whose own
+// add (_addItem -> _addItemToInventories) puts it on the shop's counters. With
+// no shop view open it is placed on counterHand directly. Logs "[vendor]
+// SELL-PLACE". Returns 1 sold, 0 nothing to sell / refused, -1 fault.
+int vendorSellTo(GameWorld* gw, const unsigned int sellerHand[5],
+                 const unsigned int counterHand[5],
+                 char* outSid, unsigned int sidLen, int* outQty);
 // SEH-guarded (protocol 60): the shop's cash as the counter reports it
 // (RootObject::getMoney - the money a trade at this counter moves).
 bool readShopCash(const unsigned int cHand[5], int* outCash);

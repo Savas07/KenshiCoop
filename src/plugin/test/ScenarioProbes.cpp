@@ -1173,8 +1173,8 @@ private:
     }
 
     // One sale: the last loose stack of this side's tab leader goes to the
-    // shop's first counter through the same engine call a purchase uses, with
-    // the roles swapped. VSELL carries the pool and the shop cash around it.
+    // shop through the open trade window's shop view (engine::vendorSellTo).
+    // VSELL carries the pool and the shop cash around it.
     void doSell(const ScenarioContext& ctx) {
         unsigned int sh[5];
         unsigned int dst[5] = { 0, 0, 0, 0, 0 };
@@ -1187,7 +1187,7 @@ private:
         if (ownLeaderHand(ctx, sh) && (dst[3] != 0 || dst[4] != 0)) {
             engine::readPlayerWallet(ctx.gw, &w0);
             engine::readShopCash(dst, &c0);
-            res = engine::vendorBuyInto(ctx.gw, sh, dst, /*pickLast=*/true, sid, sizeof(sid), &qty);
+            res = engine::vendorSellTo(ctx.gw, sh, dst, sid, sizeof(sid), &qty);
             engine::readPlayerWallet(ctx.gw, &w1);
             engine::readShopCash(dst, &c1);
         }
