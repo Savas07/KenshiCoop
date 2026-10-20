@@ -127,6 +127,15 @@ const unsigned long TASK_RETRY_MS = 1500;  // throttle between pose apply attemp
 // reproducing the order. Above transient blips (1-2 frames at 20 Hz), below the
 // player-perceptible "why is it still mining" threshold.
 const unsigned long TASK_CLEAR_MS = 1200;
+// Lapsed machine pose (ore fix, run f7_bench): a held OPERATE_MACHINERY copy can
+// drop its action LOCALLY (the host's bench finished a craft / went FULL) while
+// the owner's body is back at work within a blip shorter than TASK_CLEAR_MS, so
+// the held pose is never released and never re-taken - and since the host is the
+// only sim that runs machine work, that worker's production stops. A copy idle
+// this long under a streamed work task is re-posed; repeats back off (x2 up to
+// x16) so a machine that stays FULL is not re-ordered every few seconds.
+const unsigned long TASK_LAPSE_MS = 2000;
+const unsigned int  TASK_LAPSE_BACKOFF_MAX = 4;
 // A far-fixture apply (r=3) is RETRIED, not latched bad: a snap-into-fixture on
 // the owner (bed entry teleports the body ~9 u instantly) streams the task while
 // the join's interp target is still mid-glide, so the first distance gate fails

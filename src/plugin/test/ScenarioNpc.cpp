@@ -324,22 +324,34 @@ private:
 // host places and completes one in front of its leader (the prod_sync lever,
 // minted on the join by protocol 27 and paired by protocol 55), and the join's
 // rank-1 member is ordered to operate it. The lines and the oracle are shared:
-// "ore" is then the bench's output item, "mine" the bench.
+// "ore" is then the bench's crafted item, "mine" the bench. A bench is only
+// workable with a crafting job (b5_bench: an empty queue left the ordered member
+// at task=65535), so each side that queues gives its local bench the job the
+// crafting UI would (a first-aid kit on a first-aid desk - no blueprint needed,
+// fabrics only), with repeat on. bench_yield_join queues on BOTH clients - the
+// save-carried queue a shared base has - and bench_yield_joinq on the join only
+// - a job the join player queued mid-session, which the host's copy of the
+// bench never has. The bench mints are counted by the [craftspy] DONE trace.
 class MineYieldScenario : public TimedScenario {
 public:
-    MineYieldScenario(const char* name, unsigned int ownerRank, bool bench)
+    MineYieldScenario(const char* name, unsigned int ownerRank, bool bench, bool queueHost)
         : TimedScenario(name, 1000), ownerRank_(ownerRank), bench_(bench),
+          queueHost_(queueHost),
           haveMiner_(false), orderLogged_(false), orderOk_(false), peerSeen_(false),
           peerAtMs_(0), lastOrderMs_(0), lastVoteMs_(0), lastCollectMs_(0),
           samples_(0), placed_(false), placeOk_(false), rampStep_(0),
-          nextRampMs_(0), lastTask_(-1) {
+          nextRampMs_(0), lastTask_(-1), queued_(false), queueTries_(0),
+          lastQueueMs_(0) {
         for (int i = 0; i < 5; ++i) { minerHand_[i] = 0; benchHand_[i] = 0; }
+        strncpy(craftSid_, bench ? BENCH_ITEM_SID : "", sizeof(craftSid_) - 1);
+        craftSid_[sizeof(craftSid_) - 1] = '\0';
     }
 
     virtual void onGameplay(const ScenarioContext& ctx) { pinMiner(ctx); }
 
     virtual void onStart(const ScenarioContext& ctx) {
         pinMiner(ctx);
+        if (bench_) engine::installCraftDoneTrace();
         if (!haveMiner_) {
             char b[128];
             _snprintf(b, sizeof(b) - 1,
@@ -365,8 +377,10 @@ public:
             peerAtMs_ = ctx.elapsedMs;
         }
         const unsigned long t = ctx.elapsedMs - peerAtMs_;
-        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        unsigned long dur = ctx.isHost ? (bench_ ? BENCH_HOST_DURATION_MS : HOST_DURATION_MS)
+                                       : (bench_ ? BENCH_JOIN_DURATION_MS : JOIN_DURATION_MS);
         if (bench_ && ctx.isHost) placeBench(ctx, t);
+        if (bench_ && (owner || queueHost_)) queueCraft(ctx, t);
         // Speed votes: consensus is min(host, join), so BOTH sides vote 5x through
         // the loud click path (a real user request), re-asserted on a timer.
         if (t >= ORDER_AT_MS && t - lastVoteMs_ >= 5000) {
@@ -387,7 +401,10 @@ public:
                 orderLogged_ = true;
             }
         }
-        if (owner && haveMiner_ && t >= ORDER_AT_MS && t - lastCollectMs_ >= COLLECT_MS) {
+        const unsigned long collectEnd =
+            (bench_ ? BENCH_JOIN_DURATION_MS : JOIN_DURATION_MS) - SETTLE_MS;
+        if (owner && haveMiner_ && t >= ORDER_AT_MS && t < collectEnd &&
+            t - lastCollectMs_ >= COLLECT_MS) {
             lastCollectMs_ = t;
             collect(ctx, t);
         }
@@ -402,18 +419,32 @@ public:
 
 private:
     // The mine1 node pays ~0.0105 unit/s at 1x for the pinned miner
-    // (base_mine_pose2), so 5x gives a unit per ~19 s from ONE sim. The window is
-    // short on purpose: a hostile group reaches the node ~75 s after the order at
-    // 5x (first mine_yield run: combat at t=77 s capped the speed to 1x and pulled
-    // the miner off the node), so the yield is judged on the ~3 units before it.
+    // (base_mine_pose2), so 5x gives a unit per ~19 s from ONE sim. The work
+    // window is short on purpose: a hostile group reaches the node ~75 s after
+    // the order at 5x (first mine_yield run: combat at t=77 s capped the speed to
+    // 1x and pulled the miner off the node), so the yield is judged on the ~3
+    // units before it. The owner stops collecting SETTLE_MS before the join's
+    // window ends: the last collect's transfer holds a latched unit on the host's
+    // copy for ~15 s ("[xfer] latch-expired ... delta=1"), and v_f6_mine_yield_join
+    // ended sampling 1 s after it, so the final parity read the latch (copy 4 vs
+    // owner 3). Collection still stops at 130 s, as before.
     static const unsigned long ORDER_AT_MS      = 18000;
     static const unsigned long COLLECT_MS       = 4000;
-    static const unsigned long JOIN_DURATION_MS = 130000;
-    static const unsigned long HOST_DURATION_MS = 150000; // outlive the join + a latch grace
+    static const unsigned long SETTLE_MS        = 30000;
+    static const unsigned long JOIN_DURATION_MS = 160000;
+    static const unsigned long HOST_DURATION_MS = 180000; // outlive the join + a latch grace
+    // Bench mode: a first-aid kit is a longer job than a mine unit, and the
+    // 'sync' base has no raiders, so the bench works for longer.
+    static const unsigned long BENCH_JOIN_DURATION_MS = 220000;
+    static const unsigned long BENCH_HOST_DURATION_MS = 240000;
+    static const unsigned long QUEUE_AT_MS      = 9000;   // bench mode: after the ramp
     static const int           OPERATE_TASK     = 87;     // OPERATE_MACHINERY
     static const unsigned int  MAX_SQ           = 32;
     static const unsigned long PLACE_AT_MS      = 3000;   // bench mode: host places
     static const int           CRAFTING_CLASS   = 6;      // BCTYPE_CRAFTING
+    static const int           BENCH_KIND       = 4;      // probePlaceMachine: first-aid desk
+    static const unsigned int  ITEM_CATEGORY    = 4;      // itemType ITEM
+    static const char*         BENCH_ITEM_SID;            // the job: Basic First Aid Kit
     static const float         SPEED_MULT;
 
     void pinMiner(const ScenarioContext& ctx) {
@@ -468,7 +499,7 @@ private:
         if (!placed_ && t >= PLACE_AT_MS) {
             placed_ = true;
             char sid[64]; sid[0] = '\0';
-            int rc = engine::probePlaceMachine(ctx.gw, 10.0f, -2.0f, /*kind*/1, benchHand_,
+            int rc = engine::probePlaceMachine(ctx.gw, 10.0f, -2.0f, BENCH_KIND, benchHand_,
                                                sid, sizeof(sid));
             placeOk_ = (rc == 1);
             nextRampMs_ = t + 1000;
@@ -496,6 +527,38 @@ private:
         }
     }
 
+    // Bench mode, each side that queues: give the LOCAL bench (the host's
+    // placement / the join's minted copy) its crafting job once it exists
+    // complete - retried every 3 s, at most 10 times.
+    void queueCraft(const ScenarioContext& ctx, unsigned long t) {
+        if (queued_ || queueTries_ >= 10 || t < QUEUE_AT_MS) return;
+        if (queueTries_ > 0 && t - lastQueueMs_ < 3000) return;
+        unsigned int mh[5];
+        if (!localMachine(ctx.gw, mh)) return;
+        ++queueTries_;
+        lastQueueMs_ = t;
+        char sid[48]; sid[0] = '\0';
+        int rc = engine::probeQueueCraft(ctx.gw, mh, BENCH_ITEM_SID, ITEM_CATEGORY,
+                                         sid, sizeof(sid));
+        queued_ = (rc > 0);
+        if (queued_ && sid[0]) {
+            strncpy(craftSid_, sid, sizeof(craftSid_) - 1);
+            craftSid_[sizeof(craftSid_) - 1] = '\0';
+        }
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO MINEYIELD craft-queue side=%s t=%lu try=%u rc=%d item='%s' "
+                  "mach=%u.%u.%u.%u.%u",
+                  ctx.isHost ? "host" : "join", t, queueTries_, rc, sid,
+                  mh[0], mh[1], mh[2], mh[3], mh[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The item this side counts: the node's output, or the bench's job item.
+    const char* countedSid(const engine::ProdRead& pr) const {
+        return bench_ ? craftSid_ : pr.outSid;
+    }
+
     // Owner, bench mode: a player order to operate the bench (re-issued only
     // while the member is not already on it - re-ordering thrashes the pose).
     bool orderBench(const ScenarioContext& ctx) {
@@ -514,22 +577,24 @@ private:
         RootObject* mine = localMachine(ctx.gw, mh);
         if (!mine) return;
         engine::ProdRead pr;
-        if (!engine::readMachineByHand(mh, &pr) || !pr.outSid[0]) return;
+        if (!engine::readMachineByHand(mh, &pr)) return;
+        const char* sid = countedSid(pr);
+        if (!sid[0]) return;
         InvItemEntry it[INV_ITEMS_MAX];
         unsigned int n = engine::captureContainerContents(ctx.gw, mh, it, INV_ITEMS_MAX, 0);
         int want = 0; unsigned int type = 0;
         for (unsigned int i = 0; i < n; ++i) {
-            if (strcmp(it[i].stringID, pr.outSid) != 0) continue;
+            if (strcmp(it[i].stringID, sid) != 0) continue;
             want += (it[i].quantity < 1) ? 1 : (int)it[i].quantity;
             type = it[i].itemType;
         }
         if (want <= 0) return;
-        int moved = engine::moveItemBetweenContainers(ctx.gw, mh, minerHand_, pr.outSid,
+        int moved = engine::moveItemBetweenContainers(ctx.gw, mh, minerHand_, sid,
                                                       type, want);
         char b[200];
         _snprintf(b, sizeof(b) - 1,
                   "SCENARIO MINEYIELD COLLECT side=%s t=%lu want=%d moved=%d sid='%s'",
-                  ctx.isHost ? "host" : "join", t, want, moved, pr.outSid);
+                  ctx.isHost ? "host" : "join", t, want, moved, sid);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
@@ -553,7 +618,7 @@ private:
         memset(&pr, 0, sizeof(pr));
         pr.outAmount = -1.0f;
         bool havePr = mine && engine::readMachineByHand(mh, &pr);
-        const char* sid = havePr ? pr.outSid : "";
+        const char* sid = havePr ? countedSid(pr) : "";
         int ore = haveMiner_ ? countSid(ctx.gw, minerHand_, sid) : -1;
         int mineInv = mine ? countSid(ctx.gw, mh, sid) : -1;
         int task = -1;
@@ -578,10 +643,22 @@ private:
                   mh[0], mh[1], mh[2], mh[3], mh[4], havePr ? pr.outAmount : -1.0f,
                   mineInv, sid, mult);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!bench_ || !havePr) return;
+        engine::CraftRead cr;
+        bool haveCr = engine::probeReadCraft(mh, &cr);
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO MINEYIELD CRAFT side=%s t=%lu read=%d q=%d n=%d rep=%d "
+                  "prog=%.4f rate=%.4f end=%.3f err=%d item='%s' state=%d in0=%.3f "
+                  "in0sid='%s' nIn=%d",
+                  ctx.isHost ? "host" : "join", t, haveCr ? 1 : 0, cr.queued, cr.nCraft,
+                  cr.repeat, cr.progress, cr.rate, cr.endTime, cr.err, cr.sid,
+                  pr.productionState, pr.inAmount[0], pr.inSid[0], pr.nInputs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
     unsigned int  ownerRank_;
     bool          bench_;
+    bool          queueHost_;
     bool          haveMiner_;
     bool          orderLogged_;
     bool          orderOk_;
@@ -598,8 +675,13 @@ private:
     int           lastTask_;
     unsigned int  minerHand_[5];
     unsigned int  benchHand_[5];
+    bool          queued_;
+    unsigned int  queueTries_;
+    unsigned long lastQueueMs_;
+    char          craftSid_[48];
 };
 const float MineYieldScenario::SPEED_MULT = 5.0f;
+const char* MineYieldScenario::BENCH_ITEM_SID = "209-gamedata.base";
 
 // down_order (Stage 2, LIVE transition): the body-state analog of craft_order. The
 // subject starts UPRIGHT (down1 loaded WITHOUT host re-arm, so nothing downs it), the
@@ -1271,9 +1353,11 @@ Scenario* makeNpcScenario(const std::string& name) {
     if (name == "npc_sync")     return new NpcSyncScenario();
     if (name == "craft_order")  return new CraftOrderScenario();
     if (name == "mine_pose")    return new MinePoseScenario();
-    if (name == "mine_yield")       return new MineYieldScenario("mine_yield", 0, false);
-    if (name == "mine_yield_join")  return new MineYieldScenario("mine_yield_join", 1, false);
-    if (name == "bench_yield_join") return new MineYieldScenario("bench_yield_join", 1, true);
+    if (name == "mine_yield")       return new MineYieldScenario("mine_yield", 0, false, false);
+    if (name == "mine_yield_join")  return new MineYieldScenario("mine_yield_join", 1, false, false);
+    if (name == "bench_yield_join") return new MineYieldScenario("bench_yield_join", 1, true, true);
+    if (name == "bench_yield_joinq")
+        return new MineYieldScenario("bench_yield_joinq", 1, true, false);
     if (name == "down_order")   return new DownOrderScenario();
     if (name == "death_order")  return new DeathOrderScenario();
     if (name == "spawn_probe")  return new SpawnSyncScenario(/*probe=*/true);

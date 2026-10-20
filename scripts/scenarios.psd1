@@ -630,11 +630,13 @@
         # [xfer] fold lines. The script's clock starts when the peer is in the
         # world, so Seconds leaves room for a host that armed on the 45 s timeout
         # while the join was still loading (the process exits 4 s after RESULT).
+        # Collection stops 30 s before the join's window ends (130 s of 160 s) so
+        # the last transfer's latch settles before the final-parity read.
         mine_yield = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'
                          KENSHICOOP_CELL_AUTH = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'mine1'; Setup = ''; Tolerance = 3.0
-            Seconds = 330; KillGraceSec = 340
+            Seconds = 390; KillGraceSec = 400
             PrimaryGate = 'mine_yield'
             Gating   = @('mine_yield', 'clock_sync')
             Advisory = @('mine_identity', 'mine_output', 'machine_single')
@@ -644,7 +646,7 @@
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'
                          KENSHICOOP_CELL_AUTH = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'mine1'; Setup = ''; Tolerance = 3.0
-            Seconds = 330; KillGraceSec = 340
+            Seconds = 390; KillGraceSec = 400
             PrimaryGate = 'mine_yield'
             Gating   = @('mine_yield', 'clock_sync')
             Advisory = @('mine_identity', 'machine_single')
@@ -653,21 +655,33 @@
         # bench_yield_join: the same yield gate on a CRAFTING bench, the machine
         # class craft_order cannot reach (its fixture is a training dummy, so no
         # protocol-33 row ever exists in craft1). The host places + completes a
-        # bench on 'sync' (the prod_sync lever) and the join's rank-1 member is
-        # ordered to operate it; mine_yield then judges the bench's output item.
-        # Tier 'none' (diagnostic): measured 2026-10-20 (b5_bench/f5_bench) the
-        # order lands (ok=1) but the member never takes the operate task
-        # (task=65535 throughout, output buffer never materialises): a crafting
-        # bench is only workable with a crafting QUEUE, which no harness lever
-        # sets yet. Until one exists this cannot fail for the right reason.
+        # first-aid desk on 'sync' (the prod_sync lever) and seeds its input;
+        # BOTH clients queue a repeating first-aid-kit job on their local bench
+        # (a save-carried queue; an empty queue leaves an ordered worker idle -
+        # b5_bench: task=65535) and the join's rank-1 member is ordered to
+        # operate it. bench_yield counts each client's finished items through
+        # the harness [craftspy] DONE trace. bench_yield_joinq queues on the
+        # JOIN only (a job queued mid-session, which the host's bench never
+        # has): the host cannot simulate the bench, so the join must keep
+        # crafting it - once (bench_yield_any).
         bench_yield_join = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'
                          KENSHICOOP_CELL_AUTH = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 3.0
-            Seconds = 330; KillGraceSec = 340
-            PrimaryGate = 'mine_yield'
-            Gating   = @('mine_yield', 'clock_sync')
+            Seconds = 450; KillGraceSec = 460
+            PrimaryGate = 'bench_yield'
+            Gating   = @('bench_yield', 'clock_sync')
             Advisory = @('machine_single')
+            Tier = 'none'; WanVariant = $false
+        }
+        bench_yield_joinq = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'
+                         KENSHICOOP_CELL_AUTH = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 3.0
+            Seconds = 450; KillGraceSec = 460
+            PrimaryGate = 'bench_yield_any'
+            Gating   = @('bench_yield_any', 'clock_sync')
+            Advisory = @()
             Tier = 'none'; WanVariant = $false
         }
 

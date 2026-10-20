@@ -894,6 +894,10 @@ private:
                                      //   of continuous NONE the held pose is released
                                      //   (debounced job-removal detector - mirrors
                                      //   carryNoSeeTick/furnNoSeeTick)
+        unsigned long taskLapseTick; // first tick a held MACHINE-work pose read idle
+                                     //   locally while the owner still streams the
+                                     //   work task (0 = not lapsed); see applyRest
+        unsigned int taskLapses;     // consecutive lapse re-poses (backoff exponent)
         bool         detached;       // I9: detached from town-AI (separateIntoMyOwnSquad) once
         bool         downApplied;     // Stage 2: body is currently held in ragdoll (host says down)
         bool         koLatched;       // a reliable EVT_KNOCKOUT pinned this body down
@@ -1038,7 +1042,8 @@ private:
                    suppressed(false), lastSeenMs(0), author(AUTHOR_NONE), authorSinceMs(0),
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
                    taskTick(0), taskRetries(0), fixtureXlateLogged(false),
-                   taskNoneTick(0), detached(false), downApplied(false),
+                   taskNoneTick(0), taskLapseTick(0), taskLapses(0),
+                   detached(false), downApplied(false),
                    koLatched(false), deathLatched(false), carriedDown(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),

@@ -829,14 +829,41 @@ function Get-MineCrosses {
     return $c
 }
 
+# Bench mode: one "[craftspy] DONE mach=<hand> ..." line per item a crafting
+# bench finished on that client (harness trace on addFinishedCraftItem).
+function Get-CraftDone {
+    param([string]$File, [string]$Mach, [int]$UntilWall = [int]::MaxValue)
+    $rx = [regex]'^\[(\d+):(\d+):(\d+)\.(\d+)\].*\[craftspy\] DONE mach=([\d.]+) '
+    $n = 0
+    if (-not (Test-Path $File)) { return $n }
+    foreach ($line in [System.IO.File]::ReadLines((Resolve-Path $File))) {
+        $m = $rx.Match($line)
+        if (-not $m.Success -or $m.Groups[5].Value -ne $Mach) { continue }
+        $wall = ((([int]$m.Groups[1].Value * 60) + [int]$m.Groups[2].Value) * 60 + [int]$m.Groups[3].Value) * 1000 + [int]$m.Groups[4].Value
+        if ($wall -gt $UntilWall) { continue }
+        $n++
+    }
+    return $n
+}
+
+# -Bench (bench_yield / bench_yield_any): the machine is a crafting bench and a
+# mint is a [craftspy] DONE line on that client's bench instead of a CROSS line.
+# -AnySim (bench_yield_any, the join-only queue): the host's bench has no job,
+# so the host cannot simulate it and the join's own sim is the single minter -
+# "single" then means exactly one client finished items, and the host's
+# fabricated copy of the join's loot is the mirror, not a duplicate.
+# The owner stops collecting SettleMs before the join's window ends (the
+# scenario's settle tail), so crossings are counted up to that point.
+
 function Test-MineYield {
     param([string]$HostFile, [string]$JoinFile, [int]$OrderAtMs = 18000, [int]$Slack = 1,
-          [int]$CollectLagMs = 6000)
+          [int]$CollectLagMs = 6000, [int]$SettleMs = 30000, [switch]$Bench,
+          [switch]$AnySim, [string]$GateName = "mine_yield")
     $H = @(Get-MineYieldRows -File $HostFile)
     $J = @(Get-MineYieldRows -File $JoinFile)
     if ($H.Count -lt 10 -or $J.Count -lt 10) {
         Write-Host "  MINE-YIELD FAIL - insufficient MINEYIELD samples (host=$($H.Count) join=$($J.Count))"
-        return (Add-GateResult -Name "mine_yield" -Status FAIL -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
+        return (Add-GateResult -Name $GateName -Status FAIL -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
     }
     $arm = $H[0].arm
     $O = if ($arm -eq 'host') { $H } else { $J }     # owner's real miner
@@ -848,14 +875,29 @@ function Test-MineYield {
     $Ow = @($O | Where-Object { $_.wall -le $endWall })
     $gain = $Ow[-1].ore - $base
     $miner = $O[0].miner
-    # A unit minted in the last CollectLagMs may not have reached the miner yet
-    # (4 s collect cadence + the join's intent round trip): count crossings up
-    # to that margin, and let Slack absorb one boundary unit either way.
-    $until = $endWall - $CollectLagMs
-    $hc = Get-MineCrosses -File $HostFile -Miner $miner -UntilWall $until
-    # Join crossings inside the judged window only: once the host has exited,
-    # the join's unmirrored machine rightly works locally again.
-    $jc = Get-MineCrosses -File $JoinFile -Miner $miner -UntilWall $endWall
+    # A unit minted in the last CollectLagMs before collection stopped may not
+    # have reached the miner yet (4 s collect cadence + the join's intent round
+    # trip): count crossings up to that margin, and let Slack absorb one
+    # boundary unit either way.
+    $until = $endWall - $SettleMs - $CollectLagMs
+    if ($Bench) {
+        # Each side's bench is the one its samples name (local hands differ).
+        $hMach = $H[-1].mine; $jMach = $J[-1].mine
+        $hDone = Get-CraftDone -File $HostFile -Mach $hMach -UntilWall $until
+        $hDoneAll = Get-CraftDone -File $HostFile -Mach $hMach -UntilWall $endWall
+        $jDone = Get-CraftDone -File $JoinFile -Mach $jMach -UntilWall $until
+        $jDoneAll = Get-CraftDone -File $JoinFile -Mach $jMach -UntilWall $endWall
+        $hc = @{ own = $hDone; driven = 0 }
+        $jc = @{ own = $jDoneAll; driven = 0 }
+        $joinOnly = $AnySim -and ($hDoneAll -eq 0)
+        if ($joinOnly) { $hc = @{ own = $jDone; driven = 0 }; $jc = @{ own = 0; driven = 0 } }
+    } else {
+        $joinOnly = $false
+        $hc = Get-MineCrosses -File $HostFile -Miner $miner -UntilWall $until
+        # Join crossings inside the judged window only: once the host has exited,
+        # the join's unmirrored machine rightly works locally again.
+        $jc = Get-MineCrosses -File $JoinFile -Miner $miner -UntilWall $endWall
+    }
     $auth = $hc.own + $hc.driven
     $joinMinted = $jc.own + $jc.driven
     $sid = $Ow[-1].sid
@@ -882,18 +924,25 @@ function Test-MineYield {
     if ($ownerNear.Count -eq 0) { $ownerNear = @($O[-1].ore) }
     $parity = ($ownerNear -contains $copyEnd)
     $yieldOk = ($auth -ge 1) -and ([Math]::Abs($gain - $auth) -le $Slack)
-    $ok = $yieldOk -and ($joinMinted -eq 0) -and ($fab -eq 0) -and $parity
+    # A join-only minter's loot reaches the host's copy by fabrication (the
+    # host's bench never held it) - that is the mirror, not a second unit.
+    $fabBad = if ($joinOnly) { 0 } else { $fab }
+    $ok = $yieldOk -and ($joinMinted -eq 0) -and ($fabBad -eq 0) -and $parity
     $v = if ($ok) { "PASS" } else { "FAIL" }
     $why = @()
     if (-not $yieldOk)     { $why += "yield" }
     if ($joinMinted -gt 0) { $why += "join-minted" }
-    if ($fab -gt 0)        { $why += "ore-fab" }
+    if ($fabBad -gt 0)     { $why += "ore-fab" }
     if (-not $parity)      { $why += "parity" }
-    Write-Host ("  MINE-YIELD [$arm-owned] $v - owner gain=$gain (base=$base end=$($Ow[-1].ore) collected=$collected) " +
-                "authoritative(host crossings)=$auth [own=$($hc.own) driven=$($hc.driven)] " +
+    $authName = if ($joinOnly) { "single minter(join, host minted 0)" }
+                elseif ($Bench) { "authoritative(host bench DONE)" }
+                else { "authoritative(host crossings)" }
+    $label = if ($Bench) { "BENCH-YIELD" } else { "MINE-YIELD" }
+    Write-Host ("  $label [$arm-owned] $v - owner gain=$gain (base=$base end=$($Ow[-1].ore) collected=$collected) " +
+                "$authName=$auth [own=$($hc.own) driven=$($hc.driven)] " +
                 "join crossings=$joinMinted [own=$($jc.own) driven=$($jc.driven)] oreFab=$fab " +
                 "copyEnd=$copyEnd parity=$parity$(if ($why.Count) { ' FAILED: ' + ($why -join ',') })")
-    return (Add-GateResult -Name "mine_yield" -Status $v -Metrics @{
+    return (Add-GateResult -Name $GateName -Status $v -Metrics @{
         gain = $gain; authoritative = $auth; hostOwn = $hc.own; hostDriven = $hc.driven
         joinOwn = $jc.own; joinDriven = $jc.driven; oreFab = $fab; parity = [int]$parity
         collected = $collected } -Detail ($why -join ','))

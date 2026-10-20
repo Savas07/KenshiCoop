@@ -493,6 +493,28 @@ join miner does the work, and the join's mine fills only through the mirror. A
 machine the host does not mirror keeps local work, so a join far from the host
 still produces, once.
 
+Only the machine classes a two-client run showed double-producing are gated: the
+`ProductionBuilding` override (mines, which share it with generators and
+refiners) and the `CraftingBuilding` override. `bench_yield_join` queues a first
+aid kit on a medical desk on both clients with a join-owned worker: the
+observe-only build minted 7 kits for 4 crafts of work (`b7_bench`), the gated build
+mints only on the host. Farm, research and furnace keep their local `operate`.
+A furnace has no operator slot, research mints no item (protocol 38 already makes
+the host the tech authority), and no farm run exists to prove a gate would be
+correct, so detouring them would change behaviour nobody measured. A crafting
+queue is per client, so a host row reporting PRODUCTION_IMPOSSIBLE (state 3, the
+host bench has no job) does not mark the machine mirrored: a job queued only on
+the join still crafts there, once (`bench_yield_joinq`, `f7_benchq`).
+
+Making the host the only producer exposed a pose gap. The host's copy of the join
+worker dropped its action when the host bench finished a craft and filled, while
+the owner was back at work within a blip shorter than `TASK_CLEAR_MS`. The held
+pose was never released, so it was never re-taken, and the worker produced one
+kit for the whole run (`f7_bench`). A held machine pose whose copy reads idle for
+`TASK_LAPSE_MS` under a streamed work task is now re-posed (`[pose] lapse
+re-pose`), with backoff so a machine that stays full is not re-ordered every few
+seconds.
+
 **Rule.** When a peer's action is reproduced to make it LOOK right, list what the
 action DOES. Anything that mints, consumes or moves state must run on exactly one
 client, and the gate has to count units, not poses: `mine_pose` was green the

@@ -180,6 +180,8 @@ function Invoke-OneOracle {
         "mine_identity" { return (Test-MineIdentity    -JoinFile $JoinLog) }
         "mine_output"   { return (Test-MineOutput      -JoinFile $JoinLog) }
         "mine_yield"    { return (Test-MineYield       -HostFile $HostLog -JoinFile $JoinLog) }
+        "bench_yield"   { return (Test-MineYield       -HostFile $HostLog -JoinFile $JoinLog -Bench -GateName 'bench_yield') }
+        "bench_yield_any" { return (Test-MineYield     -HostFile $HostLog -JoinFile $JoinLog -Bench -AnySim -GateName 'bench_yield_any') }
         "machine_single" { return (Test-MachineSingle  -HostFile $HostLog -JoinFile $JoinLog) }
         "mine_clear"    { return (Test-MineClear       -JoinFile $JoinLog) }
         "down_order"    { return (Test-DownOrder       -HostFile $HostLog -JoinFile $JoinLog) }

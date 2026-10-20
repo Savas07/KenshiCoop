@@ -1251,6 +1251,11 @@ bool isNodeAnchoredPose(int taskKey);
 // maps before ordering the pose on the peer.
 bool isBuildSiteTask(int taskKey);
 
+// True if 'taskKey' is a machine work task (OPERATE_MACHINERY /
+// OPERATE_AUTOMATIC_MACHINERY): the body works a mine, refiner or bench whose
+// output the host simulates, so a copy that stopped working stops production.
+bool isMachineWorkTask(int taskKey);
+
 // AI-gating probe lever: recruit a world NPC into the local player's squad (the
 // "inhabit" path) so it stops self-assigning town tasks and obeys our drive.
 // Join-side only. Returns the engine's recruit() result (false if unresolved).
@@ -1306,19 +1311,23 @@ unsigned int damageGuardCount();
 // bodies AND the hook stopped them).
 void         damageGuardStats(unsigned long* outGuarded, unsigned long* outPassed);
 
-// Machine work detours: <Building>::operate for the production, crafting, farm,
-// research and furnace overrides (the per-frame work call a body's
-// OPERATE_MACHINERY action makes on the machine it is posed at). Logs who
-// worked which machine (`[prod] operate ...`, ~5 s aggregate per worker/machine
-// pair), every whole-unit output crossing (`[prod] operate CROSS ...`) and, in
-// mirror mode, the skipped work (`[prod] operate MIRROR ...`, throttled).
-// Returns the number of overrides hooked (5 when all resolved).
+// Machine work detours: <Building>::operate for the production (mines, refiners,
+// generators) and crafting overrides - the per-frame work call a body's
+// OPERATE_MACHINERY action makes on the machine it is posed at. Only the classes
+// a two-client run proved double-produced are gated: farm, research and furnace
+// work keep the per-client v0.57.5 behaviour (docs/REPLICATION_PITFALLS.md #19).
+// Logs who worked which machine (`[prod] operate ...`, ~5 s aggregate per
+// worker/machine pair), every whole-unit output crossing (`[prod] operate CROSS
+// ...`) and, in mirror mode, the skipped work (`[prod] operate MIRROR ...`,
+// throttled). Returns the number of overrides hooked (2 when all resolved).
 int          installMachineOperateHooks();
 // Mirror mode (the JOIN while protocol 33 runs): machine output is simulated
 // once, on the host. Local work is skipped for a worker this client DRIVES (its
 // owner's sim works it) and on any machine the host is mirroring (marked by
-// markMachineMirrored from each applied/converged protocol-33 row; the mark
-// lapses ttlMs later, after which local work resumes for an unmirrored machine).
+// markMachineMirrored from each applied/converged protocol-33 row the host can
+// actually produce on - a PRODUCTION_IMPOSSIBLE row, e.g. a crafting bench whose
+// host copy has no job queued, does not mark; the mark lapses ttlMs later, after
+// which local work resumes for an unmirrored machine).
 void         setMachineWorkMirror(bool on);
 void         markMachineMirrored(const unsigned int hand[5], unsigned long ttlMs);
 
@@ -2089,7 +2098,9 @@ bool operateMachineByHand(GameWorld* gw, const unsigned int mHand[5], float amou
 // caller ramps it complete via writeBuildProgressByHand. kind: 0 = power
 // generator, 1 = crafting bench, 2 = storage container (BCTYPE_STORAGE -
 // protocol 34's chest subject), 3 = research bench (BCTYPE_RESEARCH - spike
-// 401's subject). Returns 1 placed, 0 template-miss/refused, -1 fault.
+// 401's subject), 4 = blueprint-free crafting bench (BCTYPE_CRAFTING - the
+// first-aid desk bench_yield_join queues a job on). Returns 1 placed,
+// 0 template-miss/refused, -1 fault.
 int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
                       unsigned int outHand[5], char* outSid, unsigned int sidLen);
 

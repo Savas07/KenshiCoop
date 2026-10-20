@@ -1298,17 +1298,19 @@ HitMaterialType __fastcall hitByMelee_hook(Character* self, CutDirection dir,
 //     recently - so the host's copy of OUR worker, posed on the host's instance
 //     of the same machine, is the one that produces; the result reaches us
 //     through the buffer rows and the container census.
-// A machine the host does not mirror (outside its census) keeps local work, so
-// a join miner far from the host still produces - once, here.
+// A machine the host does not mirror (outside its census, or one it reports
+// PRODUCTION_IMPOSSIBLE - a crafting bench whose host copy has no job queued)
+// keeps local work, so a join miner far from the host still produces - once, here.
+// Only the production and crafting overrides are hooked: those are the classes
+// a two-client worker run proved double-produced (mine_yield*, bench_yield_join).
+// Farm, research and furnace work stay per-client (v0.57.5 behaviour) until a
+// run proves them.
 // The animation is untouched: only the work call is skipped. The observation
 // half logs who worked what (aggregated, ~5 s per worker/machine pair) plus
 // every whole-unit output crossing, so a run shows which sim produced each unit.
 namespace {
 MachOperateFn g_opOrigProd     = 0;
 MachOperateFn g_opOrigCraft    = 0;
-MachOperateFn g_opOrigFarm     = 0;
-MachOperateFn g_opOrigResearch = 0;
-MachOperateFn g_opOrigFurnace  = 0;
 
 bool g_opMirror = false;                               // join + prodSync
 std::map<Building*, unsigned long> g_opMirrored;       // machine -> mirrored-until (tick ms)
@@ -1322,13 +1324,12 @@ struct OpAgg {
 std::map<std::pair<Building*, Character*>, OpAgg> g_opAgg;
 
 // Output buffer amount (whole stack + fractional progress), or -1 when the
-// machine has none (research, a not-yet-materialised buffer). SEH: 'self' is
-// the engine's own live object, but a torn buffer must never fault the tick.
+// machine has none (a not-yet-materialised buffer). SEH: 'self' is the
+// engine's own live object, but a torn buffer must never fault the tick.
 float opOutAmount(Building* b) {
     __try {
         int ct = (int)b->classType;
-        if (ct != (int)BCTYPE_PRODUCTION && ct != (int)BCTYPE_CRAFTING &&
-            ct != (int)BCTYPE_ITEM_FURNACE && ct != (int)BCTYPE_FARM)
+        if (ct != (int)BCTYPE_PRODUCTION && ct != (int)BCTYPE_CRAFTING)
             return -1.0f;
         StorageBuilding::ConsumptionItem* ci =
             static_cast<ProductionBuilding*>(b)->productionItem;
@@ -1371,7 +1372,16 @@ bool opHostSimulates(Building* self, unsigned long now) {
     return false;
 }
 
-void operateCommon(MachOperateFn orig, Building* self, Character* who, float amount) {
+int opClass(Building* b) {
+    __try { return (int)b->classType; } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+void operateCommon(MachOperateFn orig, int gateClass, Building* self, Character* who,
+                   float amount) {
+    // Only the class this override belongs to is gated: a derived machine whose
+    // own override reaches the hooked address (a farm or furnace calling the
+    // production base, say) keeps its per-client work untouched.
+    if (opClass(self) != gateClass) { orig(self, who, amount); return; }
     int driven = (who && opIsDriven(who)) ? 1 : 0;
     unsigned long now = GetTickCount();
     bool skip = g_opMirror && (driven || opHostSimulates(self, now));
@@ -1409,19 +1419,10 @@ void operateCommon(MachOperateFn orig, Building* self, Character* who, float amo
 } // namespace
 
 void __fastcall operateProd_hook(Building* self, Character* who, float amount) {
-    operateCommon(g_opOrigProd, self, who, amount);
+    operateCommon(g_opOrigProd, (int)BCTYPE_PRODUCTION, self, who, amount);
 }
 void __fastcall operateCraft_hook(Building* self, Character* who, float amount) {
-    operateCommon(g_opOrigCraft, self, who, amount);
-}
-void __fastcall operateFarm_hook(Building* self, Character* who, float amount) {
-    operateCommon(g_opOrigFarm, self, who, amount);
-}
-void __fastcall operateResearch_hook(Building* self, Character* who, float amount) {
-    operateCommon(g_opOrigResearch, self, who, amount);
-}
-void __fastcall operateFurnace_hook(Building* self, Character* who, float amount) {
-    operateCommon(g_opOrigFurnace, self, who, amount);
+    operateCommon(g_opOrigCraft, (int)BCTYPE_CRAFTING, self, who, amount);
 }
 
 // Test-scene spawning. createRandomCharacter / createBuilding take Vector3 (and
@@ -2320,13 +2321,6 @@ bool installDamageGuardHook() {
 }
 
 namespace {
-// FurnaceBuilding::operate is declared protected; naming it through a derived
-// class is the standard-conforming way to take its address.
-struct FurnaceOperateAccess : public FurnaceBuilding {
-    static intptr_t addr() {
-        return KenshiLib::GetRealAddress(&FurnaceOperateAccess::_NV_operate);
-    }
-};
 bool hookOperate(intptr_t addr, void* detour, MachOperateFn* orig) {
     if (!addr) return false;
     return KenshiLib::AddHook(addr, detour, (void**)orig) == KenshiLib::SUCCESS;
@@ -2339,12 +2333,6 @@ int installMachineOperateHooks() {
                     (void*)&operateProd_hook, &g_opOrigProd)) ++ok;
     if (hookOperate(KenshiLib::GetRealAddress(&CraftingBuilding::_NV_operate),
                     (void*)&operateCraft_hook, &g_opOrigCraft)) ++ok;
-    if (hookOperate(KenshiLib::GetRealAddress(&FarmBuilding::_NV_operate),
-                    (void*)&operateFarm_hook, &g_opOrigFarm)) ++ok;
-    if (hookOperate(KenshiLib::GetRealAddress(&ResearchBuilding::_NV_operate),
-                    (void*)&operateResearch_hook, &g_opOrigResearch)) ++ok;
-    if (hookOperate(FurnaceOperateAccess::addr(),
-                    (void*)&operateFurnace_hook, &g_opOrigFurnace)) ++ok;
     return ok;
 }
 

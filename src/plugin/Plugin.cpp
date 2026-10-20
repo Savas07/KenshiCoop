@@ -3117,7 +3117,7 @@ void installEngineDetours() {
     if (g_cfg.prodSync) {
         int n = coop::engine::installMachineOperateHooks();
         char b[96];
-        _snprintf(b, sizeof(b) - 1, "[prod] operate detours installed %d/5", n);
+        _snprintf(b, sizeof(b) - 1, "[prod] operate detours installed %d/2", n);
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
     }

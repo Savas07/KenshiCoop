@@ -1060,7 +1060,11 @@ void Replicator::applyProd(const SyncContext& ctx) {
         // The host simulates this machine (its row resolved here), so local work
         // on it is skipped - see engine::setMachineWorkMirror. Marked before the
         // converged early-out: an idle machine still re-marks on every resend.
-        engine::markMachineMirrored(hand, tuning_.prodResendMs * 5 / 2);
+        // Not when the host reports it PRODUCTION_IMPOSSIBLE (3): the host's copy
+        // cannot produce (a crafting bench whose job was queued only here - the
+        // queue is per client), so this client's own work is the only sim.
+        if (p.prodState != 3)
+            engine::markMachineMirrored(hand, tuning_.prodResendMs * 5 / 2);
         // Apply only what actually diverged, through the engine's own levers.
         int wantPower = -1;
         if (p.powerOn >= 0 && cur.powerOn >= 0 && (int)p.powerOn != cur.powerOn)

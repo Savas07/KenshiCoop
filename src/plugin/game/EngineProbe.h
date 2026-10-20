@@ -89,6 +89,40 @@ int mintGradedGearForTest(GameWorld* gw, const unsigned int cHand[5], const char
 // Returns 1 round-trip ok / 0 unavailable or empty / -1 native save/load failed.
 int probeNativeSnapshot(GameWorld* gw);
 
+// ---- Crafting-bench job levers (bench_yield_join, 2026-10-20) ---------------
+// A crafting bench (BCTYPE_CRAFTING) is only workable with a crafting job
+// queued: with an empty queue the engine reports PRODUCTION_IMPOSSIBLE and an
+// ordered worker never takes the operate task (b5_bench: task=65535 throughout).
+// These levers give a placed bench the job the crafting UI would queue, read the
+// queue back, and log every item a bench finishes on this client.
+struct CraftRead {
+    int   queued;     // hasCraftingQueued() (0/1)
+    int   nCraft;     // jobs in the queue
+    int   repeat;     // the bench's repeat flag
+    float progress;   // job 0 progress01 (-1 = no job)
+    float rate;       // job 0 rate
+    float endTime;    // job 0 endTime
+    int   err;        // job 0 lastErrorCode (CraftingItem::ErrorCode; -1 = no job)
+    char  sid[48];    // job 0 item template sid ("" = no job)
+};
+// SEH-guarded: queue one crafting job on the bench at bHand, with the repeat
+// flag set so it keeps crafting. The job is the first entry of the bench's own
+// getAvailableCrafts() list whose item sid is preferSid (else entry 0) - the
+// list the crafting UI offers; when that list is empty (the item is not known
+// to this client), the preferSid item template (typeCat) is queued directly
+// with no material spec. Writes the queued item sid to outSid. Returns 1 queued
+// from the list, 2 queued from the fallback, 0 nothing queued, -1 fault.
+int probeQueueCraft(GameWorld* gw, const unsigned int bHand[5], const char* preferSid,
+                    unsigned int typeCat, char* outSid, unsigned int outLen);
+// SEH-guarded read of the bench's queue. False when bHand is not a live bench.
+bool probeReadCraft(const unsigned int bHand[5], CraftRead* out);
+// Detour CraftingBuilding::addFinishedCraftItem (observe only, then call the
+// original) to log "[craftspy] DONE mach=.. item='..' who=.. n=.." for every
+// item a bench finishes HERE - the per-sim mint count the yield oracle uses on
+// benches. First call also logs the live bytes of the bench's work functions
+// ("[craftspy] code ...") for offline disassembly. Idempotent.
+bool installCraftDoneTrace();
+
 } // namespace engine
 } // namespace coop
 
