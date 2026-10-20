@@ -679,15 +679,6 @@ PlatBoolFn      g_platIsTraderFn  = 0;
 PlatBoolFn      g_platHasVendorListFn = 0;
 GuiShowTradeFn  g_guiShowTradeFn  = 0;
 GuiCloseTradeFn g_guiCloseTradeFn = 0;
-StiAddItemFn    g_stiAddItemFn    = 0;
-
-namespace {
-// ShopTraderInventory::_NV__addItem is protected: only a derived class may name
-// it to form the member pointer KenshiLib resolves. Never instantiated.
-struct StiAccess : public ShopTraderInventory {
-    static intptr_t addItemAddr() { return KenshiLib::GetRealAddress(&StiAccess::_NV__addItem); }
-};
-} // namespace
 
 // Property deeds (protocol 54). Buying a house/shop adds the building's hand to
 // the PLAYER FACTION's owned-object set (Faction::factionOwnerships) and moves
@@ -1746,7 +1737,6 @@ void resolve() {
         (PlatBoolFn)KenshiLib::GetRealAddress(&ActivePlatoon::getHasVendorList);
     g_guiShowTradeFn  = (GuiShowTradeFn)KenshiLib::GetRealAddress(&ForgottenGUI::showTradeWindow);
     g_guiCloseTradeFn = (GuiCloseTradeFn)KenshiLib::GetRealAddress(&ForgottenGUI::closeTradeWindow);
-    g_stiAddItemFn    = (StiAddItemFn)StiAccess::addItemAddr();
     // Property deeds (protocol 54; non-fatal: unresolved -> CAP_DEED off and the
     // deed channel refuses to write, which the deed_probe reports).
     g_ownAddObjFn  = (OwnAddObjFn)KenshiLib::GetRealAddress(&Ownerships::addOwnedObject);

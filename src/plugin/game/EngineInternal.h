@@ -75,7 +75,6 @@
 #include <kenshi/Building/ResearchBuilding.h>  // ResearchBuilding tech-level evidence (protocol 33)
 #include <kenshi/Town.h>            // Town player-base state (protocol 54 deeds)
 #include <kenshi/ShopTrader.h>      // ShopTrader (vendor stock, protocol 22)
-#include <kenshi/ShopTraderInventory.h> // the trade window's shop view (protocol 60 sales)
 #include <kenshi/Globals.h>         // gui (ForgottenGUI*, KenshiLib data export)
 #include <kenshi/gui/ForgottenGUI.h> // ForgottenGUI::mainbar
 #include <kenshi/gui/MainBarGUI.h>  // MainBarGUI::speedButtons (vote-button probe)
@@ -247,9 +246,6 @@ typedef bool  (__fastcall* PlatBoolFn)(const ActivePlatoon* self);
 typedef void  (__fastcall* GuiShowTradeFn)(ForgottenGUI* self, const hand* a,
                                            const hand* b, TradeWindowType type);
 typedef void  (__fastcall* GuiCloseTradeFn)(ForgottenGUI* self);
-// ShopTraderInventory::_NV__addItem (protected; the trade window's sale drop:
-// it spreads the stack over the shop's counters via _addItemToInventories).
-typedef bool  (__fastcall* StiAddItemFn)(Inventory* self, Item* item, int quantity);
 
 // property deeds (protocol 54): the owned-object SET on the player faction's
 // Ownerships. Reference params cross as pointers (the __fastcall thunk ABI the
@@ -508,7 +504,6 @@ extern PlatBoolFn      g_platIsTraderFn;
 extern PlatBoolFn      g_platHasVendorListFn;
 extern GuiShowTradeFn  g_guiShowTradeFn;
 extern GuiCloseTradeFn g_guiCloseTradeFn;
-extern StiAddItemFn    g_stiAddItemFn;
 
 // property deeds (protocol 54)
 extern OwnAddObjFn   g_ownAddObjFn;
