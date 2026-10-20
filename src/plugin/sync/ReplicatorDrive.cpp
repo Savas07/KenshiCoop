@@ -1232,14 +1232,6 @@ void Replicator::applyTargets(GameWorld* gw) {
                     d.combatSnapTick = now;
                     d.combatOverTick = 0;
                     d.haveDest = false; // position jumped: force a fresh slide dest
-                    // A SQUAD copy that was out of the fight when it was moved is
-                    // re-ordered on the next tick instead of after the backoff: the
-                    // teleport put it at its owner's spot, away from wherever its
-                    // local fight had drifted, and the pending backoff (up to 6 s)
-                    // left it standing there (hpf_after4: snaps at drift 23-27 u,
-                    // then 0 of the next 5 samples fighting, 4-6 s idle).
-                    if (isSquad && !localFighting && !hostWaiting)
-                        d.combatTick = now - COMBAT_REISSUE_MAX_MS;
                     ++d.combatSnapCount; ++combatSnapTotal_;
                     if (wrongLocalTgt) ++combatWrongTgt_;
                     { char b[224]; _snprintf(b, sizeof(b) - 1,
