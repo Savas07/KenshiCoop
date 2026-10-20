@@ -1986,11 +1986,24 @@ int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
         if (!got) return 0;
         int q = got->quantity; if (q < 1) q = 1;
         if (outQty) *outQty = q;
-        // The drop half of the trade-window drag: the bought stack lands in the
-        // buyer's bag; dropped at the buyer's feet only if the bag is full.
-        if (!binv->tryAddItem(got, q)) {                     // virtual
-            binv->addItem(got, q, /*dropOnFail=*/true, /*destroyOnFail=*/false);
+        // The drop half of the trade-window drag. ONE placement: a loose section
+        // of the receiver first (a shop counter refuses the inventory-level
+        // tryAddItem - vs_before4: the sold stack never reached the counter -
+        // and a failed tryAddItem followed by addItem placed one bought stack
+        // twice), else the inventory's own add, dropped at the feet if full.
+        bool placed = false;
+        if (g_getSectionsFn) {
+            GameData* gd = got->getGameData();
+            lektor<InventorySection*>* secs = g_getSectionsFn(binv);
+            unsigned int ns = secs ? secs->size() : 0;
+            for (unsigned int s = 0; s < ns && !placed; ++s) {
+                InventorySection* sec = (*secs)[s];
+                if (!sec || sec->isAnEquippedItemSection || sec->containerSlot) continue;
+                if (gd && !sec->hasRoomForItem(gd, q)) continue;   // virtual
+                placed = sec->addItem(got, q);                     // virtual
+            }
         }
+        if (!placed) binv->addItem(got, q, /*dropOnFail=*/true, /*destroyOnFail=*/false);
         return 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
