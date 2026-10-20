@@ -1476,13 +1476,19 @@ function Test-PcAssault {
 # join PC) - over the OWNER's fight samples inside the viewer's sampling span:
 #   0. mint   - (-RequireMint) the join minted the enemies (proxy BOUND)
 #   1. setup  - the owner really fought: >= MinOwnerFight samples, fight=1 + target
-#   2. engaged- the viewer's copy (nearest sample within TolMs) is ENGAGED with
-#               the owner's target: fighting (fight=1), the SAME body (ctgt is
-#               the canonical key, so a re-keyed or minted target still
-#               compares; any owner target within TgtTolMs counts, for retarget
-#               latency) and not being walk-ordered by the drive (dest=0 - a
-#               move order replaces the attack, the copy jogs or stands) - in
-#               >= MinEngagedFrac of the owner's fight samples
+#   2. engaged- the viewer's copy (nearest sample within TolMs) is ENGAGED in the
+#               owner's fight: fighting (fight=1) a body the owner fights in this
+#               brawl (ctgt is the canonical key, so a re-keyed or minted target
+#               still compares; any owner target within BrawlTolMs) and not being
+#               walk-ordered by the drive (dest=0 - a move order replaces the
+#               attack, the copy jogs or stands) - in >= MinEngagedFrac of the
+#               owner's fight samples. In a multi-enemy brawl both engines pick
+#               their next victim themselves every 0.5-2 s (lead_after7_host_pc_fight:
+#               the owner switched targets ~25x in 40 s, the copy's own lock flipped
+#               between the owner's target and another brawler with no order in
+#               between), so same-body-at-the-same-moment parity ('right', owner
+#               targets within TgtTolMs) is reported, not gated: forcing it costs a
+#               clearGoals re-issue per flip, which is what cancelled the swings.
 #   3. resolve- the viewer issued <= MaxUnresolved "[combat] order hand=<pc> ...
 #               r=1" (the streamed target never resolved there: an order storm
 #               that leaves the copy un-ordered)
@@ -1491,7 +1497,8 @@ function Test-PcAssault {
 function Test-HostPcFight {
     param([string]$HostFile, [string]$JoinFile, [string]$GateName = 'host_pc_fight',
           [switch]$RequireMint, [int]$MinOwnerFight = 6, [double]$MinEngagedFrac = 0.75,
-          [int]$MaxUnresolved = 2, [int]$TolMs = 1000, [int]$TgtTolMs = 2000)
+          [int]$MaxUnresolved = 2, [int]$TolMs = 1000, [int]$TgtTolMs = 2000,
+          [int]$BrawlTolMs = 5000)
     $label = $GateName.ToUpper().Replace('_', '-')
     if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
         return (Add-GateResult -Name $GateName -Status FAIL -Detail "missing log")
@@ -1552,10 +1559,10 @@ function Test-HostPcFight {
             $copyFight++
             $want = @($fightOwn | Where-Object { [Math]::Abs([int]$_.t - [int]$best.t) -le $TgtTolMs } |
                       ForEach-Object { $_.ctgt })
-            if ($want -contains $best.ctgt) {
-                $right++
-                if ($best.dest -ne 1) { $engaged++ }
-            }
+            if ($want -contains $best.ctgt) { $right++ }
+            $brawl = @($fightOwn | Where-Object { [Math]::Abs([int]$_.t - [int]$best.t) -le $BrawlTolMs } |
+                       ForEach-Object { $_.ctgt })
+            if (($brawl -contains $best.ctgt) -and $best.dest -ne 1) { $engaged++ }
         }
         $n = $fightOwn.Count
         $engagedFrac = if ($n -gt 0) { [Math]::Round($engaged / $n, 3) } else { 0 }
@@ -1581,9 +1588,9 @@ function Test-HostPcFight {
             continue
         }
         if ($engagedFrac -lt $MinEngagedFrac) {
-            $bad += ("${t}: the viewer's copy of $pc was engaged with the owner's target in only $engaged/$n " +
+            $bad += ("${t}: the viewer's copy of $pc was engaged in the owner's fight in only $engaged/$n " +
                      "owner-fight samples ($engagedFrac < $MinEngagedFrac; fighting at all $fightFrac, " +
-                     "right body $rightFrac, walk-ordered $walkFrac; link 2: engaged)")
+                     "same body $rightFrac, walk-ordered $walkFrac; link 2: engaged)")
         }
         if ($unresolved -gt $MaxUnresolved) {
             $bad += "${t}: $unresolved unresolved-target orders (r=1) for $pc on the viewer (max $MaxUnresolved; link 3: resolve)"

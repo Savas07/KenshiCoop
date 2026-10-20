@@ -1043,14 +1043,51 @@ void Replicator::applyTargets(GameWorld* gw) {
             // minted hand, and every re-issue then clearGoals-reset a correct
             // fight while the 6 u walk band (correctFight=false) pulled the copy
             // out of it. Unjudgeable (either body unresolved here) = not wrong.
-            Character* haveTgt = (localFighting && lc.hasTarget)
+            // The body the copy's own combat is locked on (read whether or not the
+            // engine currently reports it "in combat": the lock outlives the
+            // between-swing DECISION blink of the in-combat flags).
+            Character* lockTgt = lc.hasTarget
                 ? engine::resolveCharByHand(lc.target[3], lc.target[4], lc.target[0],
                                             lc.target[1], lc.target[2])
                 : 0;
+            Character* haveTgt = localFighting ? lockTgt : 0;
             bool wrongLocalTgt = wantTgt && haveTgt && haveTgt != wantTgt;
+            // A SQUAD copy locked onto its owner's target is ENGAGED, and stays so
+            // for COMBAT_LOCK_HOLD_MS across the lock's between-swing blinks. Its
+            // fight then owns the footwork: no move-order walk (that replaces the
+            // attack - the "standing still" copy) and no re-issue reset.
+            if (isSquad && wantTgt && lockTgt == wantTgt) d.combatLockTick = now;
+            bool engagedSquad = isSquad && d.combatLockTick != 0 &&
+                                (now - d.combatLockTick) < COMBAT_LOCK_HOLD_MS;
             // The host retargeted since our last order.
             bool tgtChanged = d.combatArmed &&
                 (d.combatTgtIdx != out.sIndex || d.combatTgtSer != out.sSerial);
+            // KENSHICOOP_DEBUG_COMBAT_COPY=1: 10 Hz trace of every SQUAD copy in the
+            // combat regime - its local fight read, sword state, which body it is
+            // locked on (1 = the owner's target, 2 = another body, 0 = none), its
+            // current task, and the three distances that tell a lost fight from a
+            // displaced one: copy->owner (dO), copy->target (dT), target->owner (tO).
+            if (isSquad && combatCopyDebug()) {
+                static std::map<unsigned long long, unsigned long> s_traceMs;
+                unsigned long long tkey = ((unsigned long long)out.hIndex << 32) | out.hSerial;
+                unsigned long& last = s_traceMs[tkey];
+                if (now - last >= 100) {
+                    last = now;
+                    float tx = 0.0f, ty = 0.0f, tz = 0.0f;
+                    bool haveT = wantTgt && engine::readPos(wantTgt, &tx, &ty, &tz);
+                    int lock = !lc.hasTarget ? 0 : (lockTgt && lockTgt == wantTgt ? 1 : 2);
+                    char b[256]; _snprintf(b, sizeof(b) - 1,
+                        "[combat] trace hand=%u,%u fight=%d/%d sw=%d lock=%d task=%d "
+                        "dO=%.1f dT=%.1f tO=%.1f stask=%u orders=%u",
+                        out.hIndex, out.hSerial, lc.inCombat ? 1 : 0, lc.modeActive ? 1 : 0,
+                        lc.swordState, lock, engine::readTaskKey(c),
+                        haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : -1.0f,
+                        (haveActual && haveT) ? dist3(ax, ay, az, tx, ty, tz) : -1.0f,
+                        haveT ? dist3(tx, ty, tz, out.x, out.y, out.z) : -1.0f,
+                        (unsigned)out.task, d.combatOrders);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
             // Backoff: 1.5 s base, doubling per re-issue in this episode, 6 s cap -
             // a copy that legitimately cannot engage is not AI-reset forever.
             unsigned long interval = COMBAT_REISSUE_MS;
@@ -1076,7 +1113,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // The retarget path itself stays base-throttled, so an owner
                 // flicking between two bodies cannot thrash it.
                 if (isSquad) d.combatOrders = 0;
-            } else if ((wrongLocalTgt || (!hostWaiting && !localFighting)) &&
+            } else if ((wrongLocalTgt || (!hostWaiting && !localFighting && !engagedSquad)) &&
                        (now - d.combatTick) >= interval &&
                        d.combatOrders <= COMBAT_REISSUE_CAP) {
                 // Active copy disengaged / fighting the wrong body - and the
@@ -1211,9 +1248,13 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // 79 churn snaps/min). One teleport, one follow.
                 bool srcTeleport = teleportEdge;
                 // A WAITING stance has no chase to justify a warp - it only converges.
+                // An ENGAGED squad copy fights a target that is itself driven onto the
+                // owner's fight, so its drift is footwork, not a leave: only the big
+                // distance or a source teleport moves it (a sustained-drift warp mid-
+                // brawl resets the engine's fight just like a walk order does).
                 bool trueLeave = !hostWaiting &&
                                  (drift > combatBigSnapDist_ || srcTeleport ||
-                                  (sustained && srcVel >= COMBAT_SNAP_VEL));
+                                  (sustained && srcVel >= COMBAT_SNAP_VEL && !engagedSquad));
                 // The snap cooldown exists so a correction that CANNOT stick (mid-
                 // stagger, stale interp) does not re-fire every frame at a constant
                 // drift. A source TELEPORT is not that: it is a discrete, unambiguous
@@ -1250,7 +1291,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                         arming ? 1 : 0, hostWaiting ? 1 : 0,
                         d.interp.lastSegMs(), d.combatSnapCount);
                       b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
-                } else if (drift > leaveBand && !(isSquad && arming)) {
+                } else if (drift > leaveBand && !(isSquad && (arming || engagedSquad))) {
                     // Fast catch-up slide: speed scales with drift (~1 s to close),
                     // clamped so a big gap glides quickly without a teleport. walkTo
                     // floors sub-1 speeds to RUN, so small converges stay a walk.
@@ -1276,6 +1317,13 @@ void Replicator::applyTargets(GameWorld* gw) {
                         if (spd > cap) spd = cap;
                         engine::walkTo(c, out.x, out.y, out.z, spd);
                         ++combatSoftWalk_;
+                        if (isSquad && combatCopyDebug()) {
+                            char b[160]; _snprintf(b, sizeof(b) - 1,
+                                "[combat] walk hand=%u,%u drift=%.1f spd=%.1f localFight=%d arming=%d",
+                                out.hIndex, out.hSerial, drift, spd, localFighting ? 1 : 0,
+                                arming ? 1 : 0);
+                            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                        }
                         if (drift > combatSnapDist_) ++combatSlide_;
                         d.haveDest = true; d.dx = out.x; d.dy = out.y; d.dz = out.z;
                     }
@@ -2407,6 +2455,16 @@ void Replicator::pruneDriveGrace(unsigned long now) {
         }
         else ++ds;
     }
+}
+
+// ---- KENSHICOOP_DEBUG_COMBAT_COPY=1 squad-copy combat trace ----
+bool Replicator::combatCopyDebug() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("KENSHICOOP_DEBUG_COMBAT_COPY");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v != 0;
 }
 
 // ---- MoveSync: KENSHICOOP_DEBUG_SQUAD_DRIVE=1 per-frame [sqdrv] trace ----

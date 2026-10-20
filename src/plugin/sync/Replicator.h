@@ -937,6 +937,11 @@ private:
                                       //   drift PERSISTS COMBAT_CONVERGE_MS on a moving source;
                                       //   a momentary interp/footwork spike fast-slides back
                                       //   instead of warping
+        unsigned long combatLockTick; // last tick a SQUAD copy's local combat target WAS the
+                                      //   owner's target (0 = never). Within COMBAT_LOCK_HOLD_MS
+                                      //   of it the copy counts as engaged: its fight owns the
+                                      //   footwork and the move-order walk band (which replaces
+                                      //   the attack) is skipped
         unsigned long npcSnapTick;    // locomotion-path hard snap cooldown (Phase 2): a far
                                       //   NPC whose teleport can't stick (seat AI, unloaded
                                       //   terrain) walk-converges between snaps instead of
@@ -1056,7 +1061,7 @@ private:
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
                    combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
-                   combatOverTick(0), npcSnapTick(0),
+                   combatOverTick(0), combatLockTick(0), npcSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), physHealTick(0), getUpHealTick(0),
@@ -1952,6 +1957,9 @@ private:
     // KENSHICOOP_DEBUG_SQUAD_DRIVE=1 (read once; off by default): per-frame
     // "[sqdrv]" line for every driven squad body (gap/gate/peak/settle/poses).
     static bool squadDriveDebug();
+    // KENSHICOOP_DEBUG_COMBAT_COPY=1: 10 Hz "[combat] trace" + "[combat] walk"
+    // lines for every squad copy in the combat regime (diagnostic only).
+    static bool combatCopyDebug();
     // ---- end MoveSync -------------------------------------------------------
 
     // Protocol 36 (wire v35): per-sender clock mapping for the batch send
