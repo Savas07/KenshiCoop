@@ -492,6 +492,13 @@ local body (own hand, else the live proxy) for the drive subject AND the combat
 target; `applyCombat`/`forceAttack` take that body, and "wrong target" compares
 bodies, never hands.
 
+Two follow-ups the same scenario proved for copies of player characters: a walk
+order is a player move order, so it replaces the copy's attack (squad copies now
+converge only past the churn ceiling and never while arming); and the re-issue
+budget was spent by the owner's own re-targets inside one brawl, after which a
+copy that dropped out was never re-ordered (squad copies get a fresh budget per
+owner target and are re-ordered right after a snap).
+
 **Rule.** Any field that carries a peer's key — a subject, a target, a carrier —
 has to go through the same key-to-body translation as the body itself, and any
 comparison is made between local bodies. A hand compared with a key is a
