@@ -2045,15 +2045,47 @@ void Replicator::detectAndPublishVendorDeltas(GameWorld* gw, NetLink& net, u32 o
     if (vendorScanMs_ != 0 && now - vendorScanMs_ < SCAN_MS) return;
     vendorScanMs_ = now;
     vendorOwners_.clear();
+    std::set<ShopKey> cashSeen; // one cash check per shop, however many counters
     for (std::map<Key, InvRecv>::iterator ri = invRecv_.begin(); ri != invRecv_.end(); ++ri) {
         if (!ri->second.shop) continue;
         const Key& k = ri->first;
         unsigned int cHand[5] = { k.t, k.c, k.cs, k.i, k.s };
         if (engine::resolveObjectByHand(cHand) == 0) continue;
-        // The restock gate: this counter's trader platoon, while the mirror is live.
         unsigned int owner[5];
-        if (now - ri->second.recvMs < FRESH_MS && engine::readShopCounterOwner(cHand, owner))
-            vendorOwners_.insert(std::make_pair((u32)owner[1], (u32)owner[2]));
+        if (!engine::readShopCounterOwner(cHand, owner)) continue;
+        ShopKey sk((u32)owner[1], (u32)owner[2]);
+        // The restock gate: this counter's trader platoon, while the mirror is live.
+        if (now - ri->second.recvMs < FRESH_MS) vendorOwners_.insert(sk);
+        // Merchant cash: a settled change against the host's last value is a
+        // trade's cash leg - report it once per shop.
+        std::map<ShopKey, int>::iterator cb = vendorCashBase_.find(sk);
+        if (cb != vendorCashBase_.end() && cashSeen.insert(sk).second) {
+            int cash = -1;
+            if (engine::readShopCash(cHand, &cash) && cash >= 0) {
+                int d = cash - cb->second;
+                std::map<ShopKey, std::pair<int, unsigned long> >::iterator cp = vendorCashPend_.find(sk);
+                if (d == 0) {
+                    if (cp != vendorCashPend_.end()) vendorCashPend_.erase(cp);
+                } else if (cp == vendorCashPend_.end() || cp->second.first != d) {
+                    vendorCashPend_[sk] = std::make_pair(d, now);
+                } else if (now - cp->second.second >= SETTLE_MS) {
+                    VendorDeltaPacket pkt; memset(&pkt, 0, sizeof(pkt));
+                    pkt.type = (u8)PKT_VENDOR_DELTA; pkt.ownerId = ownerId;
+                    pkt.deltaId = nextVendorDeltaId_++;
+                    pkt.cType = k.t; pkt.cContainer = k.c; pkt.cContainerSerial = k.cs;
+                    pkt.cIndex = k.i; pkt.cSerial = k.s;
+                    pkt.level = GRADE_NA;
+                    pkt.cash = d;
+                    net.queueVendorDelta(pkt);
+                    cb->second = cash;
+                    vendorCashPend_.erase(sk);
+                    char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[vendor] CASH SEND id=%u counter=%u,%u,%u,%u,%u delta=%d now=%d",
+                        pkt.deltaId, k.t, k.c, k.cs, k.i, k.s, d, cash);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
         std::map<Key, std::map<XKey, int> >::iterator bi = vendorBase_.find(k);
         if (bi == vendorBase_.end()) continue; // not applied yet: no baseline to diff
         std::map<XKey, int> cur;
@@ -2138,11 +2170,104 @@ void Replicator::applyVendorDeltas(GameWorld* gw, Inbound& in) {
             done = engine::addItemsToContainerBySid(gw, cHand, sid, p.itemType, p.delta,
                                                     (int)p.quality, man, mat, p.level);
         }
-        char b[224]; _snprintf(b, sizeof(b) - 1,
-            "[vendor] DELTA APPLY id=%u from=%u counter=%u,%u,%u,%u,%u sid='%s' delta=%d applied=%d",
+        int cashAfter = -1;
+        if (p.cash != 0) {
+            // The trade's cash leg: the merchant received (bought from) or paid
+            // out (sold to) the player on the join's screen; same here.
+            int cur = -1;
+            if (engine::readShopCash(cHand, &cur) && cur >= 0) {
+                int target = cur + p.cash; if (target < 0) target = 0;
+                engine::setShopCash(cHand, target, &cashAfter);
+            }
+        }
+        char b[256]; _snprintf(b, sizeof(b) - 1,
+            "[vendor] DELTA APPLY id=%u from=%u counter=%u,%u,%u,%u,%u sid='%s' delta=%d applied=%d "
+            "cash=%d cashNow=%d",
             p.deltaId, p.ownerId, cHand[0], cHand[1], cHand[2], cHand[3], cHand[4], sid,
-            p.delta, done);
+            p.delta, done, p.cash, cashAfter);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::publishVendorCash(GameWorld* gw, NetLink& net, u32 ownerId) {
+    (void)gw;
+    if (!vendorSync_ || !isHostRole() || censusShops_.empty()) return;
+    const unsigned long SCAN_MS   = 500;
+    const unsigned long RESEND_MS = 5000;
+    unsigned long now = nowMs();
+    if (vendorCashMs_ != 0 && now - vendorCashMs_ < SCAN_MS) return;
+    vendorCashMs_ = now;
+    std::set<ShopKey> seen;
+    for (std::set<Key>::iterator it = censusShops_.begin(); it != censusShops_.end(); ++it) {
+        unsigned int cHand[5] = { it->t, it->c, it->cs, it->i, it->s };
+        unsigned int owner[5];
+        if (!engine::readShopCounterOwner(cHand, owner)) continue;
+        ShopKey sk((u32)owner[1], (u32)owner[2]);
+        if (!seen.insert(sk).second) continue;
+        int cash = -1;
+        if (!engine::readShopCash(cHand, &cash) || cash < 0) continue;
+        std::map<ShopKey, std::pair<int, unsigned long> >::iterator s = vendorCashSent_.find(sk);
+        bool changed = (s == vendorCashSent_.end()) || s->second.first != cash;
+        if (!changed && now - s->second.second < RESEND_MS) continue;
+        VendorCashPacket pkt; memset(&pkt, 0, sizeof(pkt));
+        pkt.type = (u8)PKT_VENDOR_CASH; pkt.ownerId = ownerId;
+        pkt.cType = it->t; pkt.cContainer = it->c; pkt.cContainerSerial = it->cs;
+        pkt.cIndex = it->i; pkt.cSerial = it->s;
+        pkt.cash = cash;
+        net.queueVendorCash(pkt);
+        vendorCashSent_[sk] = std::make_pair(cash, now);
+        if (changed) {
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[vendor] CASH MIRROR counter=%u,%u,%u,%u,%u cash=%d",
+                it->t, it->c, it->cs, it->i, it->s, cash);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+void Replicator::applyVendorCash(GameWorld* gw, Inbound& in) {
+    (void)gw;
+    std::deque<InboundVendorCash> got;
+    in.drainVendorCash(got);
+    if (!vendorSync_ || isHostRole()) return;
+    unsigned long now = nowMs();
+    for (std::deque<InboundVendorCash>::iterator it = got.begin(); it != got.end(); ++it) {
+        const VendorCashPacket& p = it->pkt;
+        unsigned int cHand[5] = { p.cType, p.cContainer, p.cContainerSerial, p.cIndex, p.cSerial };
+        unsigned int owner[5];
+        if (!engine::readShopCounterOwner(cHand, owner)) continue;
+        ShopKey sk((u32)owner[1], (u32)owner[2]);
+        std::map<ShopKey, CashIn>::iterator ci = vendorCashIn_.find(sk);
+        CashIn c;
+        c.counter.t = p.cType; c.counter.c = p.cContainer; c.counter.cs = p.cContainerSerial;
+        c.counter.i = p.cIndex; c.counter.s = p.cSerial;
+        c.cash = p.cash;
+        c.since = (ci != vendorCashIn_.end()) ? ci->second.since : now; // latest value wins
+        vendorCashIn_[sk] = c;
+    }
+    const unsigned long CASH_DEFER_MS = 3000;
+    for (std::map<ShopKey, CashIn>::iterator ci = vendorCashIn_.begin(); ci != vendorCashIn_.end(); ) {
+        const CashIn& c = ci->second;
+        unsigned int cHand[5] = { c.counter.t, c.counter.c, c.counter.cs, c.counter.i, c.counter.s };
+        int cur = -1;
+        if (!engine::readShopCash(cHand, &cur) || cur < 0) { vendorCashIn_.erase(ci++); continue; }
+        std::map<ShopKey, int>::iterator cb = vendorCashBase_.find(ci->first);
+        // A local trade's cash leg not reported yet: applying now would erase it.
+        if (cb != vendorCashBase_.end() && cur != cb->second && cur != c.cash) {
+            if (now - c.since < CASH_DEFER_MS) { ++ci; continue; }
+            coop::logLine("[vendor] cash defer-expired (unreported local change; applying)");
+        }
+        int after = cur;
+        if (cur != c.cash) {
+            engine::setShopCash(cHand, c.cash, &after);
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[vendor] CASH APPLY counter=%u,%u,%u,%u,%u cash=%d was=%d now=%d",
+                cHand[0], cHand[1], cHand[2], cHand[3], cHand[4], c.cash, cur, after);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        vendorCashBase_[ci->first] = c.cash;
+        vendorCashPend_.erase(ci->first);
+        vendorCashIn_.erase(ci++);
     }
 }
 

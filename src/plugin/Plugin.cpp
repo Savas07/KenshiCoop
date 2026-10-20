@@ -1940,8 +1940,11 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
             g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId());
         // Protocol 60 (join): a local trade with a shop whose counters the host
         // mirrors goes back to the host as per-item counter changes.
-        if (g_cfg.invSync && g_cfg.vendorSync)
+        if (g_cfg.invSync && g_cfg.vendorSync) {
             g_repl.detectAndPublishVendorDeltas(gw, g_net, g_net.localId());
+            // Protocol 60 (host): the merchant cash of every mirrored shop.
+            g_repl.publishVendorCash(gw, g_net, g_net.localId());
+        }
         // Phase W1 (bidirectional): BOTH clients stream the free ground items they
         // author in their interest sphere - owner-scoped netId spaces, peer items
         // filtered by the proxy echo guard - so a join-side drop of materials/food
@@ -2159,8 +2162,11 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         }
         // Protocol 60 (host): the joins' trades land in the real shop stock before
         // the census captures it again.
-        if (g_cfg.vendorSync)
+        if (g_cfg.vendorSync) {
             g_repl.applyVendorDeltas(gw, g_inbound);
+            // Protocol 60 (join): the host's merchant cash.
+            g_repl.applyVendorCash(gw, g_inbound);
+        }
         // Phase 4a: reconcile any peer-owned container we received a fresh snapshot
         // for (the join applies the host's container; the host skips its own).
         g_repl.applyInventories(gw);

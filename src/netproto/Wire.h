@@ -90,7 +90,8 @@ enum PacketType {
     PKT_PEER_STATE       = 49,// RELIABLE roster edge: another join arrived/left (host -> joins, protocol 56); PeerStatePacket
     PKT_CHARGEN          = 50,// RELIABLE join character-creation result (join -> host -> joins, protocol 57); CharGenHeader + tail
     PKT_ROSTER           = 51,// RELIABLE who is player N (host -> joins, protocol 59); RosterPacket
-    PKT_VENDOR_DELTA     = 52 // RELIABLE join shop-counter stock change (join -> host, protocol 60); VendorDeltaPacket
+    PKT_VENDOR_DELTA     = 52,// RELIABLE join shop-counter stock/cash change (join -> host, protocol 60); VendorDeltaPacket
+    PKT_VENDOR_CASH      = 53 // RELIABLE merchant cash at a mirrored counter (host -> joins, protocol 60); VendorCashPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -827,6 +828,9 @@ enum XferAckVerdict {
 // brings every client back in line. Only the counter side crosses: the buyer's
 // or seller's bag rides that player's own inventory snapshots and the cats the
 // money pool (protocol 52). deltaId is per-sender monotonic (idempotency).
+// The merchant's CASH is the shop's too: a join trade's change of it rides the
+// same packet (`cash`; a cash-only delta has an empty stringID), and the host
+// mirrors the real value back with PKT_VENDOR_CASH.
 struct VendorDeltaPacket {
     u8   type;       // = PKT_VENDOR_DELTA
     u32  ownerId;    // network player id of the sender (the join that traded)
@@ -844,6 +848,22 @@ struct VendorDeltaPacket {
     u8   level;      // craft grade, GRADE_NA when not applicable
     char manufacturer[48];
     char material[48];
+    i32  cash;       // merchant cash change at this shop: > 0 received (the player
+                     // bought), < 0 paid out (the player sold)
+};
+
+// Host -> joins: the merchant's cash as the host's counter reports it
+// (RootObject::getMoney), sent on change + a slow safety resend. The join moves
+// its own counter's cash to this value unless it holds an unreported change.
+struct VendorCashPacket {
+    u8   type;       // = PKT_VENDOR_CASH
+    u32  ownerId;    // the host
+    u32  cType;      // counter hand (raw, save-stable)
+    u32  cContainer;
+    u32  cContainerSerial;
+    u32  cIndex;
+    u32  cSerial;
+    i32  cash;
 };
 
 // Reserved netId meaning "no/invalid world item".

@@ -176,6 +176,11 @@ struct InboundVendorDelta {
     u32               ownerId;
     VendorDeltaPacket pkt;
 };
+// One received merchant-cash row (protocol 60, host -> join).
+struct InboundVendorCash {
+    u32              ownerId;
+    VendorCashPacket pkt;
+};
 
 // One received player-faction relation row (protocol 24): from the host it is
 // the authoritative row (the join applies it); from the join it is a forwarded
@@ -460,7 +465,7 @@ public:
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
-        vendorDelta_(worldReset_),
+        vendorDelta_(worldReset_), vendorCash_(worldReset_),
         faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
         research_(worldReset_),   deed_(worldReset_),       fixture_(worldReset_),
@@ -609,6 +614,10 @@ public:
     void pushVendorDelta(u32 ownerId, const VendorDeltaPacket& pkt) {
         InboundVendorDelta ivd; ivd.ownerId = ownerId; ivd.pkt = pkt;
         EnterCriticalSection(&cs_); vendorDelta_.push_back(ivd); LeaveCriticalSection(&cs_);
+    }
+    void pushVendorCash(u32 ownerId, const VendorCashPacket& pkt) {
+        InboundVendorCash ivc; ivc.ownerId = ownerId; ivc.pkt = pkt;
+        EnterCriticalSection(&cs_); vendorCash_.push_back(ivc); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received faction-relation row (protocol 24), owner-tagged.
     void pushFaction(u32 ownerId, const FactionPacket& pkt) {
@@ -847,6 +856,9 @@ public:
     void drainVendorDeltas(std::deque<InboundVendorDelta>& out) {
         EnterCriticalSection(&cs_); out.swap(vendorDelta_); LeaveCriticalSection(&cs_);
     }
+    void drainVendorCash(std::deque<InboundVendorCash>& out) {
+        EnterCriticalSection(&cs_); out.swap(vendorCash_); LeaveCriticalSection(&cs_);
+    }
     void drainStealth(std::deque<InboundStealth>& out) {
         EnterCriticalSection(&cs_); out.swap(stealth_); LeaveCriticalSection(&cs_);
     }
@@ -956,6 +968,7 @@ private:
     WorldQ<InboundMoney>           money_;
     WorldQ<InboundMoneyDelta>      moneyDelta_;
     WorldQ<InboundVendorDelta>     vendorDelta_;
+    WorldQ<InboundVendorCash>      vendorCash_;
     WorldQ<InboundFaction>         faction_;
     WorldQ<InboundTime>            time_;
     WorldQ<InboundDoor>            door_;

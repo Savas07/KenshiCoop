@@ -94,7 +94,7 @@ Replicator::Replicator()
       deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
       fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true),
       storeSync_(false), contCensusMs_(0),
-      vendorSync_(false), vendorScanMs_(0), nextVendorDeltaId_(1),
+      vendorSync_(false), vendorScanMs_(0), nextVendorDeltaId_(1), vendorCashMs_(0),
       timeSync_(true), timeBrake_(true),
       timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
@@ -264,6 +264,10 @@ void Replicator::resetSession() {
     vendorPend_.clear();
     vendorOwners_.clear();
     appliedVendorDeltas_.clear();
+    vendorCashSent_.clear();
+    vendorCashBase_.clear();
+    vendorCashPend_.clear();
+    vendorCashIn_.clear();
     worldTrack_.clear();
     worldProxies_.clear();
     worldSeeded_ = false; // re-baseline the reloaded world's save-native items

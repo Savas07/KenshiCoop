@@ -350,6 +350,15 @@ public:
     // host's, so the join's own restock must not run.
     bool vendorRefreshGated(unsigned int platContainer, unsigned int platSerial) const;
 
+    // Protocol 60, HOST, BEFORE engine: mirror each censused shop's merchant
+    // cash (one row per trader platoon) on change + a 5 s safety resend.
+    void publishVendorCash(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // Protocol 60, JOIN, AFTER engine: move each mirrored shop's cash to the
+    // host's value - unless the join holds a cash change it has not reported
+    // yet (a trade still settling), which defers it (3 s cap).
+    void applyVendorCash(GameWorld* gw, Inbound& in);
+
     // AFTER applyTransfers (protocol 50): drain verdicts for intents WE authored
     // and settle them on the receiver's word instead of on a deadline. Accept
     // clears our latches now; reject clears them too, which is what lets the
@@ -1595,6 +1604,18 @@ private:
     unsigned long  vendorScanMs_;
     u32            nextVendorDeltaId_;
     std::set<std::pair<u32, u32> > appliedVendorDeltas_;
+    // Protocol 60 merchant cash, keyed by the trader PLATOON (shopOwner
+    // container fields) so a shop with several counters counts once. Host:
+    // last value sent + when. Join: the host's last value (the baseline a trade
+    // is measured against), unsettled local changes (delta, since) and host
+    // values waiting for the local change to be reported.
+    typedef std::pair<u32, u32> ShopKey;
+    struct CashIn { Key counter; int cash; unsigned long since; };
+    std::map<ShopKey, std::pair<int, unsigned long> > vendorCashSent_;
+    std::map<ShopKey, int>                            vendorCashBase_;
+    std::map<ShopKey, std::pair<int, unsigned long> > vendorCashPend_;
+    std::map<ShopKey, CashIn>                         vendorCashIn_;
+    unsigned long                                     vendorCashMs_;
 
     // Phase W1 world-item state.
     // HOST: worldTrack_ maps a ground item's LOCAL engine hand (Key) to its assigned
