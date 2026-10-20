@@ -147,6 +147,18 @@ public:
         unsigned int wire[5];
     };
     bool bodyRoleOf(GameWorld* gw, Character* c, BodyRoleRead* out) const;
+    // Scenario support (host_pc_fight): what THIS client's replicator knows about
+    // the body at a LOCAL hand, so a scenario can compare one fight across the two
+    // logs. outCanon = the key the peer streams the body by (canonicalOf_: a
+    // minted proxy or a combat-detached, re-keyed NPC has a local hand the peer
+    // never heard of), the local hand itself when we do not drive it.
+    // outRegime = DevRegime of the copy's drive this tick (-1 = not a driven
+    // body). outTask/outSubj = the newest streamed task and its subject (wire
+    // key). outDest = a drive walk/slide destination is outstanding. Read-only;
+    // false when the hand does not resolve here. readObjectHand layout.
+    bool scenarioReplicaInfo(const unsigned int localHand[5], unsigned int outCanon[5],
+                             int* outRegime, unsigned int* outTask,
+                             unsigned int outSubj[5], bool* outDest) const;
 
     // AI-gating probe (join side): recruit diverged NPCs into the player squad to
     // validate the "inhabit" lever (stops self-tasking + becomes drivable).
@@ -977,6 +989,11 @@ private:
                                       //   drift PERSISTS COMBAT_CONVERGE_MS on a moving source;
                                       //   a momentary interp/footwork spike fast-slides back
                                       //   instead of warping
+        unsigned long combatLockTick; // last tick a SQUAD copy's local combat target WAS the
+                                      //   owner's target (0 = never). Within COMBAT_LOCK_HOLD_MS
+                                      //   of it the copy counts as engaged: its fight owns the
+                                      //   footwork and the move-order walk band (which replaces
+                                      //   the attack) is skipped
         unsigned long npcSnapTick;    // locomotion-path hard snap cooldown (Phase 2): a far
                                       //   NPC whose teleport can't stick (seat AI, unloaded
                                       //   terrain) walk-converges between snaps instead of
@@ -1097,7 +1114,7 @@ private:
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
                    combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
-                   combatOverTick(0), npcSnapTick(0),
+                   combatOverTick(0), combatLockTick(0), npcSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), physHealTick(0), getUpHealTick(0), poseHealTick(0),
@@ -1130,6 +1147,18 @@ private:
     void applyRest(Character* c, Driven& d, const EntityState& out,
                    bool haveActual, float ax, float ay, float az, unsigned long now,
                    bool isSquad);
+
+    // The ONE wire-key -> local-body translation. Both the drive subject and every
+    // streamed SUBJECT the drive acts on (the combat target) go through it, so the
+    // attack is aimed at the same body the drive moves for that key. The key's own
+    // hand when it resolves here; otherwise the proxy minted/adopted for it
+    // (protocol 21/23 - a proxy's key is the PEER's hand, which never resolves
+    // here), *viaProxy set. A proxy pointer can be freed by the engine between the
+    // ~1 Hz liveness sweep and this use, so it is proven live with a SEH-guarded
+    // hand read first; a dead one returns 0 with *staleProxy set (only the drive
+    // loop, which owns the binding, unbinds it). Read-only. Either out-param may
+    // be 0.
+    Character* bodyForKey(const Key& k, bool* viaProxy, bool* staleProxy) const;
 
     // Drive-tick epilogue (Phase 7 Workstream C): the self-contained post-loop
     // passes split out of applyTargets. Each reads/writes only Replicator members
@@ -2021,6 +2050,9 @@ private:
     // KENSHICOOP_DEBUG_SQUAD_DRIVE=1 (read once; off by default): per-frame
     // "[sqdrv]" line for every driven squad body (gap/gate/peak/settle/poses).
     static bool squadDriveDebug();
+    // KENSHICOOP_DEBUG_COMBAT_COPY=1: 10 Hz "[combat] trace" + "[combat] walk"
+    // lines for every squad copy in the combat regime (diagnostic only).
+    static bool combatCopyDebug();
     // ---- end MoveSync -------------------------------------------------------
 
     // Protocol 36 (wire v35): per-sender clock mapping for the batch send

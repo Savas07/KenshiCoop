@@ -82,4 +82,46 @@ void Replicator::devSnapshot(GameWorld* gw, std::vector<DevBody>& out) {
     }
 }
 
+bool Replicator::scenarioReplicaInfo(const unsigned int localHand[5],
+                                     unsigned int outCanon[5], int* outRegime,
+                                     unsigned int* outTask, unsigned int outSubj[5],
+                                     bool* outDest) const {
+    if (outRegime) *outRegime = -1;
+    if (outTask) *outTask = 0;
+    if (outDest) *outDest = false;
+    for (int j = 0; j < 5; ++j) {
+        if (outCanon) outCanon[j] = localHand ? localHand[j] : 0;
+        if (outSubj) outSubj[j] = 0;
+    }
+    if (!localHand) return false;
+    Character* c = engine::resolveCharByHand(localHand[3], localHand[4], localHand[0],
+                                             localHand[1], localHand[2]);
+    if (!c) return false;
+    Key k; k.t = localHand[0]; k.c = localHand[1]; k.cs = localHand[2];
+    k.i = localHand[3]; k.s = localHand[4];
+    std::map<Character*, Key>::const_iterator ci = canonicalOf_.find(c);
+    if (ci != canonicalOf_.end()) k = ci->second;
+    if (outCanon) {
+        outCanon[0] = k.t; outCanon[1] = k.c; outCanon[2] = k.cs;
+        outCanon[3] = k.i; outCanon[4] = k.s;
+    }
+    if (ownHands_.find(k) != ownHands_.end()) return true;
+    std::map<Key, Driven>::const_iterator dit = targets_.find(k);
+    if (dit == targets_.end()) return true;
+    const Driven& d = dit->second;
+    const unsigned long now = nowMs();
+    if (outRegime)
+        *outRegime = (d.dbgMs != 0 && now - d.dbgMs <= 250) ? d.dbgRegime : DR_NONE;
+    if (outDest) *outDest = d.haveDest;
+    EntityState e;
+    if (d.interp.latest(&e, 0, 0, 0)) {
+        if (outTask) *outTask = e.task;
+        if (outSubj) {
+            outSubj[0] = e.sType; outSubj[1] = e.sContainer; outSubj[2] = e.sContainerSerial;
+            outSubj[3] = e.sIndex; outSubj[4] = e.sSerial;
+        }
+    }
+    return true;
+}
+
 } // namespace coop

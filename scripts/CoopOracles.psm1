@@ -198,6 +198,8 @@ function Invoke-OneOracle {
         "mint_aggro"    { return (Test-MintAggro      -HostFile $HostLog -JoinFile $JoinLog) }
         "proxy_drift"   { return (Test-ProxyDrift     -JoinFile $JoinLog) }
         "pc_assault"    { return (Test-PcAssault       -HostFile $HostLog -JoinFile $JoinLog) }
+        "host_pc_fight" { return (Test-HostPcFight     -HostFile $HostLog -JoinFile $JoinLog) }
+        "host_pc_fight_mint" { return (Test-HostPcFight -HostFile $HostLog -JoinFile $JoinLog -GateName 'host_pc_fight_mint' -RequireMint) }
         "player_ko"     { return (Test-PlayerKo        -HostFile $HostLog -JoinFile $JoinLog) }
         "medic_order"   { return (Test-MedicOrder      -HostFile $HostLog -JoinFile $JoinLog) }
         "limb_loss"     { return (Test-LimbLoss        -HostFile $HostLog -JoinFile $JoinLog) }
@@ -472,7 +474,7 @@ Export-ModuleMember -Function @(
     "Test-MinePose", "Test-MineIdentity", "Test-MineOutput", "Test-MineClear",
     "Test-CombatProbe", "Test-CombatOrder", "Test-CombatKill", "Test-DamageGuard",
     "Test-CombatSnapRate", "Test-CombatBattle", "Test-CombatWin", "Test-DeathParity",
-    "Get-VitalsSeries", "Test-PlayerCombat", "Test-AssaultTown", "Test-PcAssault", "Get-CombatParity", "Test-PlayerKo", "Test-MedicOrder",
+    "Get-VitalsSeries", "Test-PlayerCombat", "Test-AssaultTown", "Test-PcAssault", "Get-CombatParity", "Test-HostPcFight", "Test-PlayerKo", "Test-MedicOrder",
     "Test-MedicPose", "Test-LimbLoss", "Test-NpcVitals",
     "Get-CrawlSeries", "Get-CrawlProbeSeries", "Test-CrawlMove",
     "Get-StatsSeries", "Test-StatsSync",

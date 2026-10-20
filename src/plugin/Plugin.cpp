@@ -115,6 +115,15 @@ static bool coopScenarioBodyRole(Character* c, coop::BodyRoleView* out) {
     return true;
 }
 #endif
+// host_pc_fight's cross-log key (ScenarioContext::replicaInfo): the wire key and
+// copy drive state of a local body. Same adapter shape and reason as above.
+static bool coopScenarioReplicaInfo(const unsigned int localHand[5],
+                                    unsigned int outCanon[5], int* outRegime,
+                                    unsigned int* outTask, unsigned int outSubj[5],
+                                    bool* outDest) {
+    return g_repl.scenarioReplicaInfo(localHand, outCanon, outRegime, outTask,
+                                      outSubj, outDest);
+}
 
 // SessionController (Phase 3): the mutable per-session lifecycle state that used
 // to live as ~18 loose file globals - peer presence, the gameplay-start edge,
@@ -2124,6 +2133,7 @@ void tickScenarioStart(GameWorld* gw) {
             pctx.peerReady = peerReady;
             pctx.pickMintedProxy = &coopScenarioPickMintedProxy;
             pctx.bodyRole = &coopScenarioBodyRole;
+            pctx.replicaInfo = &coopScenarioReplicaInfo;
             g_scenario->onGameplay(pctx);
         }
         if (peerReady || fallback) {
@@ -2135,6 +2145,7 @@ void tickScenarioStart(GameWorld* gw) {
             ctx.peerReady = peerReady;
             ctx.pickMintedProxy = &coopScenarioPickMintedProxy;
             ctx.bodyRole = &coopScenarioBodyRole;
+            ctx.replicaInfo = &coopScenarioReplicaInfo;
             char m[200];
             _snprintf(m, sizeof(m) - 1, "SCENARIO arm trigger=%s waitedMs=%lu",
                       peerReady ? "peer-ready" : "timeout", (unsigned long)waitedMs);
@@ -2353,6 +2364,7 @@ void tickScenarioTick(GameWorld* gw) {
         ctx.peerReady = g_inbound.sawRemoteEntity();
         ctx.pickMintedProxy = &coopScenarioPickMintedProxy;
         ctx.bodyRole = &coopScenarioBodyRole;
+        ctx.replicaInfo = &coopScenarioReplicaInfo;
         if (g_scenario->onTick(ctx)) {
             // Stage 2: the receiver emits its interpolation smoothness summary
             // alongside the verdict so the runner can assert per-frame gliding.

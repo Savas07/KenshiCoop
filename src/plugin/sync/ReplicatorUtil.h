@@ -166,6 +166,15 @@ const float COMBAT_SNAP_VEL      = 8.0f;   // source speed (u/s) below which a b
                                            // / wrong-place, not a chase - converge, never warp
 const unsigned long COMBAT_CONVERGE_MS = 400; // drift must persist over the snap band this long
                                               // (on a moving source) before an instant teleport
+// A SQUAD copy (a peer's player character) locked onto its owner's target counts as
+// ENGAGED for this long after its last such read: the engine's own lock blinks off
+// between swings (DECISION), and a move order issued in that blink replaces the
+// attack. While engaged the copy is never walk-converged - only a true leave snaps
+// it. Measured (lead_trace1, host_pc_fight_mint): every idle stretch of the join's
+// copy of a fighting host PC began with a band walk at drift 20-26 u while the copy
+// was fighting the right body (localFight=1); the walk flipped its task to
+// MOVE_ON_FREE_WILL and dropped the attack until the next re-issue.
+const unsigned long COMBAT_LOCK_HOLD_MS = 1500;
 const unsigned long COMBAT_REISSUE_MS     = 1500; // base re-issue throttle
 const unsigned long COMBAT_REISSUE_MAX_MS = 6000; // backoff cap
 const unsigned int  COMBAT_REISSUE_CAP    = 5;    // max timer re-issues per episode: a copy

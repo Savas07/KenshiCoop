@@ -54,6 +54,13 @@ struct ScenarioContext {
     // recruit_join: the replicator's view of body 'c' (see BodyRoleView). Same
     // adapter reason as pickMintedProxy. False when 'c' has no readable hand.
     bool        (*bodyRole)(Character* c, BodyRoleView* out);
+    // host_pc_fight: Replicator::scenarioReplicaInfo through the same kind of
+    // adapter - the canonical (wire) key of the body at a local hand plus its
+    // copy's drive state (regime DevRegime or -1, newest streamed task/subject,
+    // outstanding walk destination). 0 when unavailable - always check.
+    bool        (*replicaInfo)(const unsigned int localHand[5], unsigned int outCanon[5],
+                               int* outRegime, unsigned int* outTask,
+                               unsigned int outSubj[5], bool* outDest);
 };
 
 class Scenario {

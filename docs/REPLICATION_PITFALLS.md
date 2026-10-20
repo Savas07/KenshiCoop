@@ -509,3 +509,53 @@ copy kept its stool action (OPERATE_MACHINERY) after the re-key, an AI-suspended
 copy never ends it, so it sat frozen or crawled while the owner ran. A squad copy
 in a seat/work pose whose owner moves with no task now ends it (`[heal] POSE`) -
 the same staleness rule the get-up heal already applied.
+
+## 20. A wire key is not a local hand
+
+A streamed SUBJECT (the body a combat stance attacks) is published in the
+owner's key space: the target's raw hand when the owner simulates it, the
+canonical key when the owner drives or minted it. On the viewer that key can
+name a body whose LOCAL hand is something else entirely — a minted proxy (the
+peer's hand never resolves here) or a world NPC our own combat detach re-keyed.
+The drive already translated its own subject through the proxy table, but the
+combat branch resolved the target with a raw hand lookup and judged the copy's
+engagement by comparing its local target hand with the wire key. So when a host
+player fought a runtime spawn, the join's copy got `r=1` ("target not loaded")
+on every re-issue and was never ordered; and when it engaged the right proxy on
+its own, the hand comparison called that the wrong target, so every re-issue
+`clearGoals`-reset the fight while the walk band (a player move order on a squad
+copy) pulled it out of melee. The friend saw the player's character stand or
+jog while its owner fought (host_pc_fight_mint before the fix: 6 `r=1` orders,
+the copy walk-ordered in 71% of its owner's fight samples).
+
+The fix is one translation: `Replicator::bodyForKey` maps a wire key to the
+local body (own hand, else the live proxy) for the drive subject AND the combat
+target; `applyCombat`/`forceAttack` take that body, and "wrong target" compares
+bodies, never hands.
+
+Two follow-ups the same scenario proved for copies of player characters. First, a
+walk order is a player move order: it flips the copy's task to MOVE_ON_FREE_WILL
+and drops the attack until the next re-issue. With the trace on
+(`KENSHICOOP_DEBUG_COMBAT_COPY=1`, `[combat] trace` / `[combat] walk`), every idle
+stretch of the join's copy began with a band walk at 20-26 u of drift while the
+copy was hitting the right body (lead_trace1). A squad copy whose lock resolved to
+its owner's target is now ENGAGED for `COMBAT_LOCK_HOLD_MS` across the lock's
+between-swing blinks: no walk band, no sustained-drift warp (a big distance or a
+source teleport still snaps), no disengaged re-issue. host_pc_fight_mint went
+from 15% engaged (walk-ordered 74%) to 100%, host_pc_fight from 54% to 84%.
+Second, the re-issue budget was spent by the owner's own re-targets inside one
+brawl, after which a copy that dropped out was never re-ordered (squad copies get
+a fresh budget per owner target and are re-ordered right after a snap).
+
+In a multi-enemy brawl both engines pick their next victim themselves every
+0.5-2 s, so "same body at the same instant" is not a parity both sides can hold
+without a `clearGoals` re-issue per flip — the churn that cancelled the swings.
+The gate scores a copy as engaged when it fights any body its owner fights in that
+brawl (within 5 s); same-body parity is reported beside it.
+
+**Rule.** Any field that carries a peer's key — a subject, a target, a carrier —
+has to go through the same key-to-body translation as the body itself, and any
+comparison is made between local bodies. A hand compared with a key is a
+coincidence check that holds only until the first re-key or mint. (Still open:
+the carry self-heal, `applyPickup` on the streamed carried hand, resolves the
+raw key.)
