@@ -1066,6 +1066,16 @@ void Replicator::applyTargets(GameWorld* gw) {
                 d.combatOrders = 0; // new episode: backoff restarts
             } else if (tgtChanged && (now - d.combatTick) >= COMBAT_REISSUE_MS) {
                 reissue = true;     // retarget promptly (base throttle, no backoff)
+                // A SQUAD copy (a peer's PC) starts a fresh engagement budget per
+                // target: the owner's retargets are not failed attempts, and
+                // counting them spent the whole budget inside one brawl, after
+                // which a copy that dropped out of the fight was never re-ordered
+                // again (host_pc_fight run hpf_after4: order n=6 on a re-target,
+                // a snap 1.5 s later, then no order for 8.7 s while the copy stood
+                // out of the fight and its owner kept swinging at the same body).
+                // The retarget path itself stays base-throttled, so an owner
+                // flicking between two bodies cannot thrash it.
+                if (isSquad) d.combatOrders = 0;
             } else if ((wrongLocalTgt || (!hostWaiting && !localFighting)) &&
                        (now - d.combatTick) >= interval &&
                        d.combatOrders <= COMBAT_REISSUE_CAP) {
@@ -1222,6 +1232,14 @@ void Replicator::applyTargets(GameWorld* gw) {
                     d.combatSnapTick = now;
                     d.combatOverTick = 0;
                     d.haveDest = false; // position jumped: force a fresh slide dest
+                    // A SQUAD copy that was out of the fight when it was moved is
+                    // re-ordered on the next tick instead of after the backoff: the
+                    // teleport put it at its owner's spot, away from wherever its
+                    // local fight had drifted, and the pending backoff (up to 6 s)
+                    // left it standing there (hpf_after4: snaps at drift 23-27 u,
+                    // then 0 of the next 5 samples fighting, 4-6 s idle).
+                    if (isSquad && !localFighting && !hostWaiting)
+                        d.combatTick = now - COMBAT_REISSUE_MAX_MS;
                     ++d.combatSnapCount; ++combatSnapTotal_;
                     if (wrongLocalTgt) ++combatWrongTgt_;
                     { char b[224]; _snprintf(b, sizeof(b) - 1,
