@@ -486,6 +486,14 @@ private:
             engine::writeBuildProgressByHand(benchHand_, 0.5f * (float)rampStep_,
                                              rampStep_ >= 2, &post);
         }
+        // A crafting bench converts INPUT buffers into output, so keep the
+        // host's (authoritative) inputs topped up; protocol 33 mirrors them to
+        // the join's minted copy. Every 5 s, only once the bench is complete.
+        if (placeOk_ && rampStep_ >= 2 && t >= nextRampMs_) {
+            nextRampMs_ = t + 5000;
+            const float in[2] = { 20.0f, 20.0f };
+            engine::writeMachineByHand(benchHand_, -1, -1.0f, false, in, 0, 0);
+        }
     }
 
     // Owner, bench mode: a player order to operate the bench (re-issued only

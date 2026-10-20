@@ -655,6 +655,11 @@
         # protocol-33 row ever exists in craft1). The host places + completes a
         # bench on 'sync' (the prod_sync lever) and the join's rank-1 member is
         # ordered to operate it; mine_yield then judges the bench's output item.
+        # Tier 'none' (diagnostic): measured 2026-10-20 (b5_bench/f5_bench) the
+        # order lands (ok=1) but the member never takes the operate task
+        # (task=65535 throughout, output buffer never materialises): a crafting
+        # bench is only workable with a crafting QUEUE, which no harness lever
+        # sets yet. Until one exists this cannot fail for the right reason.
         bench_yield_join = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'
                          KENSHICOOP_CELL_AUTH = '1'; KENSHICOOP_INV_DUMP = '1' }
@@ -663,7 +668,7 @@
             PrimaryGate = 'mine_yield'
             Gating   = @('mine_yield', 'clock_sync')
             Advisory = @('machine_single')
-            Tier = 'full'; WanVariant = $false
+            Tier = 'none'; WanVariant = $false
         }
 
         # ---- body-state / reliable events ----------------------------------------
