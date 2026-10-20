@@ -136,6 +136,10 @@ function Invoke-OneOracle {
         "recruit_probe" { return (Test-RecruitProbe    -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_sync"  { return (Test-RecruitSync     -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_ctl"   { return (Test-RecruitCtl      -HostFile $HostLog -JoinFile $JoinLog) }
+        "recruit_join"  { return (Test-RecruitJoin     -HostFile $HostLog -JoinFile $JoinLog -Leg J) }
+        "recruit_join_host" { return (Test-RecruitJoin -HostFile $HostLog -JoinFile $JoinLog -Leg H) }
+        "recruit_seated" { return (Test-RecruitJoin -HostFile $HostLog -JoinFile $JoinLog -Leg J -Seated) }
+        "recruit_seated_host" { return (Test-RecruitJoin -HostFile $HostLog -JoinFile $JoinLog -Leg H -Seated) }
         "faction_probe" { return (Test-FactionProbe    -HostFile $HostLog -JoinFile $JoinLog) }
         "faction_sync"  { return (Test-FactionSync     -HostFile $HostLog -JoinFile $JoinLog) }
         "time_probe"    { return (Test-TimeProbe       -HostFile $HostLog -JoinFile $JoinLog) }
@@ -478,7 +482,7 @@ Export-ModuleMember -Function @(
     "Test-NpcCensus",
     "Get-WalletSeries", "Get-PoolSeries", "Test-ShopProbe", "Test-WalletProbe",
     "Test-MoneySync", "Test-MoneyPersist", "Test-VendorTrade",
-    "Test-RecruitProbe", "Test-RecruitSync", "Test-RecruitCtl",
+    "Test-RecruitProbe", "Test-RecruitSync", "Test-RecruitCtl", "Test-RecruitJoin",
     "Get-FacRelSeries", "Test-FactionProbe", "Test-FactionSync",
     "Get-GTimeSeries", "Test-TimeProbe", "Test-TimeSync", "Get-SlewSummary",
     "Get-SneakSeries", "Test-SneakPose", "Test-SneakDetect",

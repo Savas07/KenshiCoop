@@ -1154,6 +1154,39 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # recruit_join: sync bug 3 - a JOIN recruit of an NPC it was DRIVING from
+        # the host's stream (every NPC near a shared cell is host-authored, so a
+        # join bar recruit is always one; probeRecruit never picked one). Two
+        # mirrored legs: the host recruits an NPC it authors (control arm,
+        # recruit_join_host), then the join recruits a host-driven one
+        # (recruit_join); each recruiter move-orders its recruit while the other
+        # side mirrors. Test-RecruitJoin gates per leg: the peer re-keys its own
+        # copy (REKEY ok=1, no fallback, no proxy mint), the recruiter always
+        # streams and never drives/AI-suspends its recruit, the orders execute
+        # and the peer's copy follows, squads grow by one with tab parity, and
+        # the peer never publishes the recruit as its own. Save 'sync'.
+        recruit_join = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'recruit_join'
+            Gating   = @('recruit_join', 'recruit_join_host', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # recruit_seated: recruit_join's script with both legs recruiting a
+        # POSED (seated/working) NPC - the bar recruit. The host recruits one it
+        # authors (recruit_seated_host), the join one it drives from the host's
+        # stream (recruit_seated); same Test-RecruitJoin gates plus "the subject
+        # really was posed". The peer's copy of a seated recruit must stand up and
+        # follow the recruiter's orders. Save 'sync'.
+        recruit_seated = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'recruit_seated'
+            Gating   = @('recruit_seated', 'recruit_seated_host', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # faction_probe: faction-relation phase-0 diagnostic (protocol 24 -
         # factionSync forced OFF; the affectRelations detours stay on for
         # cause-attribution evidence). Both sides log a 1 Hz FACREL series

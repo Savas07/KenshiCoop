@@ -1223,6 +1223,308 @@ private:
     bool          haveHome_;
 };
 
+// recruit_join (sync bug 3, full tier): a JOIN recruit of a HOST-DRIVEN NPC.
+// Field report: when the host recruits, the recruit works on both screens;
+// when the JOIN recruits, the join only controls it after the host moves it
+// within the squad (EVT_SQUAD_MOVE -> CONTROL-FLIP on the join). recruit_sync
+// never covered it - probeRecruit skips AI-suspended (peer-driven) bodies, yet
+// every NPC near a shared cell is host-authored, so the join's copy of a bar
+// recruit is a DRIVEN body (often re-containered by the sitter detach).
+// Two mirrored legs in one run (clock from ARM), each recruiter ordering its
+// own recruit around while the other client mirrors it:
+//   leg H (control arm) t=6s   HOST recruits the nearest NPC it authors
+//          (prefers a free-standing one); t=9-18s host move-orders it, join
+//          drives.
+//   leg J               t=22s  JOIN recruits the nearest NPC it DRIVES from
+//          the host's stream (prefers re-keyed, then posed); t=25-34s join
+//          move-orders it, host drives.
+// Both sides find the other leg's recruit as the NEW squad member (pointer
+// set difference) and log, per leg: 2 Hz SCENARIO RJ role samples (the
+// replicator's own view - owned / pins / driven / AI-suspended / proxy /
+// minted / squad / tab owner, live hand, wire key, position), RJ gait samples
+// in the walk window, and RJ squad sizes around the leg. Test-RecruitJoin
+// gates each leg separately (recruit_join = leg J, recruit_join_host = leg H)
+// so one run shows the asymmetry.
+class RecruitJoinScenario : public TimedScenario {
+public:
+    // seated=true is recruit_seated: both legs recruit a POSED (seated/working)
+    // NPC - the bar recruit - instead of preferring a free-standing one.
+    explicit RecruitJoinScenario(bool seated)
+        : TimedScenario(seated ? "recruit_seated" : "recruit_join", /*evidenceMs=*/0),
+          seated_(seated) {
+        initLeg(legs_[0], 'H', true,  H_RECRUIT_AT_MS);
+        initLeg(legs_[1], 'J', false, J_RECRUIT_AT_MS);
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        Character* pcs[MAX_SQUAD];
+        unsigned int n = engine::listPlayerChars(ctx.gw, pcs, MAX_SQUAD);
+        base_.clear();
+        for (unsigned int i = 0; i < n; ++i) base_.push_back(pcs[i]);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO RJ start host=%d base=%u adapter=%d",
+                  ctx.isHost ? 1 : 0, n, ctx.bodyRole ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        unsigned long t = ctx.elapsedMs;
+        for (int li = 0; li < 2; ++li) {
+            Leg& L = legs_[li];
+            bool recruiter = (L.hostRecruits == ctx.isHost);
+            if (!L.preLogged && t + SQUAD_LEAD_MS >= L.recruitAt) {
+                L.preLogged = true; logSquad(ctx, L, "pre");
+            }
+            if (recruiter && !L.recruitDone && t >= L.recruitAt) {
+                L.recruitDone = true; doRecruit(ctx, L, li);
+            }
+            if (!recruiter && !L.subj && t >= L.recruitAt && t < L.recruitAt + LEG_MS)
+                findNew(ctx, L, li);
+            if (L.subj && (L.lastRoleMs == 0 || t - L.lastRoleMs >= ROLE_MS)) {
+                L.lastRoleMs = t; logRole(ctx, L, recruiter);
+            }
+            unsigned long wFrom = L.recruitAt + WALK_DELAY_MS;
+            if (L.subj && t >= wFrom && t < wFrom + WALK_MS) {
+                if (L.lastGaitMs == 0 || t - L.lastGaitMs >= GAIT_MS) {
+                    L.lastGaitMs = t; logGait(ctx, L, recruiter);
+                }
+                if (recruiter && (L.lastWalkMs == 0 || t - L.lastWalkMs >= WALK_ORDER_MS)) {
+                    L.lastWalkMs = t; orderWalk(L);
+                }
+            }
+            if (!L.postLogged && t >= L.recruitAt + LEG_MS) {
+                L.postLogged = true; logSquad(ctx, L, "post");
+            }
+        }
+        if (t >= DURATION_MS) {
+            // Each client: its own recruit landed, and it found the peer's.
+            // The cross-machine ownership/drive verdict is Test-RecruitJoin's.
+            const Leg& own  = legs_[ctx.isHost ? 0 : 1];
+            const Leg& peer = legs_[ctx.isHost ? 1 : 0];
+            passed_ = (own.res == 1) && (peer.subj != 0);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    struct Leg {
+        char          id;
+        bool          hostRecruits;
+        unsigned long recruitAt;
+        bool          preLogged, recruitDone, postLogged;
+        int           res;
+        Character*    subj;
+        unsigned long lastRoleMs, lastGaitMs, lastWalkMs;
+        unsigned int  altDir;
+    };
+
+    static void initLeg(Leg& L, char id, bool hostRecruits, unsigned long at) {
+        L.id = id; L.hostRecruits = hostRecruits; L.recruitAt = at;
+        L.preLogged = L.recruitDone = L.postLogged = false;
+        L.res = -9; L.subj = 0;
+        L.lastRoleMs = L.lastGaitMs = L.lastWalkMs = 0; L.altDir = 0;
+    }
+
+    static bool sameHand(const unsigned int a[5], const unsigned int b[5]) {
+        return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] &&
+               a[3] == b[3] && a[4] == b[4];
+    }
+
+    bool isBase(Character* c) const {
+        for (unsigned int i = 0; i < base_.size(); ++i)
+            if (base_[i] == c) return true;
+        return false;
+    }
+
+    // Our own tab leader's position (host rank 0, join rank 1): the recruiter
+    // picks the NPC nearest its own squad, like a player talking to one.
+    bool anchorPos(const ScenarioContext& ctx, float* x, float* z) const {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        if (n == 0) return false;
+        int idx = tabLeaderIdx(sq, n, ctx.isHost ? 0u : 1u);
+        if (idx < 0) idx = 0;
+        *x = sq[idx].x; *z = sq[idx].z;
+        return true;
+    }
+
+    // Leg H: an NPC this client AUTHORS (not driven, not bound to a peer key);
+    // prefers a free-standing one (the peer's copy of a SEATED host recruit
+    // never stands up - rj_before1 - a separate symmetric gap this control
+    // arm must not trip over). Leg J: an NPC this client DRIVES from the host's
+    // stream - the realistic bar recruit first: one whose local hand differs
+    // from the host's wire key (re-containered by the sitter/combat detach),
+    // posed before free-standing. Nearest within PICK_RADIUS of our own tab
+    // leader wins inside a tier. One SCENARIO RJ pick line says what was seen.
+    Character* pickSubject(const ScenarioContext& ctx, const Leg& L, int li,
+                           float* outDist, int* outPosed, BodyRoleView* outRole) {
+        if (!ctx.bodyRole) return 0;
+        float ax = 0.0f, az = 0.0f;
+        if (!anchorPos(ctx, &ax, &az)) return 0;
+        static Character*  chars[MAX_NPC]; // main-thread only
+        static EntityState st[MAX_NPC];
+        unsigned int n = engine::listNpcs(ctx.gw, chars, st, MAX_NPC);
+        unsigned int eligible = 0, driven = 0, distant = 0;
+        float nearest = -1.0f;
+        Character* best = 0; int bestTier = 99; float bestD = 0.0f;
+        for (unsigned int i = 0; i < n; ++i) {
+            Character* c = chars[i];
+            if (!c || isBase(c) || c == legs_[1 - li].subj) continue;
+            BodyRoleView v;
+            if (!ctx.bodyRole(c, &v) || v.squad || v.minted) continue;
+            bool peerDriven = v.driven || v.canon || v.proxy;
+            if (peerDriven) ++driven;
+            if (L.hostRecruits == peerDriven) continue;
+            float dx = st[i].x - ax, dz = st[i].z - az;
+            float d = sqrtf(dx * dx + dz * dz);
+            if (nearest < 0.0f || d < nearest) nearest = d;
+            if (d > PICK_RADIUS) { ++distant; continue; }
+            ++eligible;
+            bool posed   = st[i].task != TASK_NONE && !taskIsCombat(st[i].task) &&
+                           !taskIsCarry(st[i].task) && !taskIsGetUp((int)st[i].task);
+            if (seated_ && !posed) continue;
+            bool rekeyed = peerDriven && !sameHand(v.local, v.wire);
+            // Standing arms prefer free-standing bodies (leg J re-keyed first);
+            // the seated arms only see posed ones (leg J re-keyed first).
+            int tier = L.hostRecruits ? (posed ? 1 : 0)
+                                      : ((posed ? 2 : 0) + (rekeyed ? 0 : 1));
+            if (!best || tier < bestTier || (tier == bestTier && d < bestD)) {
+                best = c; bestTier = tier; bestD = d;
+                *outDist = d; *outPosed = posed ? 1 : 0; *outRole = v;
+            }
+        }
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO RJ pick leg=%c who=%s npcs=%u peerDriven=%u eligible=%u "
+                  "far=%u nearest=%.1f tier=%d anchor=%.1f,%.1f",
+                  L.id, ctx.isHost ? "host" : "join", n, driven, eligible, distant,
+                  nearest, best ? bestTier : -1, ax, az);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return best;
+    }
+
+    void doRecruit(const ScenarioContext& ctx, Leg& L, int li) {
+        float dist = 0.0f; int posed = 0;
+        BodyRoleView pre; memset(&pre, 0, sizeof(pre));
+        Character* c = pickSubject(ctx, L, li, &dist, &posed, &pre);
+        unsigned int hb[5] = { 0, 0, 0, 0, 0 }, ha[5] = { 0, 0, 0, 0, 0 };
+        int res = 0;
+        if (c) {
+            engine::readObjectHand(reinterpret_cast<RootObject*>(c), hb);
+            res = engine::recruitNpc(ctx.gw, c) ? 1 : 0;
+            engine::readObjectHand(reinterpret_cast<RootObject*>(c), ha);
+            if (res == 1) L.subj = c;
+        }
+        L.res = res;
+        char b[360];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO RJ recruit leg=%c who=%s res=%d subject=%d "
+                  "before=%u,%u,%u,%u,%u after=%u,%u,%u,%u,%u wire=%u,%u,%u,%u,%u "
+                  "drv=%d canon=%d proxy=%d ais=%d posed=%d dist=%.1f t=%lu",
+                  L.id, ctx.isHost ? "host" : "join", res, c ? 1 : 0,
+                  hb[0], hb[1], hb[2], hb[3], hb[4], ha[0], ha[1], ha[2], ha[3], ha[4],
+                  pre.wire[0], pre.wire[1], pre.wire[2], pre.wire[3], pre.wire[4],
+                  pre.driven, pre.canon, pre.proxy, pre.aiSusp, posed, dist,
+                  ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The peer's recruit = the first squad member that is neither a baseline
+    // member nor the other leg's subject (Character* survives re-containering).
+    void findNew(const ScenarioContext& ctx, Leg& L, int li) {
+        Character* pcs[MAX_SQUAD];
+        unsigned int n = engine::listPlayerChars(ctx.gw, pcs, MAX_SQUAD);
+        for (unsigned int i = 0; i < n; ++i) {
+            Character* c = pcs[i];
+            if (!c || isBase(c) || c == legs_[1 - li].subj) continue;
+            L.subj = c;
+            BodyRoleView v; memset(&v, 0, sizeof(v));
+            if (ctx.bodyRole) ctx.bodyRole(c, &v);
+            char b[224];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO RJ found leg=%c who=%s hand=%u,%u,%u,%u,%u "
+                      "wire=%u,%u,%u,%u,%u minted=%d proxy=%d t=%lu",
+                      L.id, ctx.isHost ? "host" : "join",
+                      v.local[0], v.local[1], v.local[2], v.local[3], v.local[4],
+                      v.wire[0], v.wire[1], v.wire[2], v.wire[3], v.wire[4],
+                      v.minted, v.proxy, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return;
+        }
+    }
+
+    void logRole(const ScenarioContext& ctx, const Leg& L, bool recruiter) {
+        BodyRoleView v; memset(&v, 0, sizeof(v));
+        int ok = (ctx.bodyRole && ctx.bodyRole(L.subj, &v)) ? 1 : 0;
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        engine::readPos(L.subj, &x, &y, &z);
+        char b[400];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO RJ role leg=%c who=%s side=%s ok=%d hand=%u,%u,%u,%u,%u "
+                  "own=%d pinOwn=%d pinPeer=%d drv=%d ais=%d canon=%d proxy=%d "
+                  "minted=%d squad=%d tabOwn=%d wire=%u,%u,%u,%u,%u "
+                  "pos=%.1f,%.1f,%.1f t=%lu",
+                  L.id, ctx.isHost ? "host" : "join", recruiter ? "rec" : "peer", ok,
+                  v.local[0], v.local[1], v.local[2], v.local[3], v.local[4],
+                  v.owned, v.pinOwn, v.pinPeer, v.driven, v.aiSusp, v.canon,
+                  v.proxy, v.minted, v.squad, v.tabOwn,
+                  v.wire[0], v.wire[1], v.wire[2], v.wire[3], v.wire[4],
+                  x, y, z, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void logGait(const ScenarioContext& ctx, const Leg& L, bool recruiter) {
+        bool moving = false; float speed = 0.0f;
+        int ok = engine::readMotion(L.subj, &moving, &speed) ? 1 : 0;
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO RJ gait leg=%c who=%s role=%s moving=%d speed=%.2f "
+                  "ok=%d t=%lu",
+                  L.id, ctx.isHost ? "host" : "join", recruiter ? "own" : "drive",
+                  moving ? 1 : 0, speed, ok, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The recruiter's player move order (the dashboard 'move' lever): a far
+    // destination, alternating sides so the body runs in-region all window.
+    void orderWalk(Leg& L) {
+        float x, y, z;
+        if (!engine::readPos(L.subj, &x, &y, &z)) return;
+        float d = (L.altDir & 1) ? -180.0f : 180.0f;
+        ++L.altDir;
+        engine::orderMoveTo(L.subj, x + d, y, z);
+    }
+
+    void logSquad(const ScenarioContext& ctx, const Leg& L, const char* phase) {
+        Character* pcs[MAX_SQUAD];
+        unsigned int n = engine::listPlayerChars(ctx.gw, pcs, MAX_SQUAD);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO RJ squad leg=%c who=%s phase=%s n=%u t=%lu",
+                  L.id, ctx.isHost ? "host" : "join", phase, n, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    static const unsigned long H_RECRUIT_AT_MS = 6000;
+    static const unsigned long J_RECRUIT_AT_MS = 22000;
+    static const unsigned long LEG_MS          = 15000; // recruit -> squad 'post'
+    static const unsigned long WALK_DELAY_MS   = 3000;  // recruit -> walk window
+    static const unsigned long WALK_MS         = 9000;
+    static const unsigned long WALK_ORDER_MS   = 1000;
+    static const unsigned long ROLE_MS         = 500;
+    static const unsigned long GAIT_MS         = 250;
+    static const unsigned long SQUAD_LEAD_MS   = 500;
+    static const unsigned long DURATION_MS     = 39000;
+    static const unsigned int  MAX_SQUAD       = 48;
+    static const unsigned int  MAX_NPC         = 128;
+    static const float         PICK_RADIUS;
+
+    bool                    seated_;
+    std::vector<Character*> base_;
+    Leg                     legs_[2];
+};
+const float RecruitJoinScenario::PICK_RADIUS = 200.0f; // the listNpcs query reach
+
 // squad_probe (protocol 35 phase 0, probe tier; squadSync forced OFF) /
 // squad_sync (probe=false, full tier; squadSync ON). Moving a unit between
 // squad tabs RE-CONTAINERS it - the hand changes like a recruit's - but no
@@ -2428,6 +2730,8 @@ Scenario* makeProbeScenario(const std::string& name) {
     if (name == "recruit_probe") return new RecruitProbeScenario(true);
     if (name == "recruit_sync")  return new RecruitProbeScenario(false);
     if (name == "recruit_ctl")   return new RecruitCtlScenario();
+    if (name == "recruit_join")  return new RecruitJoinScenario(false);
+    if (name == "recruit_seated") return new RecruitJoinScenario(true);
     if (name == "squad_probe")   return new SquadProbeScenario(true);
     if (name == "squad_sync")    return new SquadProbeScenario(false);
     if (name == "faction_probe") return new FactionProbeScenario(true);

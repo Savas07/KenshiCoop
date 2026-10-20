@@ -968,6 +968,7 @@ bool __fastcall recruit_hook(PlayerInterface* self, Character* c, bool editor) {
             RecruitEdgeRec e;
             memcpy(e.before, hb, sizeof(hb));
             memset(e.after, 0, sizeof(e.after));
+            e.who = c;
             readObjectHand(static_cast<RootObject*>(c), e.after);
             if (g_recruitEdges.size() < 64) g_recruitEdges.push_back(e);
             char b[176];
@@ -2166,6 +2167,7 @@ void setTaskSelectSpike(bool on) { g_taskSelectSpike = on; }
 void clearAiSuspend()           { g_aiSuspended.clear(); }
 void addAiSuspend(Character* c) { if (c) g_aiSuspended.insert(c); }
 unsigned int aiSuspendCount()   { return (unsigned int)g_aiSuspended.size(); }
+bool isAiSuspended(Character* c) { return c && g_aiSuspended.find(c) != g_aiSuspended.end(); }
 
 bool installDamageGuardHook() {
     intptr_t addr = KenshiLib::GetRealAddress(&Character::_NV_hitByMeleeAttack);
@@ -2286,6 +2288,7 @@ unsigned int drainRecruitEdges(RecruitEdge* out, unsigned int maxOut) {
     for (unsigned int i = 0; i < g_recruitEdges.size() && n < maxOut; ++i, ++n) {
         memcpy(out[n].before, g_recruitEdges[i].before, sizeof(out[n].before));
         memcpy(out[n].after,  g_recruitEdges[i].after,  sizeof(out[n].after));
+        out[n].who = g_recruitEdges[i].who;
     }
     g_recruitEdges.clear();
     return n;

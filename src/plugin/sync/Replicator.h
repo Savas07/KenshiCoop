@@ -134,6 +134,20 @@ public:
                              unsigned int outLocal[5], unsigned int outCanon[5],
                              float* outDist) const;
 
+    // Scenario support (recruit_join): this client's ownership/drive view of ONE
+    // local body - owned (local hand streamed this tick), the pins on its local
+    // hand, whether this tick drove / AI-suspended it, whether it is minted, a
+    // player-squad member, or in a tab we own, and the peer key it is bound
+    // under (canonicalOf_ stamp first, else its proxyByKey_ binding; zeros when
+    // neither). Pointer lookups plus one SEH-guarded hand read. False when the
+    // body's hand is unreadable.
+    struct BodyRoleRead {
+        bool owned, pinOwn, pinPeer, driven, aiSusp, canon, proxy, minted, squad, tabOwn;
+        unsigned int local[5];
+        unsigned int wire[5];
+    };
+    bool bodyRoleOf(GameWorld* gw, Character* c, BodyRoleRead* out) const;
+
     // AI-gating probe (join side): recruit diverged NPCs into the player squad to
     // validate the "inhabit" lever (stops self-tasking + becomes drivable).
     void setProbeRecruit(bool v) { probeRecruit_ = v; }
@@ -405,13 +419,16 @@ public:
     // Shared money-pool sync master enable (KENSHICOOP_MONEY_SYNC).
     void setMoneySync(bool v) { moneySync_ = v; }
 
-    // BEFORE engine (protocol 23, both clients): drain the engine's recruit-edge
-    // queue (the PlayerInterface::recruit detour records every successful LOCAL
-    // recruit) and author one reliable EVT_RECRUIT per edge (subject = the OLD
-    // hand, actor = the NEW hand). Also pins each recruited hand into
-    // pinOwned_ so publishOwned streams it even when the engine parked it
-    // in a tab RANK the partition says the peer owns (recruit_probe: a join
-    // recruit landed in the host's rank-0 container).
+    // BEFORE engine (protocol 23, both clients; called BEFORE publishOwned so
+    // this tick's partition - decideTabs included - already sees the pins):
+    // drain the engine's recruit-edge queue (the PlayerInterface::recruit
+    // detour records every successful LOCAL recruit) and author one reliable
+    // EVT_RECRUIT per edge (subject = the key the PEER knows the body by - its
+    // drive key when we were driving it, else the OLD local hand; actor = the
+    // NEW hand). The recruit is ours from here: our drive of it is torn down,
+    // it moves into our own tab when the engine parked it in another player's
+    // (recruit_probe: a join recruit landed in the host's rank-0 container),
+    // and every hand it held since the recruit is pinned into pinOwned_.
     void publishRecruits(GameWorld* gw, NetLink& net, u32 ownerId);
 
     // Recruitment sync master enable (KENSHICOOP_RECRUIT_SYNC).
@@ -937,6 +954,7 @@ private:
         unsigned long carryHealTick;  // last self-heal pickup attempt (throttle)
         unsigned long physHealTick;   // last locomotion-body restore attempt (throttle)
         unsigned long getUpHealTick;  // last stale get-up release (throttle)
+        unsigned long poseHealTick;   // last stale seat/work-pose release (throttle)
         unsigned long glideUntilMs;   // squad glide regime held until (0 = never)
         unsigned long glideFastSinceMs; // source outrunning its gait since (0 = not)
         float         glideStallX, glideStallZ; // copy position anchor for the stall test
@@ -1046,7 +1064,7 @@ private:
                    combatOverTick(0), npcSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
-                   carryHealTick(0), physHealTick(0), getUpHealTick(0),
+                   carryHealTick(0), physHealTick(0), getUpHealTick(0), poseHealTick(0),
                    glideUntilMs(0), glideFastSinceMs(0), glideStallX(0), glideStallZ(0),
                    glideStallSinceMs(0), glideActive(false), glideFrames(0),
                    dbgRegime(0), dbgMs(0), dbgGap(0), dbgVlen(0), dbgNx(0), dbgNy(0), dbgNz(0),
@@ -1169,6 +1187,12 @@ private:
     // Last LOCAL hand reported for each wire key, so the [rekey] translation
     // line is emitted on change rather than every drive tick.
     std::map<Key, Key>        rekeyLogged_;
+    // Per wire key: last "[drive] SKIP-OWNED" line (2 s throttle) - a peer
+    // stream that resolves to a body WE own (a recruit's old key) is refused.
+    std::map<Key, unsigned long> ownSkipLogMs_;
+    // Pinned squad hands the near-band NPC capture dropped (one
+    // "[recruit] NPC-SKIP" line per hand): see publishOwned.
+    std::set<Key>             pinNpcSkipLogged_;
     // Step-5 hysteresis: consecutive-frame counters per hand so a brief stream
     // hiccup doesn't suppress (needs ~1 s unstreamed) and a boundary NPC doesn't
     // flicker back (needs ~2 s streamed dwell to restore). Spike 18: the hard
@@ -2467,6 +2491,30 @@ private:
     // recruit ok=1 path, the ok=0 post-mint drain, and the control-flip transfer.
     void insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
                           const char* tag, u32 author, bool ownIt = false);
+    // Recruiter half of protocol 23 (publishRecruits). The body we just recruited
+    // may be one we were DRIVING from a peer's stream (every NPC near a shared
+    // cell is host-authored), whose LOCAL hand can differ from the key the peer
+    // streams it by (combat/sitter detach re-containered our copy). Return that
+    // peer key - canonicalOf_ first, else the proxyByKey_ binding - so the
+    // EVT_RECRUIT subject resolves on the peer (false = not peer-bound; the
+    // local hand is the subject).
+    bool recruitWireKeyOf(Character* c, Key* out) const;
+    // Drop every DRIVE artifact this side holds for a body it now owns - the
+    // CONTROL-FLIP teardown, for the recruiter: proxy bindings, the peer
+    // stream state under 'wire', the per-pointer drive stamps, the mint mark -
+    // and stamp 'wire' into the re-keyed grace so the peer's in-flight tail for
+    // it neither REQs nor mints a duplicate of our recruit.
+    void releaseRecruitDrive(Character* c, const Key& wire);
+    // A recruit the engine parked in a KNOWN tab another player owns (a join
+    // recruit lands in the host's rank-0 tab) moves into our own tab, the way a
+    // host recruit lands in the host's; returns true and the new hand in
+    // outHand when it moved. setFaction lever (joinPlayerSquadAt); unknown/new
+    // tabs stay put - the pin decides those.
+    bool homeRecruit(GameWorld* gw, Character* c, unsigned int outHand[5]);
+    // Is 'c' a body this client owns, judged by its LOCAL hand (pinOwned_ /
+    // ownHands_)? The drive's own-key vetoes only see the WIRE key, and a
+    // recruit's old wire key can still resolve to it. lh receives the hand.
+    bool ownsLocalBody(Character* c, unsigned int lh[5]) const;
     // Reliable-event dedupe (N-player relay): (ownerId, eventId) pairs already
     // applied, a bounded recent window per sender. Ids are per-sender monotonic
     // but restart with the sender's process, so a window - not a high-water mark.

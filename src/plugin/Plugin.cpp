@@ -92,6 +92,24 @@ static bool coopScenarioPickMintedProxy(const unsigned int refHand[5],
     return g_repl.pickMintedProxyNear(g_lastGw, refHand, outLocal, outCanon, outDist);
 }
 
+#ifdef KENSHICOOP_HARNESS
+// recruit_join's ownership/drive view of one body (ScenarioContext::bodyRole).
+// Same reason as above: only the Replicator knows who owns / drives a body.
+static bool coopScenarioBodyRole(Character* c, coop::BodyRoleView* out) {
+    if (!g_lastGw || !out) return false;
+    coop::Replicator::BodyRoleRead r;
+    if (!g_repl.bodyRoleOf(g_lastGw, c, &r)) return false;
+    out->owned = r.owned ? 1 : 0;   out->pinOwn = r.pinOwn ? 1 : 0;
+    out->pinPeer = r.pinPeer ? 1 : 0; out->driven = r.driven ? 1 : 0;
+    out->aiSusp = r.aiSusp ? 1 : 0; out->canon = r.canon ? 1 : 0;
+    out->proxy = r.proxy ? 1 : 0;   out->minted = r.minted ? 1 : 0;
+    out->squad = r.squad ? 1 : 0;   out->tabOwn = r.tabOwn ? 1 : 0;
+    memcpy(out->local, r.local, sizeof(out->local));
+    memcpy(out->wire, r.wire, sizeof(out->wire));
+    return true;
+}
+#endif
+
 // SessionController (Phase 3): the mutable per-session lifecycle state that used
 // to live as ~18 loose file globals - peer presence, the gameplay-start edge,
 // the title auto-load gate, and the coordinated save/load (protocol 31/32)
@@ -1893,6 +1911,16 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         g_repl.applyEvents(gw, g_inbound);
     }
     if (worldLive) {
+        // Recruitment sync (protocol 23): drain the recruit detour's edge queue
+        // into reliable EVT_RECRUIT events (subject = the key the peer knows the
+        // body by, actor = its new hand), release our drive of the recruit and
+        // pin it to its recruiter. The receive half (re-key) lives in
+        // applyEvents above. BEFORE publishOwned: this tick's partition (and a
+        // brand-new tab's one-shot decideTabs verdict) must already see the pin,
+        // and the edge must leave in the same flush as the new hand's first
+        // batch so the peer re-keys before it could REQ the hand.
+        if (g_cfg.recruitSync)
+            g_repl.publishRecruits(gw, g_net, g_net.localId());
         // CharCreate: while the join's character editor is open the edited bodies
         // sit on the editor platform at the world origin - don't publish that.
         if (!g_chargenSuppressPublish)
@@ -1979,14 +2007,6 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
             g_repl.publishMoneyPool(replCtx(gw));
             g_repl.applyMoneyPool(replCtx(gw));
         }
-        // Recruitment sync (protocol 23): drain the recruit detour's edge queue
-        // into reliable EVT_RECRUIT events (subject = old hand, actor = new
-        // hand) and pin recruited hands to their recruiter's ownership. The
-        // receive half (re-key) lives in applyEvents above. Ordered after
-        // publishOwned so this tick's recruits pin BEFORE next tick's census.
-    if (g_cfg.recruitSync)
-        g_repl.publishRecruits(gw, g_net, g_net.localId());
-
     // Squad management sync (protocol 35): poll the roster's pointer->hand
     // baseline (~2 Hz; a squad-tab move re-containers the body but the
     // Character* survives) and author reliable EVT_SQUAD_MOVE re-key edges,
@@ -2090,6 +2110,7 @@ void tickScenarioStart(GameWorld* gw) {
             pctx.elapsedMs = waitedMs; pctx.tick = g_scenarioTick;
             pctx.peerReady = peerReady;
             pctx.pickMintedProxy = &coopScenarioPickMintedProxy;
+            pctx.bodyRole = &coopScenarioBodyRole;
             g_scenario->onGameplay(pctx);
         }
         if (peerReady || fallback) {
@@ -2100,6 +2121,7 @@ void tickScenarioStart(GameWorld* gw) {
             ctx.elapsedMs = 0; ctx.tick = g_scenarioTick;
             ctx.peerReady = peerReady;
             ctx.pickMintedProxy = &coopScenarioPickMintedProxy;
+            ctx.bodyRole = &coopScenarioBodyRole;
             char m[200];
             _snprintf(m, sizeof(m) - 1, "SCENARIO arm trigger=%s waitedMs=%lu",
                       peerReady ? "peer-ready" : "timeout", (unsigned long)waitedMs);
@@ -2310,6 +2332,7 @@ void tickScenarioTick(GameWorld* gw) {
         ctx.tick = ++g_scenarioTick;
         ctx.peerReady = g_inbound.sawRemoteEntity();
         ctx.pickMintedProxy = &coopScenarioPickMintedProxy;
+        ctx.bodyRole = &coopScenarioBodyRole;
         if (g_scenario->onTick(ctx)) {
             // Stage 2: the receiver emits its interpolation smoothness summary
             // alongside the verdict so the runner can assert per-frame gliding.

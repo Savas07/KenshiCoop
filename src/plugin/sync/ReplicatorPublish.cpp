@@ -225,6 +225,32 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // it actually owns or the two of us drive the same bodies.
     if (streamNpcs_ && n < MAX_PUBLISH) {
         unsigned int got = engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
+        // A hand pinned to a squad owner is a squad body, never a world NPC.
+        // insertPeerMember re-containers a peer's recruit into our squad with
+        // setFaction, and playerCharacters - captureNpcs' squad filter - only
+        // refreshes on a later engine tick, so for that publish the body passes
+        // as an NPC under its fresh LOCAL hand. The recruiter cannot resolve
+        // that hand, REQs it, and the player-faction mint lands as a phantom
+        // twin in its own squad (recruit_join rj_after2: join squad +2).
+        {
+            unsigned int keptPin = 0;
+            for (unsigned int i = 0; i < got; ++i) {
+                const Key pk = keyOf(buf[n + i]);
+                if (pinPeer_.count(pk) || pinOwned_.count(pk)) {
+                    if (pinNpcSkipLogged_.insert(pk).second) {
+                        char pb[160]; _snprintf(pb, sizeof(pb) - 1,
+                            "[recruit] NPC-SKIP pinned squad hand=%u,%u,%u,%u,%u "
+                            "(not streamed as a world NPC)",
+                            pk.t, pk.c, pk.cs, pk.i, pk.s);
+                        pb[sizeof(pb) - 1] = '\0'; coop::logLine(pb);
+                    }
+                    continue;
+                }
+                if (keptPin != i) buf[n + keptPin] = buf[n + i];
+                ++keptPin;
+            }
+            got = keptPin;
+        }
         // The attention gate lives HERE, not on the census. Streaming is the
         // expensive half - a transform per body per tick - and it is the half
         // that is genuinely pointless when the peer has no camera or squad near

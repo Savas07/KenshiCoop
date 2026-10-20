@@ -189,6 +189,8 @@ void Replicator::resetSession() {
     drivenSeen_.clear();       // recently-driven grace (pointers dangle after swap)
     canonicalOf_.clear();      // capture-translation reverse map (same pointers)
     rekeyLogged_.clear();      // and the change-detector for its [rekey] line
+    ownSkipLogMs_.clear();     // [drive] SKIP-OWNED throttle
+    pinNpcSkipLogged_.clear(); // [recruit] NPC-SKIP once-per-hand log
     jailObs_.clear();          // jail-observe spike per-captive last sample
     proxyByKey_.clear();
     suppressed_.clear();

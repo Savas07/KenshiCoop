@@ -461,6 +461,11 @@ bool taskIsBedPose(int t) {
     return t == (int)USE_BED || t == (int)USE_BED_ORDER || t == (int)SLEEP_ON_FLOOR;
 }
 
+bool taskIsSeatPose(int t) {
+    return t == (int)OPERATE_MACHINERY || t == (int)PRETEND_TO_OPERATE_MACHINERY ||
+           t == (int)SIT_AROUND || t == (int)SIT_ON_THRONE;
+}
+
 // ---- Protocol 20: stealth mode + detection indicators ----------------------
 
 bool readStealth(Character* c, StealthRead* out) {
