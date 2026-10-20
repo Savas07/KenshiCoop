@@ -2872,7 +2872,7 @@ function Test-VendorStock {
 
     # 4. every purchase came out of the ONE stock, on both sides.
     if ($okBuys.Count -gt 0 -and $H.stock.Count -gt 0) {
-        $first = ($okBuys | Measure-Object -Property t -Minimum).Minimum
+        $first = (@($okBuys | ForEach-Object { $_.t }) | Measure-Object -Minimum).Minimum
         $base = @($H.stock | Where-Object { $_.t -lt $first }) | Select-Object -Last 1
         if ($null -eq $base) { $why += "no host stock sample before the first purchase" }
         else {
@@ -2900,7 +2900,7 @@ function Test-VendorStock {
         $mine = @($okBuys | Where-Object { $_.who -eq $who })
         if ($mine.Count -eq 0) { continue }
         $rank = if ($who -eq 'host') { 0 } else { 1 }
-        $first = ($mine | Measure-Object -Property t -Minimum).Minimum
+        $first = (@($mine | ForEach-Object { $_.t }) | Measure-Object -Minimum).Minimum
         $preBag = @($sides[$who].bags[$rank] | Where-Object { $_.t -lt $first }) | Select-Object -Last 1
         if ($null -eq $preBag) { $why += "$who buyer bag not sampled before its first purchase"; continue }
         $got = @{}
