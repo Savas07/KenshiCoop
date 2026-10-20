@@ -2198,9 +2198,9 @@ const float AssaultTravelScenario::TRAVEL_SPEED_MULT = 5.0f;
 // VICTIM (player_combat).
 // None checked the JOIN's copy of a HOST PC that is fighting. Here both
 // leaders fight at once, so each client OWNS one fight and VIEWS the other.
-// Both sides buff their own squad to FIGHTER_STATS at 8 s (an unbuffed leader
-// was knocked out 11-19 s into the fight); the fight starts at 30 s, after the
-// join's clock catch-up.
+// Both sides buff their own squad at 8 s (an unbuffed leader was knocked out
+// 11-19 s into the fight; see buffOwnSquad for which stats); the fight starts at
+// 30 s, after the join's clock catch-up.
 //   host_pc_fight       save 'sync': each leader attacks the nearest upright
 //                       bar NPC (save-resident, so the hand is shared until the
 //                       viewer's combat detach re-keys that body locally).
@@ -2366,17 +2366,29 @@ private:
 
     // Both sides buff their OWN tab (statsSync streams the raise to the peer's
     // copies) so neither leader is knocked out a few seconds into the fight.
+    // Mint variant: every stat, matching the equally buffed enemies. Resident
+    // variant: DEFENSIVE stats only - the bar NPCs stay unbuffed, and an all-stat
+    // leader turned the fight into a chase (the victim fled, the leader ran it
+    // down at 120 u/s, its copy 190-330 u behind).
     void buffOwnSquad(const ScenarioContext& ctx) {
         buffed_ = true;
         const unsigned int ownRank = ctx.isHost ? 0u : 1u;
         EntityState sq[MAX_SQUAD];
         unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
         int idx = tabLeaderIdx(sq, n, ownRank);
+        static const int DEFENSIVE[3] = { STAT_TOUGHNESS, STAT_MELEE_DEFENCE, STAT_DODGE };
         unsigned int nBuffed = 0;
         for (unsigned int i = 0; idx >= 0 && i < n; ++i) {
             if (!tabCtnrEq(sq[i], sq[idx])) continue;
             unsigned int h[5]; handFromEntity(sq[i], h);
-            if (engine::raiseAllStats(ctx.gw, h, FIGHTER_STATS) > 0) ++nBuffed;
+            bool ok = false;
+            if (mint_) {
+                ok = engine::raiseAllStats(ctx.gw, h, FIGHTER_STATS) > 0;
+            } else {
+                for (int s = 0; s < 3; ++s)
+                    if (engine::raiseSubjectStat(ctx.gw, h, DEFENSIVE[s], FIGHTER_STATS)) ok = true;
+            }
+            if (ok) ++nBuffed;
         }
         char b[96]; _snprintf(b, sizeof(b) - 1, "SCENARIO HPFIGHT buff rank=%u buffed=%u",
                               ownRank, nBuffed);
