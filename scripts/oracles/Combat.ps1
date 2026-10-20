@@ -1476,18 +1476,21 @@ function Test-PcAssault {
 # join PC) - over the OWNER's fight samples inside the viewer's sampling span:
 #   0. mint   - (-RequireMint) the join minted the enemies (proxy BOUND)
 #   1. setup  - the owner really fought: >= MinOwnerFight samples, fight=1 + target
-#   2. fight  - the viewer's copy (nearest sample within TolMs) fights the SAME
-#               body - ctgt is the canonical key, so a re-keyed or minted target
-#               still compares - in >= MinRightFrac of the owner's fight samples.
-#               Any owner target within TgtTolMs counts (retarget latency).
+#   2. engaged- the viewer's copy (nearest sample within TolMs) is ENGAGED with
+#               the owner's target: fighting (fight=1), the SAME body (ctgt is
+#               the canonical key, so a re-keyed or minted target still
+#               compares; any owner target within TgtTolMs counts, for retarget
+#               latency) and not being walk-ordered by the drive (dest=0 - a
+#               move order replaces the attack, the copy jogs or stands) - in
+#               >= MinEngagedFrac of the owner's fight samples
 #   3. resolve- the viewer issued <= MaxUnresolved "[combat] order hand=<pc> ...
 #               r=1" (the streamed target never resolved there: an order storm
 #               that leaves the copy un-ordered)
-# Metrics also carry the copy's walk share (dest=1 while its owner fights), its
-# order count and wrong-target snaps - the churn that cancels the attack.
+# Metrics also carry the copy's fight/right-target/walk shares, its order count
+# and wrong-target snaps - the churn that cancels the attack.
 function Test-HostPcFight {
     param([string]$HostFile, [string]$JoinFile, [string]$GateName = 'host_pc_fight',
-          [switch]$RequireMint, [int]$MinOwnerFight = 6, [double]$MinRightFrac = 0.75,
+          [switch]$RequireMint, [int]$MinOwnerFight = 6, [double]$MinEngagedFrac = 0.75,
           [int]$MaxUnresolved = 2, [int]$TolMs = 1000, [int]$TgtTolMs = 2000)
     $label = $GateName.ToUpper().Replace('_', '-')
     if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
@@ -1533,7 +1536,7 @@ function Test-HostPcFight {
         } else {
             $fightOwn = @()
         }
-        $pairs = 0; $copyFight = 0; $right = 0; $walk = 0; $streamed = 0; $combatReg = 0
+        $pairs = 0; $copyFight = 0; $right = 0; $engaged = 0; $walk = 0; $streamed = 0; $combatReg = 0
         foreach ($o in $fightOwn) {
             $best = $null; $bd = [int]::MaxValue
             foreach ($v in $copy) {
@@ -1549,9 +1552,13 @@ function Test-HostPcFight {
             $copyFight++
             $want = @($fightOwn | Where-Object { [Math]::Abs([int]$_.t - [int]$best.t) -le $TgtTolMs } |
                       ForEach-Object { $_.ctgt })
-            if ($want -contains $best.ctgt) { $right++ }
+            if ($want -contains $best.ctgt) {
+                $right++
+                if ($best.dest -ne 1) { $engaged++ }
+            }
         }
         $n = $fightOwn.Count
+        $engagedFrac = if ($n -gt 0) { [Math]::Round($engaged / $n, 3) } else { 0 }
         $rightFrac = if ($n -gt 0) { [Math]::Round($right / $n, 3) } else { 0 }
         $fightFrac = if ($n -gt 0) { [Math]::Round($copyFight / $n, 3) } else { 0 }
         $walkFrac  = if ($n -gt 0) { [Math]::Round($walk / $n, 3) } else { 0 }
@@ -1562,18 +1569,21 @@ function Test-HostPcFight {
             $wrongSnaps = @(Select-String -Path $d.viewFile -Pattern ('\[combat\] snap hand=' + $pc + ' .*wrongTgt=1') -ErrorAction SilentlyContinue).Count
         }
         $m["${t}Pc"] = $pc; $m["${t}OwnerFight"] = $n; $m["${t}Pairs"] = $pairs
+        $m["${t}EngagedFrac"] = $engagedFrac
         $m["${t}CopyFightFrac"] = $fightFrac; $m["${t}RightFrac"] = $rightFrac
         $m["${t}WalkFrac"] = $walkFrac; $m["${t}Streamed"] = $streamed; $m["${t}CombatRegime"] = $combatReg
         $m["${t}Orders"] = $orders; $m["${t}Unresolved"] = $unresolved; $m["${t}WrongTgtSnaps"] = $wrongSnaps
-        $summary += ("${t} pc=$pc ownerFight=$n pairs=$pairs copyFight=$fightFrac right=$rightFrac " +
-                     "walk=$walkFrac streamed=$streamed regCombat=$combatReg orders=$orders r1=$unresolved wrongSnaps=$wrongSnaps")
+        $summary += ("${t} pc=$pc ownerFight=$n pairs=$pairs engaged=$engagedFrac copyFight=$fightFrac " +
+                     "right=$rightFrac walk=$walkFrac streamed=$streamed regCombat=$combatReg orders=$orders " +
+                     "r1=$unresolved wrongSnaps=$wrongSnaps")
         if ($n -lt $MinOwnerFight) {
             $bad += "${t}: the owner of $pc fought in only $n sample(s) inside the viewer's window (need >= $MinOwnerFight; link 1: setup)"
             continue
         }
-        if ($rightFrac -lt $MinRightFrac) {
-            $bad += ("${t}: the viewer's copy of $pc fought the owner's target in only $right/$n owner-fight samples " +
-                     "($rightFrac < $MinRightFrac; copy fighting at all $fightFrac, walking $walkFrac; link 2: fight)")
+        if ($engagedFrac -lt $MinEngagedFrac) {
+            $bad += ("${t}: the viewer's copy of $pc was engaged with the owner's target in only $engaged/$n " +
+                     "owner-fight samples ($engagedFrac < $MinEngagedFrac; fighting at all $fightFrac, " +
+                     "right body $rightFrac, walk-ordered $walkFrac; link 2: engaged)")
         }
         if ($unresolved -gt $MaxUnresolved) {
             $bad += "${t}: $unresolved unresolved-target orders (r=1) for $pc on the viewer (max $MaxUnresolved; link 3: resolve)"

@@ -2197,15 +2197,18 @@ const float AssaultTravelScenario::TRAVEL_SPEED_MULT = 5.0f;
 // copy: assault_town, pc_assault, assault_travel/mint) or has a PC as the
 // VICTIM (player_combat).
 // None checked the JOIN's copy of a HOST PC that is fighting. Here both
-// leaders fight at once, so each client OWNS one fight and VIEWS the other:
+// leaders fight at once, so each client OWNS one fight and VIEWS the other.
+// Both sides buff their own squad to FIGHTER_STATS at 8 s (an unbuffed leader
+// was knocked out 11-19 s into the fight); the fight starts at 30 s, after the
+// join's clock catch-up.
 //   host_pc_fight       save 'sync': each leader attacks the nearest upright
 //                       bar NPC (save-resident, so the hand is shared until the
 //                       viewer's combat detach re-keys that body locally).
-//   host_pc_fight_mint  the host runtime-spawns ENEMY_N bodies in front of its
-//                       leader (the join has to MINT them - combat_win's setup)
-//                       and orders them onto both leaders; the host leader
-//                       attacks its own assigned enemy, the join leader the
-//                       nearest minted proxy.
+//   host_pc_fight_mint  the host runtime-spawns ENEMY_N equally buffed bodies in
+//                       front of its leader (the join has to MINT them -
+//                       combat_win's setup) and orders them onto both leaders;
+//                       the host leader attacks its own assigned enemy, the join
+//                       leader the nearest minted proxy.
 // Evidence, both sides, 2 Hz, for BOTH leaders:
 //   SCENARIO HPFIGHT pc=<i,s> owner=<host|join> view=<own|copy> fight= wait=
 //                    sw= tgt=<local i,s> ctgt=<i,s> reg= stask= dest=
@@ -2219,8 +2222,8 @@ public:
     explicit HostPcFightScenario(bool mint)
         : TimedScenario(mint ? "host_pc_fight_mint" : "host_pc_fight", 500),
           mint_(mint), haveOwn_(false), havePeer_(false), haveVic_(false),
-          issued_(false), pickFailLogged_(false), spawned_(false), nEnemies_(0),
-          lastOrderMs_(0), lastPickMs_(0) {
+          issued_(false), pickFailLogged_(false), spawned_(false), buffed_(false),
+          nEnemies_(0), lastOrderMs_(0), lastPickMs_(0) {
         for (int j = 0; j < 5; ++j) {
             ownHand_[j] = 0; peerHand_[j] = 0; vic_[j] = 0; lastVic_[j] = 0;
         }
@@ -2231,6 +2234,7 @@ public:
 
     virtual bool onTick(const ScenarioContext& ctx) {
         if (!haveOwn_ || !havePeer_) latchLeaders(ctx);
+        if (!buffed_ && ctx.elapsedMs >= BUFF_AT_MS) buffOwnSquad(ctx);
         if (mint_) {
             if (ctx.isHost) tickMintHost(ctx); else tickMintJoin(ctx);
         } else {
@@ -2240,9 +2244,7 @@ public:
             if (haveOwn_)  logPc(ctx, ownHand_, ctx.isHost);
             if (havePeer_) logPc(ctx, peerHand_, !ctx.isHost);
         }
-        unsigned long dur = ctx.isHost
-            ? (mint_ ? MINT_HOST_DURATION_MS : HOST_DURATION_MS)
-            : (mint_ ? MINT_JOIN_DURATION_MS : JOIN_DURATION_MS);
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
         if (ctx.elapsedMs >= dur) {
             // Script-ran verdict only (the cross-client judgement is the oracle's):
             // this side ordered its own leader into a fight, and the host latched
@@ -2255,19 +2257,23 @@ public:
     }
 
 private:
-    static const unsigned long FIGHT_AT_MS           = 10000;
-    static const unsigned long ORDER_EVERY_MS        = 2500;
-    static const unsigned long HOST_DURATION_MS      = 50000;
-    static const unsigned long JOIN_DURATION_MS      = 44000;
-    // Mint variant: spawn, census, REQ and mint come first (spawn_far measures
-    // that at a few seconds), then the fight.
-    static const unsigned long MINT_SPAWN_AT_MS      = 6000;
-    static const unsigned long MINT_FIGHT_AT_MS      = 14000;
-    static const unsigned long MINT_HOST_DURATION_MS = 56000;
-    static const unsigned long MINT_JOIN_DURATION_MS = 50000;
-    static const unsigned int  MAX_SQUAD             = 40;
-    static const unsigned int  ENEMY_N               = 4;
-    static const float         MINT_FIGHT_DIST;      // join attacks a mint this close
+    // The fight starts only once the join's game clock has caught up: on the
+    // 'sync' save the time-sync slew runs the join at up to 2x for ~20 s after
+    // arming, and a fight inside that window runs at two speeds on the two
+    // clients (first runs: the join's PC sprinted at 120+ u/s while its host
+    // copy trailed 50-65 u behind and snapped).
+    static const unsigned long BUFF_AT_MS        = 8000;
+    static const unsigned long FIGHT_AT_MS       = 30000;
+    static const unsigned long ORDER_EVERY_MS    = 2500;
+    static const unsigned long HOST_DURATION_MS  = 75000;
+    static const unsigned long JOIN_DURATION_MS  = 68000;
+    // Mint variant: spawn, census, REQ and mint come before the fight
+    // (spawn_far measures that at a few seconds).
+    static const unsigned long MINT_SPAWN_AT_MS  = 22000;
+    static const unsigned int  MAX_SQUAD         = 40;
+    static const unsigned int  ENEMY_N           = 4;
+    static const float         FIGHTER_STATS;    // own squad + enemies (all stats)
+    static const float         MINT_FIGHT_DIST;  // join attacks a mint this close
 
     // Both sides, resident variant: the nearest upright bar NPC near our own
     // leader (falling back to the peer leader's crowd - the save bakes it around
@@ -2308,7 +2314,7 @@ private:
     // on the join's leader. A downed enemy hands its slot to the next upright one.
     void tickMintHost(const ScenarioContext& ctx) {
         if (!spawned_ && ctx.elapsedMs >= MINT_SPAWN_AT_MS) spawnEnemies(ctx);
-        if (!haveOwn_ || nEnemies_ == 0 || ctx.elapsedMs < MINT_FIGHT_AT_MS) return;
+        if (!haveOwn_ || nEnemies_ == 0 || ctx.elapsedMs < FIGHT_AT_MS) return;
         if (lastOrderMs_ != 0 && (ctx.elapsedMs - lastOrderMs_) < ORDER_EVERY_MS) return;
         lastOrderMs_ = ctx.elapsedMs;
         int mine = firstUprightEnemy(0);
@@ -2325,7 +2331,7 @@ private:
     // MINTED (its local hand is what an order needs; the canonical one is what
     // the host logs it by).
     void tickMintJoin(const ScenarioContext& ctx) {
-        if (!haveOwn_ || !ctx.pickMintedProxy || ctx.elapsedMs < MINT_FIGHT_AT_MS) return;
+        if (!haveOwn_ || !ctx.pickMintedProxy || ctx.elapsedMs < FIGHT_AT_MS) return;
         if (lastOrderMs_ != 0 && (ctx.elapsedMs - lastOrderMs_) < ORDER_EVERY_MS) return;
         lastOrderMs_ = ctx.elapsedMs;
         unsigned int local[5], canon[5];
@@ -2342,14 +2348,38 @@ private:
         noteIssued(ctx, local, canon, ok);
     }
 
+    // The enemies get the fighters' stat line too: an even match is a fight that
+    // lasts the window, where an unbuffed PC was knocked out inside 11-19 s.
     void spawnEnemies(const ScenarioContext& ctx) {
         spawned_ = true;
         static unsigned int hands[ENEMY_N][5];
         nEnemies_ = engine::spawnRuntimeSquad(ctx.gw, ENEMY_N, hands);
-        for (unsigned int i = 0; i < nEnemies_; ++i)
+        unsigned int raised = 0;
+        for (unsigned int i = 0; i < nEnemies_; ++i) {
             for (int j = 0; j < 5; ++j) enemy_[i][j] = hands[i][j];
-        char b[96]; _snprintf(b, sizeof(b) - 1, "SCENARIO HPFIGHT spawned=%u/%u",
-                              nEnemies_, ENEMY_N);
+            if (engine::raiseAllStats(ctx.gw, enemy_[i], FIGHTER_STATS) > 0) ++raised;
+        }
+        char b[96]; _snprintf(b, sizeof(b) - 1, "SCENARIO HPFIGHT spawned=%u/%u buffed=%u",
+                              nEnemies_, ENEMY_N, raised);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Both sides buff their OWN tab (statsSync streams the raise to the peer's
+    // copies) so neither leader is knocked out a few seconds into the fight.
+    void buffOwnSquad(const ScenarioContext& ctx) {
+        buffed_ = true;
+        const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, ownRank);
+        unsigned int nBuffed = 0;
+        for (unsigned int i = 0; idx >= 0 && i < n; ++i) {
+            if (!tabCtnrEq(sq[i], sq[idx])) continue;
+            unsigned int h[5]; handFromEntity(sq[i], h);
+            if (engine::raiseAllStats(ctx.gw, h, FIGHTER_STATS) > 0) ++nBuffed;
+        }
+        char b[96]; _snprintf(b, sizeof(b) - 1, "SCENARIO HPFIGHT buff rank=%u buffed=%u",
+                              ownRank, nBuffed);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
@@ -2441,6 +2471,7 @@ private:
     bool          issued_;
     bool          pickFailLogged_;
     bool          spawned_;
+    bool          buffed_;
     unsigned int  nEnemies_;
     unsigned long lastOrderMs_;
     unsigned long lastPickMs_;
@@ -2451,6 +2482,7 @@ private:
     unsigned int  enemy_[ENEMY_N][5];
 };
 
+const float HostPcFightScenario::FIGHTER_STATS = 120.0f;
 // Close enough that the proxy is live and visible on the join (inside the stream
 // bubble), well inside any plausible aggro radius.
 const float HostPcFightScenario::MINT_FIGHT_DIST = 40.0f;
