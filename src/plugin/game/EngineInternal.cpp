@@ -674,6 +674,11 @@ OwnSetMoneyFn g_ownSetMoneyFn = 0;
 BuyItemFn     g_buyItemFn     = 0;
 PlatoonRefreshInvFn g_platoonRefreshInvFn = 0;
 ShopGetTraderFn     g_shopGetTraderFn     = 0;
+CharIsTraderFn  g_charIsTraderFn  = 0;
+PlatBoolFn      g_platIsTraderFn  = 0;
+PlatBoolFn      g_platHasVendorListFn = 0;
+GuiShowTradeFn  g_guiShowTradeFn  = 0;
+GuiCloseTradeFn g_guiCloseTradeFn = 0;
 
 // Property deeds (protocol 54). Buying a house/shop adds the building's hand to
 // the PLAYER FACTION's owned-object set (Faction::factionOwnerships) and moves
@@ -727,6 +732,36 @@ Item* __fastcall buyItem_hook(Inventory* self, Item* itemToBuy, RootObject* send
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return got;
+}
+
+// Protocol 60: trader stock refresh. Every trader refresh logs "[vendor]
+// REFRESH"; on a join the gate skips it for a shop whose counters the host
+// mirrors - the host's own refresh reaches the join on the snapshot channel,
+// and a local one would show (and report back as trades) goods the host never
+// made. The platoon is named by its leader's hand container fields, the same
+// fields a counter's shopOwner carries.
+PlatoonRefreshInvFn g_refreshInvOrig = 0;
+VendorRefreshGateFn g_vendorRefreshGate = 0;
+void __fastcall refreshInv_hook(ActivePlatoon* self, bool firstTime) {
+    unsigned int lh[5] = { 0, 0, 0, 0, 0 };
+    int isTrader = -1;
+    __try {
+        if (self && g_platIsTraderFn) isTrader = g_platIsTraderFn(self) ? 1 : 0;
+        Character* ld = self ? self->getSquadLeader() : 0;
+        if (ld) readObjectHand(static_cast<RootObject*>(ld), lh);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    bool skip = isTrader == 1 && (lh[1] != 0 || lh[2] != 0) && g_vendorRefreshGate &&
+                g_vendorRefreshGate(lh[1], lh[2]);
+    if (isTrader == 1) {
+        char b[176];
+        _snprintf(b, sizeof(b) - 1,
+                  "[vendor] %s first=%d leader=%u,%u,%u,%u,%u",
+                  skip ? "REFRESH-SKIP (host-owned stock)" : "REFRESH",
+                  firstTime ? 1 : 0, lh[0], lh[1], lh[2], lh[3], lh[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    if (skip) return;
+    g_refreshInvOrig(self, firstTime);
 }
 
 // ---- Cross-owner trade veto (block direct squad-to-squad transfers) --------
@@ -1697,6 +1732,12 @@ void resolve() {
     g_platoonRefreshInvFn =
         (PlatoonRefreshInvFn)KenshiLib::GetRealAddress(&ActivePlatoon::refreshInventory);
     g_shopGetTraderFn = (ShopGetTraderFn)KenshiLib::GetRealAddress(&ShopTrader::getTrader);
+    g_charIsTraderFn  = (CharIsTraderFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    g_platIsTraderFn  = (PlatBoolFn)KenshiLib::GetRealAddress(&ActivePlatoon::getIsTrader);
+    g_platHasVendorListFn =
+        (PlatBoolFn)KenshiLib::GetRealAddress(&ActivePlatoon::getHasVendorList);
+    g_guiShowTradeFn  = (GuiShowTradeFn)KenshiLib::GetRealAddress(&ForgottenGUI::showTradeWindow);
+    g_guiCloseTradeFn = (GuiCloseTradeFn)KenshiLib::GetRealAddress(&ForgottenGUI::closeTradeWindow);
     // Property deeds (protocol 54; non-fatal: unresolved -> CAP_DEED off and the
     // deed channel refuses to write, which the deed_probe reports).
     g_ownAddObjFn  = (OwnAddObjFn)KenshiLib::GetRealAddress(&Ownerships::addOwnedObject);
@@ -2182,6 +2223,15 @@ bool installShopHook() {
     return KenshiLib::AddHook(addr, (void*)&buyItem_hook,
                               (void**)&g_buyItemOrig) == KenshiLib::SUCCESS;
 }
+
+bool installVendorHooks() {
+    intptr_t aRef = KenshiLib::GetRealAddress(&ActivePlatoon::refreshInventory);
+    if (!aRef) return false;
+    return KenshiLib::AddHook(aRef, (void*)&refreshInv_hook,
+                              (void**)&g_refreshInvOrig) == KenshiLib::SUCCESS;
+}
+
+void setVendorRefreshGate(VendorRefreshGateFn fn) { g_vendorRefreshGate = fn; }
 
 // Cross-owner trade veto: detour the _NV_ twins of the drag primitives (hooking
 // the real body catches virtual dispatch AND direct calls). Both must install or

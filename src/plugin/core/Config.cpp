@@ -252,6 +252,7 @@ void loadConfig(Config& c) {
     c.deedSync    = envOr("KENSHICOOP_DEED_SYNC", "1") != "0";
     c.fixtureSync = envOr("KENSHICOOP_FIXTURE_SYNC", "1") != "0";
     c.storeSync   = envOr("KENSHICOOP_STORE_SYNC", "1") != "0";
+    c.vendorSync  = envOr("KENSHICOOP_VENDOR_SYNC", "1") != "0";
     c.squadSync   = envOr("KENSHICOOP_SQUAD_SYNC", "1") != "0";
     c.latejoinSync = envOr("KENSHICOOP_LATEJOIN_SYNC", "1") != "0";
     // NOTE: every channel above DEFAULTS ON for real sessions; the diagnostic
@@ -471,6 +472,7 @@ std::string describeConfig(const Config& c) {
         { "prod",    c.prodSync },     { "research",c.researchSync },
         { "deed",    c.deedSync },    { "fixture", c.fixtureSync },
         { "store",   c.storeSync },    { "squad",   c.squadSync },
+        { "vendor",  c.vendorSync },
         { "latejoin",c.latejoinSync }, { "aiSuspend", c.aiSuspend },
         { "gateAuth",c.gateAuthority },{ "camInterest", c.camInterest },
         { "censusFreezeAi", c.censusFreezeAi },

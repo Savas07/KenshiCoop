@@ -133,6 +133,7 @@ function Invoke-OneOracle {
         "wallet_probe"  { return (Test-WalletProbe     -HostFile $HostLog -JoinFile $JoinLog) }
         "money_sync"    { return (Test-MoneySync       -HostFile $HostLog -JoinFile $JoinLog) }
         "vendor_trade"  { return (Test-VendorTrade     -HostFile $HostLog -JoinFile $JoinLog) }
+        "vendor_stock"  { return (Test-VendorStock     -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_probe" { return (Test-RecruitProbe    -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_sync"  { return (Test-RecruitSync     -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_ctl"   { return (Test-RecruitCtl      -HostFile $HostLog -JoinFile $JoinLog) }
@@ -481,7 +482,7 @@ Export-ModuleMember -Function @(
     "Get-SpawnHands", "Test-SpawnProbe", "Test-SpawnSync", "Test-SpawnFarBind",
     "Test-NpcCensus",
     "Get-WalletSeries", "Get-PoolSeries", "Test-ShopProbe", "Test-WalletProbe",
-    "Test-MoneySync", "Test-MoneyPersist", "Test-VendorTrade",
+    "Test-MoneySync", "Test-MoneyPersist", "Test-VendorTrade", "Test-VendorStock",
     "Test-RecruitProbe", "Test-RecruitSync", "Test-RecruitCtl", "Test-RecruitJoin",
     "Get-FacRelSeries", "Test-FactionProbe", "Test-FactionSync",
     "Get-GTimeSeries", "Test-TimeProbe", "Test-TimeSync", "Get-SlewSummary",

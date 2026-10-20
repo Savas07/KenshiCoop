@@ -1274,6 +1274,25 @@ int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
     return ok ? qty : 0;
 }
 
+int removeItemsFromContainerBySid(GameWorld* gw, const unsigned int cHand[5],
+                                  const char* sid, unsigned int typeCat, int qty) {
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = invOf(ro);
+    if (!inv) return 0;
+    InvItemEntry cur[INV_ITEMS_MAX];
+    Item* curItems[INV_ITEMS_MAX];
+    unsigned int n = readInvItems(inv, cur, curItems, INV_ITEMS_MAX);
+    int removed = removeByKey(inv, curItems, cur, n, sid, typeCat, qty, /*wantEquipped=*/0);
+    if (removed < qty) {
+        // removeByKey destroyed the stacks it took: re-read before the worn pass.
+        n = readInvItems(inv, cur, curItems, INV_ITEMS_MAX);
+        removed += removeByKey(inv, curItems, cur, n, sid, typeCat, qty - removed, 1);
+    }
+    return removed;
+}
+
 int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                               const unsigned int dstHand[5],
                               const char* sid, unsigned int typeCat, int qty,

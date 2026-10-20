@@ -343,6 +343,36 @@ public:
     // so the relocation beats the reconcile.
     void applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 localId);
 
+    // Protocol 60, JOIN, BEFORE engine (after publishInventories): every change
+    // a local trade made to a counter the host mirrors (INV_FLAG_SHOP) - stock
+    // a purchase took out, goods a sale put in - leaves as one reliable
+    // PKT_VENDOR_DELTA per item key once it has held for a settle window (a
+    // stack on the trade cursor is not a trade yet). Each sent change is
+    // latched on the counter so a host snapshot captured before the host
+    // applied it cannot reconcile it back. Also refreshes the set of shops
+    // whose own restock the join skips (vendorRefreshGated).
+    void detectAndPublishVendorDeltas(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // Protocol 60, HOST, AFTER engine: apply the joins' counter changes to the
+    // real stock (remove what was bought, fabricate what was sold); the next
+    // census snapshot brings every client back in line. Idempotent by
+    // (ownerId, deltaId).
+    void applyVendorDeltas(GameWorld* gw, Inbound& in);
+
+    // Protocol 60, JOIN: true when the trader platoon named by (container,
+    // serial) owns a counter the host currently mirrors - its stock is the
+    // host's, so the join's own restock must not run.
+    bool vendorRefreshGated(unsigned int platContainer, unsigned int platSerial) const;
+
+    // Protocol 60, HOST, BEFORE engine: mirror each censused shop's merchant
+    // cash (one row per trader platoon) on change + a 5 s safety resend.
+    void publishVendorCash(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // Protocol 60, JOIN, AFTER engine: move each mirrored shop's cash to the
+    // host's value - unless the join holds a cash change it has not reported
+    // yet (a trade still settling), which defers it (3 s cap).
+    void applyVendorCash(GameWorld* gw, Inbound& in);
+
     // AFTER applyTransfers (protocol 50): drain verdicts for intents WE authored
     // and settle them on the receiver's word instead of on a deadline. Accept
     // clears our latches now; reject clears them too, which is what lets the
@@ -640,6 +670,12 @@ public:
     // the protocol-27 build maps (keyKind=1); the receiver resolves back in
     // ingestInv. Layered on invSync (publishInventories is the carrier).
     void setStoreSync(bool v) { storeSync_ = v; }
+
+    // Shared vendor stock (protocol 60, KENSHICOOP_VENDOR_SYNC). Host: the
+    // container census also takes the SHOP COUNTERS and flags their snapshots
+    // INV_FLAG_SHOP. Join: counters so flagged report local trades back as
+    // PKT_VENDOR_DELTA and stay out of the protocol-37 transfer detector.
+    void setVendorSync(bool v) { vendorSync_ = v; }
 
     // Connect-edge resync (protocol 30, no wire change): called from the
     // game-thread connect drain (processNetEvents) when a peer appears (host
@@ -1563,7 +1599,10 @@ private:
     struct InvPub { u32 hash; unsigned long lastSendMs; u32 pendingHash; unsigned long pendingSince; unsigned int lastSentN; unsigned int lastSentUnits; };
     // truncated (protocol 46): the author's container did not fit in INV_ITEMS_MAX, so
     // `items` is an INCOMPLETE description - reconcile additive-only, never delete.
-    struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; bool truncated; };
+    // shop (protocol 60): the author flagged the container INV_FLAG_SHOP;
+    // recvMs: when its latest snapshot arrived (freshness of the mirror).
+    struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; bool truncated;
+                     bool shop; unsigned long recvMs; };
     std::set<Key>          ownedContainers_;
     std::map<Key, InvPub>  invPub_;
     std::map<Key, InvRecv> invRecv_;
@@ -1576,6 +1615,31 @@ private:
     bool           storeSync_;
     unsigned long  contCensusMs_;
     std::set<Key>  censusContainers_;
+    // Protocol 60. Host: the census rows that are shop counters (their
+    // snapshots carry INV_FLAG_SHOP). Join: per mirrored counter, the per-item
+    // totals the host last put there (vendorBase_) and the unsettled local
+    // changes against them, delta + since (vendorPend_); the trader platoons
+    // whose counters are mirrored (vendorOwners_, the restock gate).
+    bool           vendorSync_;
+    std::set<Key>  censusShops_;
+    std::map<Key, std::map<std::pair<std::string, u32>, int> > vendorBase_;
+    std::map<Key, std::map<std::pair<std::string, u32>, std::pair<int, unsigned long> > > vendorPend_;
+    std::set<std::pair<u32, u32> > vendorOwners_;
+    unsigned long  vendorScanMs_;
+    u32            nextVendorDeltaId_;
+    std::set<std::pair<u32, u32> > appliedVendorDeltas_;
+    // Protocol 60 merchant cash, keyed by the trader PLATOON (shopOwner
+    // container fields) so a shop with several counters counts once. Host:
+    // last value sent + when. Join: the host's last value (the baseline a trade
+    // is measured against), unsettled local changes (delta, since) and host
+    // values waiting for the local change to be reported.
+    typedef std::pair<u32, u32> ShopKey;
+    struct CashIn { Key counter; int cash; unsigned long since; };
+    std::map<ShopKey, std::pair<int, unsigned long> > vendorCashSent_;
+    std::map<ShopKey, int>                            vendorCashBase_;
+    std::map<ShopKey, std::pair<int, unsigned long> > vendorCashPend_;
+    std::map<ShopKey, CashIn>                         vendorCashIn_;
+    unsigned long                                     vendorCashMs_;
 
     // Phase W1 world-item state.
     // HOST: worldTrack_ maps a ground item's LOCAL engine hand (Key) to its assigned
@@ -1804,6 +1868,12 @@ private:
     // Recapture `k`'s container and overwrite its baseline (clears its pends): call
     // after ANY local mutation we make ourselves so the detector only sees the user.
     void xferRebase(GameWorld* gw, const Key& k);
+    // Protocol 60 (vendor detector, join): per-item totals of a counter; the
+    // baseline overwrite after the host's snapshot is applied; and whether the
+    // counter holds a local change not yet reported (applyInventories defers).
+    void vendorTotals(GameWorld* gw, const unsigned int cHand[5], std::map<XKey, int>& out);
+    void vendorRebase(GameWorld* gw, const Key& k, const unsigned int cHand[5]);
+    bool vendorUnreported(GameWorld* gw, const Key& k, const unsigned int cHand[5]);
     // True while the transfer detector is watching an unresolved LOSS of `sid` from
     // container `k` - the W2 census fallback defers its drop verdict for it.
     bool xferPendingLoss(const Key& k, const char* sid);

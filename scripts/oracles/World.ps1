@@ -2990,3 +2990,223 @@ function Test-CellProbe {
                             tabs = $m.tabs; tabCells = $m.tabCells; samples = $m.samples
                             hostCellX = $h.cellX; joinCellX = $j.cellX })
 }
+
+# vendor_stock (protocol 60): one shop's stock is ONE stock across clients.
+# Each side logs "SCENARIO VSTOCK thand=.. items=sid*qty,.." for every shop
+# near the bar at 1 Hz (the multiset of its counters, keyed by the owning
+# trader platoon), picks the same shop (VPICK: the counter nearest the rank-0
+# leader) and runs its trade sessions: join buys the first stack, host the
+# last, then the join buys out everything left (one VBUY line per stack).
+# Gates, per side's picked shop:
+#   1. both sides sampled the stock and both bought at least once (res=1);
+#   2. no ZERO-vs-GOODS: never more than 6 s with one side at qty 0 while the
+#      other has goods, and not at the end;
+#   3. convergence: the stock multisets never disagree for more than 8 s in a
+#      row (host-clock aligned samples), and agree at the end;
+#   4. every purchase left the vendor on BOTH sides: each side's final stock
+#      equals the host's pre-purchase stock minus everything bought;
+#   5. each buyer's bag (VBAG rank = host 0 / join 1) gained exactly what it
+#      bought, on host AND join;
+#   6. the shared pool ends equal on both sides and below the 50000 seed.
+#   7. sales (VSELL): both sides sold one stack back and the seller's pool grew;
+#      gates 4/5 count them (stock +sold, seller's bag -sold);
+#   8. merchant cash (VSTOCK cash=, the counter's getMoney): equal host/join
+#      within 5 s of any change and at the end.
+function Test-VendorStock {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $parseItems = {
+        param([string]$s)
+        $h = @{}
+        if ($s) {
+            foreach ($tok in $s.Trim().Split(',')) {
+                $i = $tok.LastIndexOf('*')
+                if ($i -lt 1) { continue }
+                $h[$tok.Substring(0, $i)] = [int]$tok.Substring($i + 1)
+            }
+        }
+        return $h
+    }
+    $sameSet = {
+        param($a, $b)
+        if ($a.Count -ne $b.Count) { return $false }
+        foreach ($k in $a.Keys) { if (-not $b.ContainsKey($k) -or $b[$k] -ne $a[$k]) { return $false } }
+        return $true
+    }
+    $stamp = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*'
+    $read = {
+        param([string]$file)
+        $r = @{ pick = $null; stock = (New-Object System.Collections.ArrayList); buys = @(); sells = @()
+                bags = @{ 0 = (New-Object System.Collections.ArrayList); 1 = (New-Object System.Collections.ArrayList) }
+                wallet = $null }
+        if (-not (Test-Path $file)) { return $r }
+        $off = Get-LogClockOffsetMs -File $file
+        $p = Select-String -Path $file -Pattern 'SCENARIO VPICK thand=([\d,]+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $p) { $r.pick = $p.Matches[0].Groups[1].Value }
+        foreach ($m in @(Select-String -Path $file -Pattern ($stamp + 'SCENARIO VSTOCK thand=([\d,]+) .*qty=(-?\d+) cash=(-?\d+) .* items=(.*)$') -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            if ($g[5].Value -ne $r.pick) { continue }
+            [void]$r.stock.Add(@{ t = (Convert-StampToMs -Groups $g -OffsetMs $off); qty = [int]$g[6].Value
+                                  cash = [int]$g[7].Value; items = (& $parseItems $g[8].Value) })
+        }
+        foreach ($m in @(Select-String -Path $file -Pattern ($stamp + 'SCENARIO VSELL who=(\w+) res=(-?\d+) qty=(-?\d+) .*sid=''([^'']*)'' wallet=(-?\d+)->(-?\d+) cash=(-?\d+)->(-?\d+)') -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            $r.sells += @{ t = (Convert-StampToMs -Groups $g -OffsetMs $off); who = $g[5].Value
+                           res = [int]$g[6].Value; qty = [int]$g[7].Value; sid = $g[8].Value
+                           w0 = [int]$g[9].Value; w1 = [int]$g[10].Value
+                           c0 = [int]$g[11].Value; c1 = [int]$g[12].Value }
+        }
+        foreach ($m in @(Select-String -Path $file -Pattern ($stamp + 'SCENARIO VBUY who=(\w+) res=(-?\d+) qty=(-?\d+) .*sid=''([^'']*)''') -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            $r.buys += @{ t = (Convert-StampToMs -Groups $g -OffsetMs $off); who = $g[5].Value
+                          res = [int]$g[6].Value; qty = [int]$g[7].Value; sid = $g[8].Value }
+        }
+        foreach ($m in @(Select-String -Path $file -Pattern ($stamp + 'SCENARIO VBAG rank=(\d+) t=\d+ items=(.*)$') -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            [void]$r.bags[[int]$g[5].Value].Add(@{ t = (Convert-StampToMs -Groups $g -OffsetMs $off)
+                                                   items = (& $parseItems $g[6].Value) })
+        }
+        $w = Select-String -Path $file -Pattern 'SCENARIO VWALLET money=(-?\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $w) { $r.wallet = [int]$w.Matches[0].Groups[1].Value }
+        return $r
+    }
+    $H = & $read $HostFile
+    $J = & $read $JoinFile
+    $sides = @{ host = $H; join = $J }
+
+    # 1. coverage + both purchases.
+    foreach ($s in @('host', 'join')) {
+        if ($null -eq $sides[$s].pick) { $why += "$s never picked a trader (no shop counter in range)" }
+        elseif ($sides[$s].stock.Count -eq 0) { $why += "$s logged no VSTOCK for its trader" }
+    }
+    $allBuys = @($H.buys | Where-Object { $_.who -eq 'host' }) + @($J.buys | Where-Object { $_.who -eq 'join' })
+    $okBuys = @($allBuys | Where-Object { $_.res -eq 1 -and $_.sid })
+    foreach ($s in @('host', 'join')) {
+        $b = @($allBuys | Where-Object { $_.who -eq $s })
+        if ($b.Count -eq 0) { $why += "$s never logged VBUY" }
+        elseif (@($b | Where-Object { $_.res -eq 1 }).Count -eq 0) { $why += "$s never bought (res=$($b[0].res))" }
+    }
+    # 1b. both sales happened and the merchant paid the seller.
+    $allSells = @($H.sells | Where-Object { $_.who -eq 'host' }) + @($J.sells | Where-Object { $_.who -eq 'join' })
+    $okSells = @($allSells | Where-Object { $_.res -eq 1 -and $_.sid })
+    foreach ($s in @('host', 'join')) {
+        $x = @($allSells | Where-Object { $_.who -eq $s })
+        if ($x.Count -eq 0) { $why += "$s never logged VSELL" }
+        elseif ($x[0].res -ne 1) { $why += "$s sale failed (res=$($x[0].res))" }
+        elseif ($x[0].w1 -le $x[0].w0) { $why += "$s sold '$($x[0].sid)' but its pool did not grow ($($x[0].w0)->$($x[0].w1))" }
+    }
+    $cashRunMax = 0
+
+    $zeroRunMax = 0; $divRunMax = 0; $pairs = 0
+    $hFinal = $null; $jFinal = $null
+    if ($H.stock.Count -gt 0 -and $J.stock.Count -gt 0) {
+        $hFinal = $H.stock[$H.stock.Count - 1]; $jFinal = $J.stock[$J.stock.Count - 1]
+        # Pair each host sample with the nearest join sample (host clock frame).
+        $zeroSince = $null; $divSince = $null; $ji = 0
+        foreach ($hs in $H.stock) {
+            while ($ji + 1 -lt $J.stock.Count -and
+                   [Math]::Abs($J.stock[$ji + 1].t - $hs.t) -le [Math]::Abs($J.stock[$ji].t - $hs.t)) { $ji++ }
+            $js = $J.stock[$ji]
+            if ([Math]::Abs($js.t - $hs.t) -gt 1500) { continue }
+            $pairs++
+            $zero = (($hs.qty -eq 0) -ne ($js.qty -eq 0))
+            if ($zero) { if ($null -eq $zeroSince) { $zeroSince = $hs.t }; $zeroRunMax = [Math]::Max($zeroRunMax, $hs.t - $zeroSince) }
+            else { $zeroSince = $null }
+            $div = -not (& $sameSet $hs.items $js.items)
+            if ($div) { if ($null -eq $divSince) { $divSince = $hs.t }; $divRunMax = [Math]::Max($divRunMax, $hs.t - $divSince) }
+            else { $divSince = $null }
+        }
+        # 3b. merchant cash: the same on both screens - within 5 s of every trade, and at the end.
+        $cashSince = $null; $ji = 0
+        foreach ($hs in $H.stock) {
+            while ($ji + 1 -lt $J.stock.Count -and
+                   [Math]::Abs($J.stock[$ji + 1].t - $hs.t) -le [Math]::Abs($J.stock[$ji].t - $hs.t)) { $ji++ }
+            $js = $J.stock[$ji]
+            if ([Math]::Abs($js.t - $hs.t) -gt 1500) { continue }
+            if ($hs.cash -ne $js.cash) { if ($null -eq $cashSince) { $cashSince = $hs.t }; $cashRunMax = [Math]::Max($cashRunMax, $hs.t - $cashSince) }
+            else { $cashSince = $null }
+        }
+        if ($hFinal.cash -lt 0 -or $jFinal.cash -lt 0) { $why += "merchant cash unreadable (host $($hFinal.cash) join $($jFinal.cash))" }
+        if ($cashRunMax -gt 5000) { $why += "merchant cash differed host/join for $([int]($cashRunMax/1000)) s in a row" }
+        if ($hFinal.cash -ne $jFinal.cash) { $why += "final merchant cash host=$($hFinal.cash) join=$($jFinal.cash)" }
+        # 2. zero-vs-goods.
+        if ($zeroRunMax -gt 6000) { $why += "stock read 0 on one side while the other had goods for $([int]($zeroRunMax/1000)) s" }
+        if (($hFinal.qty -eq 0) -ne ($jFinal.qty -eq 0)) { $why += "final stock host qty=$($hFinal.qty) join qty=$($jFinal.qty) (one side empty)" }
+        # 3. convergence.
+        if ($divRunMax -gt 8000) { $why += "stocks disagreed for $([int]($divRunMax/1000)) s in a row" }
+        if (-not (& $sameSet $hFinal.items $jFinal.items)) {
+            $diff = @()
+            foreach ($k in (@($hFinal.items.Keys) + @($jFinal.items.Keys) | Sort-Object -Unique)) {
+                $a = if ($hFinal.items.ContainsKey($k)) { $hFinal.items[$k] } else { 0 }
+                $b = if ($jFinal.items.ContainsKey($k)) { $jFinal.items[$k] } else { 0 }
+                if ($a -ne $b) { $diff += "${k}:$a/$b" }
+            }
+            $why += "final stock differs host/join: $(($diff | Select-Object -First 6) -join ' ')"
+        }
+    }
+
+    # 4. every trade moved the ONE stock, on both sides: final stock = the host's
+    #    pre-trade stock - everything bought + everything sold.
+    $okTrades = @(@($okBuys | ForEach-Object { @{ t = $_.t; who = $_.who; sid = $_.sid; n = -[Math]::Max(1, $_.qty) } }) +
+                  @($okSells | ForEach-Object { @{ t = $_.t; who = $_.who; sid = $_.sid; n = [Math]::Max(1, $_.qty) } }))
+    if ($okTrades.Count -gt 0 -and $H.stock.Count -gt 0) {
+        $first = (@($okTrades | ForEach-Object { $_.t }) | Measure-Object -Minimum).Minimum
+        $base = @($H.stock | Where-Object { $_.t -lt $first }) | Select-Object -Last 1
+        if ($null -eq $base) { $why += "no host stock sample before the first trade" }
+        else {
+            $want = @{}
+            foreach ($k in $base.items.Keys) { $want[$k] = $base.items[$k] }
+            foreach ($x in $okTrades) {
+                $want[$x.sid] = $(if ($want.ContainsKey($x.sid)) { $want[$x.sid] } else { 0 }) + $x.n
+            }
+            foreach ($s in @('host', 'join')) {
+                $st = $sides[$s].stock
+                if ($st.Count -eq 0) { continue }
+                $fin = $st[$st.Count - 1].items
+                foreach ($sid in @($okTrades | ForEach-Object { $_.sid } | Sort-Object -Unique)) {
+                    $w = [Math]::Max(0, $want[$sid])
+                    $a = if ($fin.ContainsKey($sid)) { $fin[$sid] } else { 0 }
+                    if ($a -ne $w) { $why += "traded '$sid': $s vendor ends holding $a, expected $w" }
+                }
+            }
+        }
+    }
+    # 5. each trader's tab leader holds exactly bought - sold, on both sides.
+    foreach ($who in @('host', 'join')) {
+        $mine = @($okTrades | Where-Object { $_.who -eq $who })
+        if ($mine.Count -eq 0) { continue }
+        $rank = if ($who -eq 'host') { 0 } else { 1 }
+        $first = (@($mine | ForEach-Object { $_.t }) | Measure-Object -Minimum).Minimum
+        $preBag = @($sides[$who].bags[$rank] | Where-Object { $_.t -lt $first }) | Select-Object -Last 1
+        if ($null -eq $preBag) { $why += "$who bag not sampled before its first trade"; continue }
+        $got = @{}
+        foreach ($x in $mine) { $got[$x.sid] = $(if ($got.ContainsKey($x.sid)) { $got[$x.sid] } else { 0 }) - $x.n }
+        foreach ($s in @('host', 'join')) {
+            $bags = $sides[$s].bags[$rank]
+            if ($bags.Count -eq 0) { $why += "$s logged no VBAG rank $rank"; continue }
+            $finB = $bags[$bags.Count - 1].items
+            foreach ($sid in $got.Keys) {
+                $b0 = if ($preBag.items.ContainsKey($sid)) { $preBag.items[$sid] } else { 0 }
+                $b1 = if ($finB.ContainsKey($sid)) { $finB[$sid] } else { 0 }
+                if ($b1 - $b0 -ne $got[$sid]) { $why += "$who (rank $rank) holds $b1 '$sid' on $s, expected $($b0 + $got[$sid])" }
+            }
+        }
+    }
+
+    # 6. pool.
+    if ($null -eq $H.wallet -or $null -eq $J.wallet) { $why += "VWALLET missing on a side" }
+    elseif ($H.wallet -ne $J.wallet) { $why += "pool diverged host=$($H.wallet) join=$($J.wallet)" }
+    elseif ($okBuys.Count -gt 0 -and $H.wallet -ge 50000) { $why += "purchases did not reach the pool (still $($H.wallet))" }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    $hq = if ($null -ne $hFinal) { $hFinal.qty } else { -1 }
+    $jq = if ($null -ne $jFinal) { $jFinal.qty } else { -1 }
+    $hc = if ($null -ne $hFinal) { $hFinal.cash } else { -1 }
+    $jc = if ($null -ne $jFinal) { $jFinal.cash } else { -1 }
+    Write-Host "  VENDOR-STOCK $v - pick host=$($H.pick) join=$($J.pick) finalQty=$hq/$jq cash=$hc/$jc pairs=$pairs zeroRunMs=$zeroRunMax divRunMs=$divRunMax cashRunMs=$cashRunMax $detail"
+    return (Add-GateResult -Name "vendor_stock" -Status $v `
+                -Metrics @{ hostQty = $hq; joinQty = $jq; pairs = $pairs; zeroRunMs = $zeroRunMax
+                            divRunMs = $divRunMax; cashRunMs = $cashRunMax; hostCash = $hc; joinCash = $jc
+                            hostWallet = $H.wallet; joinWallet = $J.wallet } -Detail $detail)
+}
