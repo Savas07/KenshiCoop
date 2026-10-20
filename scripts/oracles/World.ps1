@@ -552,6 +552,212 @@ function Test-RecruitCtl {
                 -Metrics @{ phantom = $phantom; flips = $flip } -Detail $detail)
 }
 
+# recruit_join (sync bug 3): a recruit belongs to its RECRUITER on both games.
+# The scenario runs two mirrored legs; this oracle judges ONE of them:
+#   -Leg J (gate recruit_join)      - the JOIN recruits an NPC it was DRIVING
+#                                     from the host's stream (the field bug);
+#   -Leg H (gate recruit_join_host) - the HOST recruits an NPC it authors (the
+#                                     control arm: the field report says it works).
+# Gates, recruiter R / peer P:
+#   1. R recruited (res=1) and P found the recruit as a NEW squad member that is
+#      its own re-keyed copy, not a minted duplicate;
+#   2. P logged "[recruit] REKEY ... new=<after> ok=1" with no REKEY-FALLBACK and
+#      no "[spawn] proxy BOUND" for the recruit's hand;
+#   3. from 1.5 s after the recruit, R always streams it (own=1) and never
+#      drives or AI-suspends it (drv=0 ais=0); P never owns or pins it owned and
+#      drives it in at least half of its samples;
+#   4. R's move orders execute (owner gait median >= RUN_MIN) and P's copy follows
+#      (driver gait >= GAIT_RATIO x owner; time-paired planar gap median <=
+#      FOLLOW_MAX);
+#   5. both squads grew by exactly one and the recruit sits in the same tab
+#      container on both games;
+#   6. P sends no owned-channel lines for it ([stats] SEND, [med] SEND npc=0,
+#      [inv] SEND) and authors no squad move for it.
+function Test-RecruitJoin {
+    param([string]$HostFile, [string]$JoinFile, [ValidateSet('J', 'H')][string]$Leg = 'J')
+    $gate     = if ($Leg -eq 'J') { 'recruit_join' } else { 'recruit_join_host' }
+    $recFile  = if ($Leg -eq 'J') { $JoinFile } else { $HostFile }
+    $peerFile = if ($Leg -eq 'J') { $HostFile } else { $JoinFile }
+    $recWho   = if ($Leg -eq 'J') { 'join' } else { 'host' }
+    $peerWho  = if ($Leg -eq 'J') { 'host' } else { 'join' }
+    $legStart = if ($Leg -eq 'J') { 22000 } else { 6000 }   # scenario recruit times
+    $LEG_MS = 15000; $SETTLE_MS = 1500; $WALK_FROM = 3000; $WALK_MS = 9000
+    $RUN_MIN = 1.0; $GAIT_RATIO = 0.5; $FOLLOW_MAX = 20.0; $PAIR_MS = 300
+    $stamp = '^\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]'
+    $why = @()
+    $recOff  = Get-LogClockOffsetMs -File $recFile
+    $peerOff = Get-LogClockOffsetMs -File $peerFile
+
+    # --- 1. the recruit happened, and the peer saw it join -----------------------
+    $rx = "SCENARIO RJ recruit leg=$Leg who=$recWho res=(-?\d+) subject=(\d) before=([\d,]+) after=([\d,]+) wire=([\d,]+) .*posed=(\d) .*t=(\d+)"
+    $rm = @(Select-String -Path $recFile -Pattern $rx -ErrorAction SilentlyContinue) | Select-Object -First 1
+    if ($null -eq $rm) {
+        Write-Host "  RECRUIT-JOIN[$Leg] FAIL - $recWho never logged its recruit"
+        return (Add-GateResult -Name $gate -Status "FAIL" -Detail "$recWho never logged SCENARIO RJ recruit leg=$Leg")
+    }
+    $g = $rm.Matches[0].Groups
+    $res = [int]$g[1].Value; $before = $g[3].Value; $after = $g[4].Value
+    Write-Host "    FINDING: leg=$Leg recruiter=$recWho res=$res subject=$($g[2].Value) before=$before after=$after wire=$($g[5].Value) posed=$($g[6].Value)"
+    if ($res -ne 1) {
+        Write-Host "  RECRUIT-JOIN[$Leg] FAIL - recruit failed locally (res=$res subject=$($g[2].Value))"
+        return (Add-GateResult -Name $gate -Status "FAIL" -Detail "recruit failed locally (res=$res subject=$($g[2].Value))")
+    }
+    $tRec = [int]$g[7].Value
+    $fm = @(Select-String -Path $peerFile -Pattern "$stamp.*SCENARIO RJ found leg=$Leg who=$peerWho hand=([\d,]+) wire=([\d,]+) minted=(\d) proxy=(\d) t=(\d+)" -ErrorAction SilentlyContinue) | Select-Object -First 1
+    $tFound = $null; $foundWall = $null
+    if ($null -eq $fm) { $why += "$peerWho never saw the recruit join its squad" }
+    else {
+        $fg = $fm.Matches[0].Groups
+        $tFound = [int]$fg[9].Value
+        $foundWall = Convert-StampToMs -Groups $fg -OffsetMs $peerOff
+        if ($fg[7].Value -eq '1') { $why += "$peerWho's new member is a MINTED duplicate, not its own copy re-keyed" }
+        Write-Host "    FINDING: $peerWho found hand=$($fg[5].Value) wire=$($fg[6].Value) minted=$($fg[7].Value) proxy=$($fg[8].Value) after $($tFound - $legStart) ms"
+    }
+
+    # --- 2. the peer re-keyed its own copy (no fallback, no mint) ----------------
+    $h = [regex]::Escape($after)
+    $rekey = @(Select-String -Path $peerFile -Pattern "\[recruit\] REKEY old=[\d,]+ new=$h ok=1" -ErrorAction SilentlyContinue).Count
+    $fallback = @(Select-String -Path $peerFile -Pattern "\[recruit\] REKEY-FALLBACK new=$h force-REQ" -ErrorAction SilentlyContinue).Count
+    $bound = @(Select-String -Path $peerFile -Pattern "\[spawn\] proxy BOUND hand=$h sid=" -ErrorAction SilentlyContinue).Count
+    if ($rekey -eq 0)   { $why += "$peerWho never re-keyed its copy (no REKEY new=$after ok=1)" }
+    if ($fallback -gt 0) { $why += "$peerWho could not resolve the recruit's subject key (REKEY-FALLBACK x$fallback)" }
+    if ($bound -gt 0)   { $why += "$peerWho minted a proxy for the recruit (proxy BOUND x$bound)" }
+    Write-Host "    FINDING: $peerWho rekeyOk=$rekey fallback=$fallback proxyBound=$bound"
+
+    # --- 3. ownership / drive state ---------------------------------------------
+    $roleRx = "$stamp.*SCENARIO RJ role leg=$Leg who=(host|join) side=(rec|peer) ok=(\d) hand=([\d,]+) own=(\d) pinOwn=(\d) pinPeer=(\d) drv=(\d) ais=(\d) canon=(\d) proxy=(\d) minted=(\d) squad=(\d) tabOwn=(\d) wire=([\d,]+) pos=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+) t=(\d+)"
+    function _rjRoles($file, $off, $rxp) {
+        $out = @()
+        foreach ($m in @(Select-String -Path $file -Pattern $rxp -ErrorAction SilentlyContinue)) {
+            $q = $m.Matches[0].Groups
+            $out += [pscustomobject]@{
+                wall = (Convert-StampToMs -Groups $q -OffsetMs $off)
+                ok = [int]$q[7].Value; hand = $q[8].Value
+                own = [int]$q[9].Value; pinOwn = [int]$q[10].Value; pinPeer = [int]$q[11].Value
+                drv = [int]$q[12].Value; ais = [int]$q[13].Value; canon = [int]$q[14].Value
+                proxy = [int]$q[15].Value; minted = [int]$q[16].Value; squad = [int]$q[17].Value
+                tabOwn = [int]$q[18].Value; wire = $q[19].Value
+                x = [double]$q[20].Value; z = [double]$q[22].Value; t = [int]$q[23].Value
+            }
+        }
+        return ,$out
+    }
+    $recAll  = _rjRoles $recFile $recOff $roleRx
+    $peerAll = _rjRoles $peerFile $peerOff $roleRx
+    $recWin  = @($recAll | Where-Object { $_.ok -eq 1 -and $_.t -ge ($tRec + $SETTLE_MS) -and $_.t -le ($legStart + $LEG_MS) })
+    $peerFrom = if ($null -ne $tFound) { $tFound + $SETTLE_MS } else { [int]::MaxValue }
+    $peerWin = @($peerAll | Where-Object { $_.ok -eq 1 -and $_.t -ge $peerFrom -and $_.t -le ($legStart + $LEG_MS) })
+    if ($recWin.Count -lt 5) { $why += "too few $recWho role samples ($($recWin.Count))" }
+    else {
+        $notOwn = @($recWin | Where-Object { $_.own -ne 1 }).Count
+        $drove  = @($recWin | Where-Object { $_.drv -eq 1 }).Count
+        $susp   = @($recWin | Where-Object { $_.ais -eq 1 }).Count
+        $out    = @($recWin | Where-Object { $_.squad -ne 1 }).Count
+        if ($notOwn -gt 0) { $why += "$recWho did not stream its own recruit in $notOwn/$($recWin.Count) samples (own=0)" }
+        if ($drove -gt 0 -or $susp -gt 0) { $why += "$recWho DROVE its own recruit from a peer stream (drv=1 x$drove, ais=1 x$susp of $($recWin.Count))" }
+        if ($out -gt 0) { $why += "recruit not in $recWho's squad in $out/$($recWin.Count) samples" }
+        Write-Host ("    FINDING: {0} rec n={1} own0={2} drv1={3} ais1={4} canon1={5} tabOwn1={6} lastHand={7}" -f $recWho, $recWin.Count, $notOwn, $drove, $susp, @($recWin | Where-Object { $_.canon -eq 1 }).Count, @($recWin | Where-Object { $_.tabOwn -eq 1 }).Count, $recWin[-1].hand)
+    }
+    if ($null -ne $tFound) {
+        if ($peerWin.Count -lt 5) { $why += "too few $peerWho role samples ($($peerWin.Count))" }
+        else {
+            $claimed = @($peerWin | Where-Object { $_.own -eq 1 -or $_.pinOwn -eq 1 }).Count
+            $driven  = @($peerWin | Where-Object { $_.drv -eq 1 }).Count
+            $out     = @($peerWin | Where-Object { $_.squad -ne 1 }).Count
+            if ($claimed -gt 0) { $why += "$peerWho claimed the recruit as its own in $claimed/$($peerWin.Count) samples" }
+            if ($driven -lt [math]::Ceiling(0.5 * $peerWin.Count)) { $why += "$peerWho drove its copy in only $driven/$($peerWin.Count) samples" }
+            if ($out -gt 0) { $why += "recruit not in $peerWho's squad in $out/$($peerWin.Count) samples" }
+            Write-Host ("    FINDING: {0} peer n={1} claimed={2} drv1={3} pinPeer1={4} minted1={5} tabOwn1={6} lastHand={7}" -f $peerWho, $peerWin.Count, $claimed, $driven, @($peerWin | Where-Object { $_.pinPeer -eq 1 }).Count, @($peerWin | Where-Object { $_.minted -eq 1 }).Count, @($peerWin | Where-Object { $_.tabOwn -eq 1 }).Count, $peerWin[-1].hand)
+        }
+    }
+
+    # --- 4. move orders execute and the peer's copy follows ----------------------
+    $gaitRx = "SCENARIO RJ gait leg=$Leg who=(host|join) role=(own|drive) moving=(\d) speed=([\d.]+) ok=\d t=(\d+)"
+    function _rjGait($file, $role, $rxp) {
+        $out = @()
+        foreach ($m in @(Select-String -Path $file -Pattern $rxp -ErrorAction SilentlyContinue)) {
+            $q = $m.Matches[0].Groups
+            if ($q[2].Value -ne $role -or $q[3].Value -ne '1') { continue }
+            $out += [double]$q[4].Value
+        }
+        return ,$out
+    }
+    function _rjMedian($a) {
+        if ($a.Count -eq 0) { return 0.0 }
+        $s = @($a | Sort-Object)
+        return [double]$s[[int]([math]::Floor($s.Count / 2))]
+    }
+    $own = _rjGait $recFile 'own' $gaitRx
+    $drv = _rjGait $peerFile 'drive' $gaitRx
+    $ownMed = _rjMedian $own; $drvMed = _rjMedian $drv
+    if ($own.Count -lt 5 -or $ownMed -lt $RUN_MIN) {
+        $why += "$recWho's move orders did not execute (owner moving n=$($own.Count) med=$([math]::Round($ownMed,2)))"
+    } elseif ($drv.Count -lt [int](0.3 * $own.Count)) {
+        $why += "$peerWho's copy rarely moved (n=$($drv.Count) vs owner $($own.Count))"
+    } elseif ($drvMed -lt ($GAIT_RATIO * $ownMed)) {
+        $why += "$peerWho's copy too slow (med=$([math]::Round($drvMed,2)) < $GAIT_RATIO x owner $([math]::Round($ownMed,2)))"
+    }
+    $walkLo = $legStart + $WALK_FROM; $walkHi = $walkLo + $WALK_MS
+    $gaps = @()
+    foreach ($r in @($recAll | Where-Object { $_.ok -eq 1 -and $_.t -ge $walkLo -and $_.t -lt $walkHi })) {
+        $best = $null; $bestDt = $PAIR_MS + 1
+        foreach ($p in $peerAll) {
+            if ($p.ok -ne 1) { continue }
+            $dt = [math]::Abs($p.wall - $r.wall)
+            if ($dt -lt $bestDt) { $bestDt = $dt; $best = $p }
+        }
+        if ($null -ne $best) { $gaps += [math]::Sqrt([math]::Pow($best.x - $r.x, 2) + [math]::Pow($best.z - $r.z, 2)) }
+    }
+    $gapMed = _rjMedian $gaps
+    if ($gaps.Count -lt 5) { $why += "too few time-paired walk samples ($($gaps.Count)) to judge the follow" }
+    elseif ($gapMed -gt $FOLLOW_MAX) { $why += "$peerWho's copy does not follow (median gap $([math]::Round($gapMed,1)) u > $FOLLOW_MAX)" }
+    Write-Host ("    FINDING: gait owner n={0} med={1} driver n={2} med={3}; follow pairs={4} medGap={5}" -f $own.Count, [math]::Round($ownMed, 2), $drv.Count, [math]::Round($drvMed, 2), $gaps.Count, [math]::Round($gapMed, 1))
+
+    # --- 5. squad membership + tab parity ---------------------------------------
+    foreach ($pair in @(@($recWho, $recFile), @($peerWho, $peerFile))) {
+        $sq = @{}
+        foreach ($m in @(Select-String -Path $pair[1] -Pattern "SCENARIO RJ squad leg=$Leg who=$($pair[0]) phase=(pre|post) n=(\d+)" -ErrorAction SilentlyContinue)) {
+            $sq[$m.Matches[0].Groups[1].Value] = [int]$m.Matches[0].Groups[2].Value
+        }
+        if (-not ($sq.ContainsKey('pre') -and $sq.ContainsKey('post'))) { $why += "$($pair[0]) squad census missing" }
+        elseif (($sq['post'] - $sq['pre']) -ne 1) { $why += "$($pair[0]) squad grew by $($sq['post'] - $sq['pre']) (pre=$($sq['pre']) post=$($sq['post'])), expected 1" }
+        else { Write-Host "    FINDING: $($pair[0]) squad $($sq['pre']) -> $($sq['post'])" }
+    }
+    if ($recWin.Count -gt 0 -and $peerWin.Count -gt 0) {
+        $rh = $recWin[-1].hand -split ','; $ph = $peerWin[-1].hand -split ','
+        if ($rh[1] -ne $ph[1] -or $rh[2] -ne $ph[2]) {
+            $why += "recruit sits in different tabs ($recWho cont=$($rh[1]),$($rh[2]) vs $peerWho cont=$($ph[1]),$($ph[2]))"
+        }
+    }
+
+    # --- 6. the peer never publishes the recruit as its own ----------------------
+    $sent = 0
+    if ($null -ne $foundWall -and $peerWin.Count -gt 0) {
+        $hands = @($peerWin | ForEach-Object { $_.hand } | Sort-Object -Unique)
+        $pats = @()
+        foreach ($hh in $hands) {
+            $p5 = $hh -split ','
+            $is = [regex]::Escape("$($p5[3]),$($p5[4])")
+            $pats += "\[stats\] SEND hand=$is str="
+            $pats += "\[med\] SEND hand=$is npc=0"
+            $pats += "\[inv\] SEND hand=$([regex]::Escape($hh)) kind="
+            $pats += "\[squad\] EVT send old=$([regex]::Escape($hh)) "
+        }
+        foreach ($m in @(Select-String -Path $peerFile -Pattern ($pats | ForEach-Object { "$stamp.*$_" }) -ErrorAction SilentlyContinue)) {
+            if ((Convert-StampToMs -Groups $m.Matches[0].Groups -OffsetMs $peerOff) -ge $foundWall) { $sent++ }
+        }
+        if ($sent -gt 0) { $why += "$peerWho published the recruit as its own ($sent owned-channel/squad-move lines)" }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  RECRUIT-JOIN[$Leg] $v - $detail"
+    return (Add-GateResult -Name $gate -Status $v `
+                -Metrics @{ rekeyOk = $rekey; fallback = $fallback; proxyBound = $bound
+                            ownerMed = [math]::Round($ownMed, 2); driverMed = [math]::Round($drvMed, 2)
+                            followGap = [math]::Round($gapMed, 1); peerOwnedLines = $sent } -Detail $detail)
+}
+
 # Test-CampApproach (Phase 2 crash-hardening SOAK): validate the fix MECHANISMS
 # from the flushed plugin logs of a camp_approach run. There is no deterministic
 # repro of the original approach crash, so this proves: (1) both clients reach

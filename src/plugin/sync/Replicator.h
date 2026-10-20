@@ -134,6 +134,20 @@ public:
                              unsigned int outLocal[5], unsigned int outCanon[5],
                              float* outDist) const;
 
+    // Scenario support (recruit_join): this client's ownership/drive view of ONE
+    // local body - owned (local hand streamed this tick), the pins on its local
+    // hand, whether this tick drove / AI-suspended it, whether it is minted, a
+    // player-squad member, or in a tab we own, and the peer key it is bound
+    // under (canonicalOf_ stamp first, else its proxyByKey_ binding; zeros when
+    // neither). Pointer lookups plus one SEH-guarded hand read. False when the
+    // body's hand is unreadable.
+    struct BodyRoleRead {
+        bool owned, pinOwn, pinPeer, driven, aiSusp, canon, proxy, minted, squad, tabOwn;
+        unsigned int local[5];
+        unsigned int wire[5];
+    };
+    bool bodyRoleOf(GameWorld* gw, Character* c, BodyRoleRead* out) const;
+
     // AI-gating probe (join side): recruit diverged NPCs into the player squad to
     // validate the "inhabit" lever (stops self-tasking + becomes drivable).
     void setProbeRecruit(bool v) { probeRecruit_ = v; }

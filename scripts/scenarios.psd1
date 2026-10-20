@@ -1154,6 +1154,25 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # recruit_join: sync bug 3 - a JOIN recruit of an NPC it was DRIVING from
+        # the host's stream (every NPC near a shared cell is host-authored, so a
+        # join bar recruit is always one; probeRecruit never picked one). Two
+        # mirrored legs: the host recruits an NPC it authors (control arm,
+        # recruit_join_host), then the join recruits a host-driven one
+        # (recruit_join); each recruiter move-orders its recruit while the other
+        # side mirrors. Test-RecruitJoin gates per leg: the peer re-keys its own
+        # copy (REKEY ok=1, no fallback, no proxy mint), the recruiter always
+        # streams and never drives/AI-suspends its recruit, the orders execute
+        # and the peer's copy follows, squads grow by one with tab parity, and
+        # the peer never publishes the recruit as its own. Save 'sync'.
+        recruit_join = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'recruit_join'
+            Gating   = @('recruit_join', 'recruit_join_host', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # faction_probe: faction-relation phase-0 diagnostic (protocol 24 -
         # factionSync forced OFF; the affectRelations detours stay on for
         # cause-attribution evidence). Both sides log a 1 Hz FACREL series

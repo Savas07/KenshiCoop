@@ -771,6 +771,39 @@ bool Replicator::pickMintedProxyNear(GameWorld* gw, const unsigned int refHand[5
     return true;
 }
 
+bool Replicator::bodyRoleOf(GameWorld* gw, Character* c, BodyRoleRead* out) const {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!c || !engine::readObjectHand(reinterpret_cast<RootObject*>(c), out->local))
+        return false;
+    Key lk; lk.t = out->local[0]; lk.c = out->local[1]; lk.cs = out->local[2];
+    lk.i = out->local[3]; lk.s = out->local[4];
+    out->owned   = ownHands_.count(lk) != 0;
+    out->pinOwn  = pinOwned_.count(lk) != 0;
+    out->pinPeer = pinPeer_.count(lk) != 0;
+    out->driven  = drivenChars_.count(c) != 0;
+    out->aiSusp  = engine::isAiSuspended(c);
+    out->minted  = mintedBodies_.count(c) != 0;
+    out->squad   = engine::isLocalPlayerChar(gw, c);
+    std::pair<u32, u32> tab((u32)lk.c, (u32)lk.cs);
+    out->tabOwn  = out->squad && ownsTab(tab, tabRankFor(tab, lastCtnrs_));
+    const Key* wire = 0;
+    std::map<Character*, Key>::const_iterator ct = canonicalOf_.find(c);
+    if (ct != canonicalOf_.end()) { out->canon = true; wire = &ct->second; }
+    for (std::map<Key, Character*>::const_iterator pt = proxyByKey_.begin();
+         pt != proxyByKey_.end(); ++pt) {
+        if (pt->second != c) continue;
+        out->proxy = true;
+        if (!wire) wire = &pt->first;
+        break;
+    }
+    if (wire) {
+        out->wire[0] = wire->t; out->wire[1] = wire->c; out->wire[2] = wire->cs;
+        out->wire[3] = wire->i; out->wire[4] = wire->s;
+    }
+    return true;
+}
+
 void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
     std::deque<InboundEvent> got;
     in.drainEvents(got);

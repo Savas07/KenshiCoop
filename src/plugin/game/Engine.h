@@ -1277,6 +1277,8 @@ bool         installAiSuspendHook();
 void         clearAiSuspend();
 void         addAiSuspend(Character* c);
 unsigned int aiSuspendCount();
+// Is 'c' in this tick's suspended set? Pointer compare only (never dereferenced).
+bool         isAiSuspended(Character* c);
 
 // Task-selection observation spike (KENSHICOOP_TASK_SPIKE, OFF by default):
 // passively detours CharBody::setCurrentAction - the single seam every task

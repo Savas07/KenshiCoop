@@ -2166,6 +2166,7 @@ void setTaskSelectSpike(bool on) { g_taskSelectSpike = on; }
 void clearAiSuspend()           { g_aiSuspended.clear(); }
 void addAiSuspend(Character* c) { if (c) g_aiSuspended.insert(c); }
 unsigned int aiSuspendCount()   { return (unsigned int)g_aiSuspended.size(); }
+bool isAiSuspended(Character* c) { return c && g_aiSuspended.find(c) != g_aiSuspended.end(); }
 
 bool installDamageGuardHook() {
     intptr_t addr = KenshiLib::GetRealAddress(&Character::_NV_hitByMeleeAttack);
