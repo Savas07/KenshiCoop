@@ -1,11 +1,13 @@
 // ScenarioCombat.cpp - combat scenarios (monolith split from Scenario.cpp,
 // 2026-07-12): combat_probe, combat_order, combat_kill, player_combat,
-// assault_town, assault_travel, player_ko, combat_crowd. Classes are TU-private (anonymous
-// namespace); only makeCombatScenario (ScenarioSupport.h) is exported.
+// assault_town, assault_travel, player_ko, combat_crowd, host_pc_fight. Classes are
+// TU-private (anonymous namespace); only makeCombatScenario (ScenarioSupport.h) is
+// exported.
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
 #include "ScenarioSupport.h"
 #include <cstdlib>  // getenv/atoi - combat_battle size (KENSHICOOP_BATTLE_N)
+#include "../devtools/DevTools.h" // devRegimeName - host_pc_fight's reg= field
 
 namespace coop {
 namespace {
@@ -2188,6 +2190,271 @@ const float AssaultTravelScenario::CLOSE_DIST  = 12.0f;
 const float AssaultTravelScenario::HOSTILE_REL = -100.0f;
 const float AssaultTravelScenario::TRAVEL_SPEED_MULT = 5.0f;
 
+// ---- host_pc_fight / host_pc_fight_mint -------------------------------------
+// 2026-10 Workshop report: a player fought a Shek and, on the friend's screen,
+// that player's character just stood there. The coverage gap behind it: every
+// other combat scenario either has the JOIN's PC attack (the host renders the
+// copy: assault_town, pc_assault, assault_travel/mint) or has a PC as the
+// VICTIM (player_combat).
+// None checked the JOIN's copy of a HOST PC that is fighting. Here both
+// leaders fight at once, so each client OWNS one fight and VIEWS the other:
+//   host_pc_fight       save 'sync': each leader attacks the nearest upright
+//                       bar NPC (save-resident, so the hand is shared until the
+//                       viewer's combat detach re-keys that body locally).
+//   host_pc_fight_mint  the host runtime-spawns ENEMY_N bodies in front of its
+//                       leader (the join has to MINT them - combat_win's setup)
+//                       and orders them onto both leaders; the host leader
+//                       attacks its own assigned enemy, the join leader the
+//                       nearest minted proxy.
+// Evidence, both sides, 2 Hz, for BOTH leaders:
+//   SCENARIO HPFIGHT pc=<i,s> owner=<host|join> view=<own|copy> fight= wait=
+//                    sw= tgt=<local i,s> ctgt=<i,s> reg= stask= dest=
+// ctgt is the target in the key space both clients share (replicaInfo: the wire
+// key of a body this client drives or minted, else the local hand), so the
+// owner's and the viewer's samples compare directly. reg/stask/dest are the
+// viewer copy's drive regime, newest streamed task and outstanding walk order.
+// Judged by Test-HostPcFight.
+class HostPcFightScenario : public TimedScenario {
+public:
+    explicit HostPcFightScenario(bool mint)
+        : TimedScenario(mint ? "host_pc_fight_mint" : "host_pc_fight", 500),
+          mint_(mint), haveOwn_(false), havePeer_(false), haveVic_(false),
+          issued_(false), pickFailLogged_(false), spawned_(false), nEnemies_(0),
+          lastOrderMs_(0), lastPickMs_(0) {
+        for (int j = 0; j < 5; ++j) {
+            ownHand_[j] = 0; peerHand_[j] = 0; vic_[j] = 0; lastVic_[j] = 0;
+        }
+    }
+
+    virtual void onGameplay(const ScenarioContext& ctx) { latchLeaders(ctx); }
+    virtual void onStart(const ScenarioContext& ctx) { latchLeaders(ctx); }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveOwn_ || !havePeer_) latchLeaders(ctx);
+        if (mint_) {
+            if (ctx.isHost) tickMintHost(ctx); else tickMintJoin(ctx);
+        } else {
+            tickResident(ctx);
+        }
+        if (evidenceDue(ctx.elapsedMs)) {
+            if (haveOwn_)  logPc(ctx, ownHand_, ctx.isHost);
+            if (havePeer_) logPc(ctx, peerHand_, !ctx.isHost);
+        }
+        unsigned long dur = ctx.isHost
+            ? (mint_ ? MINT_HOST_DURATION_MS : HOST_DURATION_MS)
+            : (mint_ ? MINT_JOIN_DURATION_MS : JOIN_DURATION_MS);
+        if (ctx.elapsedMs >= dur) {
+            // Script-ran verdict only (the cross-client judgement is the oracle's):
+            // this side ordered its own leader into a fight, and the host latched
+            // the peer leader (and spawned the enemies, mint variant).
+            passed_ = issued_ && (!ctx.isHost ||
+                                  (havePeer_ && (!mint_ || nEnemies_ >= 2)));
+            return true;
+        }
+        return false;
+    }
+
+private:
+    static const unsigned long FIGHT_AT_MS           = 10000;
+    static const unsigned long ORDER_EVERY_MS        = 2500;
+    static const unsigned long HOST_DURATION_MS      = 50000;
+    static const unsigned long JOIN_DURATION_MS      = 44000;
+    // Mint variant: spawn, census, REQ and mint come first (spawn_far measures
+    // that at a few seconds), then the fight.
+    static const unsigned long MINT_SPAWN_AT_MS      = 6000;
+    static const unsigned long MINT_FIGHT_AT_MS      = 14000;
+    static const unsigned long MINT_HOST_DURATION_MS = 56000;
+    static const unsigned long MINT_JOIN_DURATION_MS = 50000;
+    static const unsigned int  MAX_SQUAD             = 40;
+    static const unsigned int  ENEMY_N               = 4;
+    static const float         MINT_FIGHT_DIST;      // join attacks a mint this close
+
+    // Both sides, resident variant: the nearest upright bar NPC near our own
+    // leader (falling back to the peer leader's crowd - the save bakes it around
+    // the HOST leader), re-picked when the victim goes down. The order is a
+    // keep-alive: orderAttackByHand no-ops while the attacker is fighting.
+    void tickResident(const ScenarioContext& ctx) {
+        if (!haveOwn_ || ctx.elapsedMs < FIGHT_AT_MS) return;
+        if (haveVic_) {
+            Character* v = engine::resolveCharByHand(vic_[3], vic_[4], vic_[0],
+                                                     vic_[1], vic_[2]);
+            if (!v || bodyFlags(engine::readBodyState(v)) != 0) {
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO HPFIGHT victim down side=%s vic=%u,%u (re-picking)",
+                    ctx.isHost ? "host" : "join", vic_[3], vic_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                haveVic_ = false;
+            }
+        }
+        if (!haveVic_ && (lastPickMs_ == 0 || (ctx.elapsedMs - lastPickMs_) >= ORDER_EVERY_MS)) {
+            lastPickMs_ = ctx.elapsedMs;
+            haveVic_ = engine::pickCombatVictim(ctx.gw, ownHand_, 0, vic_, 0);
+            if (!haveVic_ && havePeer_)
+                haveVic_ = engine::pickCombatVictim(ctx.gw, peerHand_, 0, vic_, 0);
+            if (!haveVic_ && !pickFailLogged_) {
+                coop::logLine("SCENARIO HPFIGHT pick FAILED (no upright NPC; retrying)");
+                pickFailLogged_ = true;
+            }
+        }
+        if (haveVic_ && (lastOrderMs_ == 0 || (ctx.elapsedMs - lastOrderMs_) >= ORDER_EVERY_MS)) {
+            lastOrderMs_ = ctx.elapsedMs;
+            bool ok = engine::orderAttackByHand(ctx.gw, ownHand_, vic_);
+            noteIssued(ctx, vic_, vic_, ok);
+        }
+    }
+
+    // HOST, mint variant: spawn once, then keep the even-numbered enemies on our
+    // leader (both ways - it is a fight, not a beating) and the odd-numbered ones
+    // on the join's leader. A downed enemy hands its slot to the next upright one.
+    void tickMintHost(const ScenarioContext& ctx) {
+        if (!spawned_ && ctx.elapsedMs >= MINT_SPAWN_AT_MS) spawnEnemies(ctx);
+        if (!haveOwn_ || nEnemies_ == 0 || ctx.elapsedMs < MINT_FIGHT_AT_MS) return;
+        if (lastOrderMs_ != 0 && (ctx.elapsedMs - lastOrderMs_) < ORDER_EVERY_MS) return;
+        lastOrderMs_ = ctx.elapsedMs;
+        int mine = firstUprightEnemy(0);
+        if (mine >= 0) {
+            bool ok = engine::orderAttackByHand(ctx.gw, ownHand_, enemy_[mine]);
+            engine::orderAttackByHand(ctx.gw, enemy_[mine], ownHand_);
+            noteIssued(ctx, enemy_[mine], enemy_[mine], ok);
+        }
+        int theirs = havePeer_ ? firstUprightEnemy(1) : -1;
+        if (theirs >= 0) engine::orderAttackByHand(ctx.gw, enemy_[theirs], peerHand_);
+    }
+
+    // JOIN, mint variant: our leader attacks the nearest body the replicator
+    // MINTED (its local hand is what an order needs; the canonical one is what
+    // the host logs it by).
+    void tickMintJoin(const ScenarioContext& ctx) {
+        if (!haveOwn_ || !ctx.pickMintedProxy || ctx.elapsedMs < MINT_FIGHT_AT_MS) return;
+        if (lastOrderMs_ != 0 && (ctx.elapsedMs - lastOrderMs_) < ORDER_EVERY_MS) return;
+        lastOrderMs_ = ctx.elapsedMs;
+        unsigned int local[5], canon[5];
+        float d = 0.0f;
+        if (!ctx.pickMintedProxy(ownHand_, local, canon, &d)) {
+            if (!pickFailLogged_) {
+                coop::logLine("SCENARIO HPFIGHT pick FAILED (no minted body yet; retrying)");
+                pickFailLogged_ = true;
+            }
+            return;
+        }
+        if (d > MINT_FIGHT_DIST) return;
+        bool ok = engine::orderAttackByHand(ctx.gw, ownHand_, local);
+        noteIssued(ctx, local, canon, ok);
+    }
+
+    void spawnEnemies(const ScenarioContext& ctx) {
+        spawned_ = true;
+        static unsigned int hands[ENEMY_N][5];
+        nEnemies_ = engine::spawnRuntimeSquad(ctx.gw, ENEMY_N, hands);
+        for (unsigned int i = 0; i < nEnemies_; ++i)
+            for (int j = 0; j < 5; ++j) enemy_[i][j] = hands[i][j];
+        char b[96]; _snprintf(b, sizeof(b) - 1, "SCENARIO HPFIGHT spawned=%u/%u",
+                              nEnemies_, ENEMY_N);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // First upright enemy of the given parity (0 = ours, 1 = the peer's); -1 none.
+    int firstUprightEnemy(unsigned int parity) {
+        for (unsigned int i = parity; i < nEnemies_; i += 2) {
+            Character* c = engine::resolveCharByHand(enemy_[i][3], enemy_[i][4],
+                                                     enemy_[i][0], enemy_[i][1],
+                                                     enemy_[i][2]);
+            if (c && bodyFlags(engine::readBodyState(c)) == 0) return (int)i;
+        }
+        return -1;
+    }
+
+    // One "issued" marker per victim change (the keep-alive re-orders silently).
+    void noteIssued(const ScenarioContext& ctx, const unsigned int local[5],
+                    const unsigned int canon[5], bool ok) {
+        issued_ = true;
+        if (local[3] == lastVic_[3] && local[4] == lastVic_[4]) return;
+        for (int j = 0; j < 5; ++j) lastVic_[j] = local[j];
+        char b[192]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO HPFIGHT issued side=%s atk=%u,%u vic=%u,%u local=%u,%u ok=%d",
+            ctx.isHost ? "host" : "join", ownHand_[3], ownHand_[4],
+            canon[3], canon[4], local[3], local[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // One 2 Hz sample of a leader as THIS client sees it: the owner's own body
+    // (view=own) or our driven copy of the peer's (view=copy).
+    void logPc(const ScenarioContext& ctx, const unsigned int pc[5], bool ownerIsHost) {
+        const bool own = (ownerIsHost == ctx.isHost);
+        engine::CombatRead cr;
+        bool ok = engine::readCombatByHand(pc, &cr);
+        bool fight = ok && (cr.inCombat || cr.modeActive);
+        bool hasTgt = ok && cr.hasTarget;
+        unsigned int ct[5] = { 0, 0, 0, 0, 0 };
+        if (hasTgt) {
+            for (int j = 0; j < 5; ++j) ct[j] = cr.target[j];
+            if (ctx.replicaInfo) ctx.replicaInfo(cr.target, ct, 0, 0, 0, 0);
+        }
+        int reg = -1; unsigned int stask = 0; bool dest = false;
+        if (!own && ctx.replicaInfo) {
+            unsigned int canon[5], subj[5];
+            ctx.replicaInfo(pc, canon, &reg, &stask, subj, &dest);
+        }
+        char b[256]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO HPFIGHT pc=%u,%u owner=%s view=%s fight=%d wait=%d sw=%d "
+            "tgt=%u,%u ctgt=%u,%u reg=%s stask=%u dest=%d",
+            pc[3], pc[4], ownerIsHost ? "host" : "join", own ? "own" : "copy",
+            fight ? 1 : 0, (ok && cr.waiting) ? 1 : 0, ok ? cr.swordState : -1,
+            hasTgt ? cr.target[3] : 0, hasTgt ? cr.target[4] : 0, ct[3], ct[4],
+            own ? "own" : (reg < 0 ? "undriven" : devRegimeName(reg)),
+            stask, dest ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchLeaders(const ScenarioContext& ctx) {
+        const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        if (!haveOwn_) {
+            int idx = tabLeaderIdx(sq, n, ownRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], ownHand_);
+                haveOwn_ = true;
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO HPFIGHT own rank=%u hand=%u,%u",
+                    ownRank, ownHand_[3], ownHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!havePeer_) {
+            int idx = tabLeaderIdx(sq, n, ownRank == 0u ? 1u : 0u);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], peerHand_);
+                havePeer_ = true;
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO HPFIGHT peer rank=%u hand=%u,%u",
+                    ownRank == 0u ? 1u : 0u, peerHand_[3], peerHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    const bool    mint_;
+    bool          haveOwn_;
+    bool          havePeer_;
+    bool          haveVic_;
+    bool          issued_;
+    bool          pickFailLogged_;
+    bool          spawned_;
+    unsigned int  nEnemies_;
+    unsigned long lastOrderMs_;
+    unsigned long lastPickMs_;
+    unsigned int  ownHand_[5];
+    unsigned int  peerHand_[5];
+    unsigned int  vic_[5];
+    unsigned int  lastVic_[5];
+    unsigned int  enemy_[ENEMY_N][5];
+};
+
+// Close enough that the proxy is live and visible on the join (inside the stream
+// bubble), well inside any plausible aggro radius.
+const float HostPcFightScenario::MINT_FIGHT_DIST = 40.0f;
+
 } // namespace
 
 Scenario* makeCombatScenario(const std::string& name) {
@@ -2204,6 +2471,8 @@ Scenario* makeCombatScenario(const std::string& name) {
     if (name == "combat_battle") return new CombatBattleScenario();
     if (name == "combat_win")    return new CombatWinScenario();
     if (name == "pc_assault")   return new PcAssaultScenario();
+    if (name == "host_pc_fight")      return new HostPcFightScenario(false);
+    if (name == "host_pc_fight_mint") return new HostPcFightScenario(true);
     return 0;
 }
 

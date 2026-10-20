@@ -1998,6 +1998,32 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
+        # host_pc_fight: the 2026-10 Workshop report (a player fought a Shek; on
+        # the friend's screen that player's character stood still). Every other
+        # combat scenario has the JOIN's PC attack or has a PC as the victim; here
+        # BOTH leaders attack at once, so each client owns one fight and renders
+        # the other. Save-resident victims (bar NPCs): the viewer's combat detach
+        # re-keys them locally, so the copy's local target never equals the wire
+        # key. Test-HostPcFight gates, per direction, that the viewer's copy of a
+        # fighting PC fights the SAME body (canonical key) for most of the owner's
+        # fight samples and that no unresolved-target (r=1) order storm happened.
+        host_pc_fight = @{
+            Save = 'sync'; Setup = ''; Tolerance = 20.0
+            PrimaryGate = 'host_pc_fight'
+            Gating   = @('host_pc_fight', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        # host_pc_fight_mint: the same two-way fight against a host RUNTIME spawn
+        # (combat_win's setup): the join has to MINT the enemies, so the host PC's
+        # streamed target is a hand that never resolves on the join.
+        host_pc_fight_mint = @{
+            Save = 'sync'; Setup = ''; Tolerance = 20.0
+            PrimaryGate = 'host_pc_fight_mint'
+            Gating   = @('host_pc_fight_mint', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'existence_parity')
+            Tier = 'full'; WanVariant = $false
+        }
 
         # ---- inventory ---------------------------------------------------------------
         inv_order = @{

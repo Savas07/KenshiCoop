@@ -37,6 +37,13 @@ struct ScenarioContext {
     bool        (*pickMintedProxy)(const unsigned int refHand[5],
                                    unsigned int outLocal[5],
                                    unsigned int outCanon[5], float* outDist);
+    // host_pc_fight: Replicator::scenarioReplicaInfo through the same kind of
+    // adapter - the canonical (wire) key of the body at a local hand plus its
+    // copy's drive state (regime DevRegime or -1, newest streamed task/subject,
+    // outstanding walk destination). 0 when unavailable - always check.
+    bool        (*replicaInfo)(const unsigned int localHand[5], unsigned int outCanon[5],
+                               int* outRegime, unsigned int* outTask,
+                               unsigned int outSubj[5], bool* outDest);
 };
 
 class Scenario {

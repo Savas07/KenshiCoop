@@ -1466,3 +1466,126 @@ function Test-PcAssault {
     Write-Host ("  PC-ASSAULT PASS - atk=$atk hit-hand=$hitHand cap=$capAll host-orders=$ordOk hostview-fight=$fight; join-dealt authoritative damage flesh=$($m.hitFlesh)/blood=$($m.hitBlood) (x$hitCount reports) streamed to join drop=$($m.joinDrop) (end-gap $($m.endGap)); cohesion joinOnlyFrac=$joinOnlyFrac (finding)")
     return (Add-GateResult -Name "pc_assault" -Status PASS -Metrics $m)
 }
+
+# host_pc_fight / host_pc_fight_mint (2026-10 Workshop report: a player fought a
+# Shek and, on the friend's screen, that player's character stood still). Both
+# leaders fight at once and every 500 ms each client logs BOTH leaders as it sees
+# them: "SCENARIO HPFIGHT pc=<i,s> owner=<host|join> view=<own|copy> fight= wait=
+# sw= tgt= ctgt= reg= stask= dest=". Judged per DIRECTION - host->join (the join's
+# copy of the fighting host PC: the report) and join->host (the host's copy of the
+# join PC) - over the OWNER's fight samples inside the viewer's sampling span:
+#   0. mint   - (-RequireMint) the join minted the enemies (proxy BOUND)
+#   1. setup  - the owner really fought: >= MinOwnerFight samples, fight=1 + target
+#   2. fight  - the viewer's copy (nearest sample within TolMs) fights the SAME
+#               body - ctgt is the canonical key, so a re-keyed or minted target
+#               still compares - in >= MinRightFrac of the owner's fight samples.
+#               Any owner target within TgtTolMs counts (retarget latency).
+#   3. resolve- the viewer issued <= MaxUnresolved "[combat] order hand=<pc> ...
+#               r=1" (the streamed target never resolved there: an order storm
+#               that leaves the copy un-ordered)
+# Metrics also carry the copy's walk share (dest=1 while its owner fights), its
+# order count and wrong-target snaps - the churn that cancels the attack.
+function Test-HostPcFight {
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = 'host_pc_fight',
+          [switch]$RequireMint, [int]$MinOwnerFight = 6, [double]$MinRightFrac = 0.75,
+          [int]$MaxUnresolved = 2, [int]$TolMs = 1000, [int]$TgtTolMs = 2000)
+    $label = $GateName.ToUpper().Replace('_', '-')
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name $GateName -Status FAIL -Detail "missing log")
+    }
+    $rx = ('\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO HPFIGHT pc=(\d+,\d+) owner=(host|join) ' +
+           'view=(own|copy) fight=(\d) wait=(\d) sw=(-?\d+) tgt=(\d+,\d+) ctgt=(\d+,\d+) ' +
+           'reg=(\w+) stask=(\d+) dest=(\d)')
+    $read = {
+        param([string]$File)
+        $off = Get-LogClockOffsetMs -File $File
+        $out = New-Object System.Collections.ArrayList
+        foreach ($mm in (Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+            $g = $mm.Matches[0].Groups
+            [void]$out.Add([pscustomobject]@{
+                t = (Convert-StampToMs -Groups $g -OffsetMs $off); pc = $g[5].Value
+                owner = $g[6].Value; view = $g[7].Value; fight = [int]$g[8].Value
+                ctgt = $g[12].Value; reg = $g[13].Value; stask = [int]$g[14].Value
+                dest = [int]$g[15].Value })
+        }
+        return ,$out
+    }
+    $hostRows = & $read $HostFile
+    $joinRows = & $read $JoinFile
+    $minted = @(Select-String -Path $JoinFile -Pattern '\[spawn\] proxy BOUND hand=' -ErrorAction SilentlyContinue).Count
+
+    $dirs = @(
+        @{ tag = 'hostToJoin'; owner = 'host'; ownRows = $hostRows; viewRows = $joinRows; viewFile = $JoinFile },
+        @{ tag = 'joinToHost'; owner = 'join'; ownRows = $joinRows; viewRows = $hostRows; viewFile = $HostFile }
+    )
+    $m = @{ minted = $minted }
+    $bad = @()
+    $summary = @()
+    foreach ($d in $dirs) {
+        $t = $d.tag
+        $own  = @($d.ownRows  | Where-Object { $_.owner -eq $d.owner -and $_.view -eq 'own' } | Sort-Object t)
+        $copy = @($d.viewRows | Where-Object { $_.owner -eq $d.owner -and $_.view -eq 'copy' } | Sort-Object t)
+        $pc = if ($own.Count -gt 0) { $own[0].pc } elseif ($copy.Count -gt 0) { $copy[0].pc } else { '' }
+        $fightOwn = @($own | Where-Object { $_.fight -eq 1 -and $_.ctgt -ne '0,0' })
+        if ($copy.Count -gt 0) {
+            $lo = [int]$copy[0].t - $TolMs; $hi = [int]$copy[-1].t + $TolMs
+            $fightOwn = @($fightOwn | Where-Object { $_.t -ge $lo -and $_.t -le $hi })
+        } else {
+            $fightOwn = @()
+        }
+        $pairs = 0; $copyFight = 0; $right = 0; $walk = 0; $streamed = 0; $combatReg = 0
+        foreach ($o in $fightOwn) {
+            $best = $null; $bd = [int]::MaxValue
+            foreach ($v in $copy) {
+                $dd = [Math]::Abs([int]$v.t - [int]$o.t)
+                if ($dd -lt $bd) { $bd = $dd; $best = $v }
+            }
+            if ($null -eq $best -or $bd -gt $TolMs) { continue }
+            $pairs++
+            if ($best.dest -eq 1) { $walk++ }
+            if ($best.stask -eq 65024 -or $best.stask -eq 65025) { $streamed++ }
+            if ($best.reg -eq 'combat') { $combatReg++ }
+            if ($best.fight -ne 1) { continue }
+            $copyFight++
+            $want = @($fightOwn | Where-Object { [Math]::Abs([int]$_.t - [int]$best.t) -le $TgtTolMs } |
+                      ForEach-Object { $_.ctgt })
+            if ($want -contains $best.ctgt) { $right++ }
+        }
+        $n = $fightOwn.Count
+        $rightFrac = if ($n -gt 0) { [Math]::Round($right / $n, 3) } else { 0 }
+        $fightFrac = if ($n -gt 0) { [Math]::Round($copyFight / $n, 3) } else { 0 }
+        $walkFrac  = if ($n -gt 0) { [Math]::Round($walk / $n, 3) } else { 0 }
+        $orders = 0; $unresolved = 0; $wrongSnaps = 0
+        if ($pc -ne '') {
+            $orders     = @(Select-String -Path $d.viewFile -Pattern ('\[combat\] order hand=' + $pc + ' ') -ErrorAction SilentlyContinue).Count
+            $unresolved = @(Select-String -Path $d.viewFile -Pattern ('\[combat\] order hand=' + $pc + ' tgt=\d+,\d+ localFight=\d r=1 ') -ErrorAction SilentlyContinue).Count
+            $wrongSnaps = @(Select-String -Path $d.viewFile -Pattern ('\[combat\] snap hand=' + $pc + ' .*wrongTgt=1') -ErrorAction SilentlyContinue).Count
+        }
+        $m["${t}Pc"] = $pc; $m["${t}OwnerFight"] = $n; $m["${t}Pairs"] = $pairs
+        $m["${t}CopyFightFrac"] = $fightFrac; $m["${t}RightFrac"] = $rightFrac
+        $m["${t}WalkFrac"] = $walkFrac; $m["${t}Streamed"] = $streamed; $m["${t}CombatRegime"] = $combatReg
+        $m["${t}Orders"] = $orders; $m["${t}Unresolved"] = $unresolved; $m["${t}WrongTgtSnaps"] = $wrongSnaps
+        $summary += ("${t} pc=$pc ownerFight=$n pairs=$pairs copyFight=$fightFrac right=$rightFrac " +
+                     "walk=$walkFrac streamed=$streamed regCombat=$combatReg orders=$orders r1=$unresolved wrongSnaps=$wrongSnaps")
+        if ($n -lt $MinOwnerFight) {
+            $bad += "${t}: the owner of $pc fought in only $n sample(s) inside the viewer's window (need >= $MinOwnerFight; link 1: setup)"
+            continue
+        }
+        if ($rightFrac -lt $MinRightFrac) {
+            $bad += ("${t}: the viewer's copy of $pc fought the owner's target in only $right/$n owner-fight samples " +
+                     "($rightFrac < $MinRightFrac; copy fighting at all $fightFrac, walking $walkFrac; link 2: fight)")
+        }
+        if ($unresolved -gt $MaxUnresolved) {
+            $bad += "${t}: $unresolved unresolved-target orders (r=1) for $pc on the viewer (max $MaxUnresolved; link 3: resolve)"
+        }
+    }
+    if ($RequireMint -and $minted -lt 1) {
+        $bad += "the join minted no proxy (no [spawn] proxy BOUND; link 0: the run did not reproduce the runtime-spawn setup)"
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  $label FAIL - " + ($bad -join "; ") + " [" + ($summary -join " | ") + "]")
+        return (Add-GateResult -Name $GateName -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  $label PASS - " + ($summary -join " | ") + " minted=$minted")
+    return (Add-GateResult -Name $GateName -Status PASS -Metrics $m)
+}

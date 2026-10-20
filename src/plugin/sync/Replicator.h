@@ -134,6 +134,19 @@ public:
                              unsigned int outLocal[5], unsigned int outCanon[5],
                              float* outDist) const;
 
+    // Scenario support (host_pc_fight): what THIS client's replicator knows about
+    // the body at a LOCAL hand, so a scenario can compare one fight across the two
+    // logs. outCanon = the key the peer streams the body by (canonicalOf_: a
+    // minted proxy or a combat-detached, re-keyed NPC has a local hand the peer
+    // never heard of), the local hand itself when we do not drive it.
+    // outRegime = DevRegime of the copy's drive this tick (-1 = not a driven
+    // body). outTask/outSubj = the newest streamed task and its subject (wire
+    // key). outDest = a drive walk/slide destination is outstanding. Read-only;
+    // false when the hand does not resolve here. readObjectHand layout.
+    bool scenarioReplicaInfo(const unsigned int localHand[5], unsigned int outCanon[5],
+                             int* outRegime, unsigned int* outTask,
+                             unsigned int outSubj[5], bool* outDest) const;
+
     // AI-gating probe (join side): recruit diverged NPCs into the player squad to
     // validate the "inhabit" lever (stops self-tasking + becomes drivable).
     void setProbeRecruit(bool v) { probeRecruit_ = v; }
