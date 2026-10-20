@@ -1306,6 +1306,22 @@ unsigned int damageGuardCount();
 // bodies AND the hook stopped them).
 void         damageGuardStats(unsigned long* outGuarded, unsigned long* outPassed);
 
+// Machine work detours: <Building>::operate for the production, crafting, farm,
+// research and furnace overrides (the per-frame work call a body's
+// OPERATE_MACHINERY action makes on the machine it is posed at). Logs who
+// worked which machine (`[prod] operate ...`, ~5 s aggregate per worker/machine
+// pair), every whole-unit output crossing (`[prod] operate CROSS ...`) and, in
+// mirror mode, the skipped work (`[prod] operate MIRROR ...`, throttled).
+// Returns the number of overrides hooked (5 when all resolved).
+int          installMachineOperateHooks();
+// Mirror mode (the JOIN while protocol 33 runs): machine output is simulated
+// once, on the host. Local work is skipped for a worker this client DRIVES (its
+// owner's sim works it) and on any machine the host is mirroring (marked by
+// markMachineMirrored from each applied/converged protocol-33 row; the mark
+// lapses ttlMs later, after which local work resumes for an unmirrored machine).
+void         setMachineWorkMirror(bool on);
+void         markMachineMirrored(const unsigned int hand[5], unsigned long ttlMs);
+
 // ---- Join-dealt authoritative damage report (protocol 45) -------------------
 // The damage guard suppresses the join PC's melee on driven NPC copies (cosmetic
 // medical model), but those hits must still WOUND the real NPC on the host. When

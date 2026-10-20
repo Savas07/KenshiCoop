@@ -1279,6 +1279,151 @@ HitMaterialType __fastcall hitByMelee_hook(Character* self, CutDirection dir,
     return g_hitByMeleeOrig(self, dir, damage, who, attack, comboID);
 }
 
+// ---- Machine work detours (2026-10-20: co-op mining yielded 2-3 ore per 1) ----
+// <Building>::operate(Character* who, float amount) is the per-frame work entry
+// a body's OPERATE_MACHINERY action calls on the machine it is posed at - the
+// same non-virtual addresses operateMachineByHand dispatches through. Since
+// protocol 55 a peer's driven copy is posed on the same machine as its owner, so
+// BOTH clients advanced the machine for one worker and each minted the output
+// into its own copy of the machine container: the join's surplus then crossed to
+// the owner as transfer intents the host could only satisfy by fabricating.
+//
+// Machine output is host-simulated (protocols 33/34 already make the host the
+// author of every machine's buffers and contents), so the JOIN ("mirror" mode)
+// skips the work call when either
+//   * the worker is a body it drives - the peer simulates that worker (the host
+//     for its own squad and every world NPC, and its copy of another join's
+//     worker), or
+//   * the host is mirroring this machine - a protocol-33 row resolved to it
+//     recently - so the host's copy of OUR worker, posed on the host's instance
+//     of the same machine, is the one that produces; the result reaches us
+//     through the buffer rows and the container census.
+// A machine the host does not mirror (outside its census) keeps local work, so
+// a join miner far from the host still produces - once, here.
+// The animation is untouched: only the work call is skipped. The observation
+// half logs who worked what (aggregated, ~5 s per worker/machine pair) plus
+// every whole-unit output crossing, so a run shows which sim produced each unit.
+namespace {
+MachOperateFn g_opOrigProd     = 0;
+MachOperateFn g_opOrigCraft    = 0;
+MachOperateFn g_opOrigFarm     = 0;
+MachOperateFn g_opOrigResearch = 0;
+MachOperateFn g_opOrigFurnace  = 0;
+
+bool g_opMirror = false;                               // join + prodSync
+std::map<Building*, unsigned long> g_opMirrored;       // machine -> mirrored-until (tick ms)
+std::map<Building*, unsigned long> g_opMirrorLogMs;    // per-machine skip log throttle
+
+struct OpAgg {
+    unsigned long calls, skipped, sinceMs;
+    float sum;
+    OpAgg() : calls(0), skipped(0), sinceMs(0), sum(0.0f) {}
+};
+std::map<std::pair<Building*, Character*>, OpAgg> g_opAgg;
+
+// Output buffer amount (whole stack + fractional progress), or -1 when the
+// machine has none (research, a not-yet-materialised buffer). SEH: 'self' is
+// the engine's own live object, but a torn buffer must never fault the tick.
+float opOutAmount(Building* b) {
+    __try {
+        int ct = (int)b->classType;
+        if (ct != (int)BCTYPE_PRODUCTION && ct != (int)BCTYPE_CRAFTING &&
+            ct != (int)BCTYPE_ITEM_FURNACE && ct != (int)BCTYPE_FARM)
+            return -1.0f;
+        StorageBuilding::ConsumptionItem* ci =
+            static_cast<ProductionBuilding*>(b)->productionItem;
+        return ci ? ci->amount : -1.0f;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1.0f; }
+}
+
+bool opIsDriven(Character* who) {
+    return (!g_damageGuarded.empty() && g_damageGuarded.count(who) != 0) ||
+           (!g_aiSuspended.empty() && g_aiSuspended.count(who) != 0);
+}
+
+void opLog(const char* kind, Building* self, Character* who, int driven,
+           float before, float after, const OpAgg* agg) {
+    unsigned int mh[5] = { 0, 0, 0, 0, 0 }, wh[5] = { 0, 0, 0, 0, 0 };
+    readObjectHand(static_cast<RootObject*>(self), mh);
+    if (who) readObjectHand(static_cast<RootObject*>(who), wh);
+    char b[256];
+    if (agg)
+        _snprintf(b, sizeof(b) - 1,
+                  "[prod] operate mach=%u.%u.%u.%u.%u who=%u,%u driven=%d calls=%lu "
+                  "sum=%.4f skipped=%lu out=%.3f",
+                  mh[0], mh[1], mh[2], mh[3], mh[4], wh[3], wh[4], driven,
+                  agg->calls, agg->sum, agg->skipped, after);
+    else
+        _snprintf(b, sizeof(b) - 1,
+                  "[prod] operate %s mach=%u.%u.%u.%u.%u who=%u,%u driven=%d "
+                  "out=%.3f->%.3f",
+                  kind, mh[0], mh[1], mh[2], mh[3], mh[4], wh[3], wh[4], driven,
+                  before, after);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+bool opHostSimulates(Building* self, unsigned long now) {
+    if (g_opMirrored.empty()) return false;
+    std::map<Building*, unsigned long>::iterator it = g_opMirrored.find(self);
+    if (it == g_opMirrored.end()) return false;
+    if ((long)(it->second - now) > 0) return true;
+    g_opMirrored.erase(it); // lapsed: the host stopped reporting this machine
+    return false;
+}
+
+void operateCommon(MachOperateFn orig, Building* self, Character* who, float amount) {
+    int driven = (who && opIsDriven(who)) ? 1 : 0;
+    unsigned long now = GetTickCount();
+    bool skip = g_opMirror && (driven || opHostSimulates(self, now));
+    float before = opOutAmount(self);
+    if (skip && who) {
+        unsigned long& last = g_opMirrorLogMs[self];
+        if (last == 0 || now - last >= 30000) {
+            last = now;
+            opLog("MIRROR", self, who, driven, before, before, 0);
+        }
+    }
+    if (!skip) orig(self, who, amount);
+    float after = skip ? before : opOutAmount(self);
+    // A whole unit left the buffer (amount wrapped down) or a whole stack was
+    // added (the floor rose): either way one unit of output was minted here.
+    if (before >= 0.0f && after >= 0.0f &&
+        (after < before - 0.0001f || (int)after > (int)before))
+        opLog("CROSS", self, who, driven, before, after, 0);
+    // The building's own per-frame self-call (who == null: every complete
+    // machine, worked or not - 26 nodes around mine1) is gated the same way but
+    // not aggregated; the per-worker rows are the evidence worth a log line.
+    if (!who) return;
+    OpAgg& a = g_opAgg[std::make_pair(self, who)];
+    if (a.sinceMs == 0) a.sinceMs = now;
+    ++a.calls;
+    if (skip) ++a.skipped; else a.sum += amount;
+    if (now - a.sinceMs >= 5000) {
+        opLog("", self, who, driven, before, after, &a);
+        a = OpAgg();
+        a.sinceMs = now;
+    }
+    if (g_opAgg.size() > 256) g_opAgg.clear(); // bounded: stale pairs age out
+    if (g_opMirrorLogMs.size() > 256) g_opMirrorLogMs.clear();
+}
+} // namespace
+
+void __fastcall operateProd_hook(Building* self, Character* who, float amount) {
+    operateCommon(g_opOrigProd, self, who, amount);
+}
+void __fastcall operateCraft_hook(Building* self, Character* who, float amount) {
+    operateCommon(g_opOrigCraft, self, who, amount);
+}
+void __fastcall operateFarm_hook(Building* self, Character* who, float amount) {
+    operateCommon(g_opOrigFarm, self, who, amount);
+}
+void __fastcall operateResearch_hook(Building* self, Character* who, float amount) {
+    operateCommon(g_opOrigResearch, self, who, amount);
+}
+void __fastcall operateFurnace_hook(Building* self, Character* who, float amount) {
+    operateCommon(g_opOrigFurnace, self, who, amount);
+}
+
 // Test-scene spawning. createRandomCharacter / createBuilding take Vector3 (and
 // Quaternion) BY VALUE; declaring the typedef with the exact by-value signature
 // lets the compiler emit the correct x64 ABI (large structs passed by hidden
@@ -2172,6 +2317,44 @@ bool installDamageGuardHook() {
     if (!addr) return false;
     return KenshiLib::AddHook(addr, (void*)&hitByMelee_hook,
                               (void**)&g_hitByMeleeOrig) == KenshiLib::SUCCESS;
+}
+
+namespace {
+// FurnaceBuilding::operate is declared protected; naming it through a derived
+// class is the standard-conforming way to take its address.
+struct FurnaceOperateAccess : public FurnaceBuilding {
+    static intptr_t addr() {
+        return KenshiLib::GetRealAddress(&FurnaceOperateAccess::_NV_operate);
+    }
+};
+bool hookOperate(intptr_t addr, void* detour, MachOperateFn* orig) {
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, detour, (void**)orig) == KenshiLib::SUCCESS;
+}
+} // namespace
+
+int installMachineOperateHooks() {
+    int ok = 0;
+    if (hookOperate(KenshiLib::GetRealAddress(&ProductionBuilding::_NV_operate),
+                    (void*)&operateProd_hook, &g_opOrigProd)) ++ok;
+    if (hookOperate(KenshiLib::GetRealAddress(&CraftingBuilding::_NV_operate),
+                    (void*)&operateCraft_hook, &g_opOrigCraft)) ++ok;
+    if (hookOperate(KenshiLib::GetRealAddress(&FarmBuilding::_NV_operate),
+                    (void*)&operateFarm_hook, &g_opOrigFarm)) ++ok;
+    if (hookOperate(KenshiLib::GetRealAddress(&ResearchBuilding::_NV_operate),
+                    (void*)&operateResearch_hook, &g_opOrigResearch)) ++ok;
+    if (hookOperate(FurnaceOperateAccess::addr(),
+                    (void*)&operateFurnace_hook, &g_opOrigFurnace)) ++ok;
+    return ok;
+}
+
+void setMachineWorkMirror(bool on) { g_opMirror = on; if (!on) g_opMirrored.clear(); }
+
+void markMachineMirrored(const unsigned int hand[5], unsigned long ttlMs) {
+    RootObject* ro = resolveObjectByHand(hand);
+    if (!ro) return;
+    g_opMirrored[static_cast<Building*>(ro)] = GetTickCount() + ttlMs;
+    if (g_opMirrored.size() > 512) g_opMirrored.clear(); // bounded; rows re-mark within a resend
 }
 
 bool installShopHook() {

@@ -73,6 +73,7 @@
 #include <kenshi/Building/CraftingBuilding.h>  // CraftingBuilding::operate override (protocol 33)
 #include <kenshi/Building/GeneratorBuilding.h> // GeneratorBuilding::getPowerOutput override (protocol 33)
 #include <kenshi/Building/ResearchBuilding.h>  // ResearchBuilding tech-level evidence (protocol 33)
+#include <kenshi/Building/FurnaceBuilding.h>   // FurnaceBuilding::operate override (machine work gate)
 #include <kenshi/Town.h>            // Town player-base state (protocol 54 deeds)
 #include <kenshi/ShopTrader.h>      // ShopTrader (vendor stock, protocol 22)
 #include <kenshi/Globals.h>         // gui (ForgottenGUI*, KenshiLib data export)
