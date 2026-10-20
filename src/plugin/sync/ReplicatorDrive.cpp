@@ -2914,6 +2914,35 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
         // it (manual test 2026-07-17). The wake-and-move desync is handled by the
         // bed fast-exit in applyTargets (Fix A), so no re-sleep guard is needed
         // here - the driven copy follows the host the instant it moves.
+        //
+        // Lapsed machine pose (TASK_LAPSE_MS): the copy went idle locally while
+        // the owner still streams machine work (its own action dropped when this
+        // client's machine finished a craft or filled). Only the host sim runs
+        // machine work, so an idle copy produces nothing for its owner. Re-arm
+        // the order; the next tick re-applies it through the block above.
+        if (engine::isMachineWorkTask((int)out.task) && (now - d.taskTick) > TASK_GRACE_MS) {
+            if (engine::readTaskKey(c) == (int)TASK_NONE) {
+                unsigned int sh = d.taskLapses < TASK_LAPSE_BACKOFF_MAX
+                                      ? d.taskLapses : TASK_LAPSE_BACKOFF_MAX;
+                if (d.taskLapseTick == 0) d.taskLapseTick = now;
+                else if ((now - d.taskLapseTick) >= (TASK_LAPSE_MS << sh)) {
+                    ++d.taskLapses;
+                    { char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[pose] lapse re-pose hand=%u,%u task=%u idle=%lums n=%u",
+                        out.hIndex, out.hSerial, (unsigned)out.task,
+                        now - d.taskLapseTick, d.taskLapses);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                    d.taskLapseTick = 0;
+                    d.taskApplied = false;
+                    d.taskRetries = 0;
+                }
+            } else {
+                d.taskLapseTick = 0;
+                d.taskLapses = 0; // working again: next lapse starts unthrottled
+            }
+        } else {
+            d.taskLapseTick = 0;
+        }
         return;
     }
     // Fallback (no task / fixture missing / drifted): quiet the AI and hold the

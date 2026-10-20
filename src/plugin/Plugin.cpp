@@ -2750,6 +2750,10 @@ void startNetworking() {
         g_net.setIdentity(idb);
     }
     g_repl.setHostRole(g_cfg.isHost);
+    // Machine output is host-simulated: the join skips local machine work the
+    // host already does (see engine::setMachineWorkMirror). Set here, not at
+    // configure time, because the in-game panel picks the role at connect.
+    coop::engine::setMachineWorkMirror(g_cfg.prodSync && !g_cfg.isHost);
 
     bool ok;
     if (g_cfg.isHost) {
@@ -2824,6 +2828,7 @@ void coopUiDisconnect() {
     // World stays live on a manual disconnect: despawn minted proxies before
     // clearing maps so nothing lingers as a duplicate or gets baked into a save.
     sessionResetForUi();
+    coop::engine::setMachineWorkMirror(false); // solo again: every machine works locally
     applyHostRanks(); // solo again: the host controls every squad
 }
 
@@ -3172,6 +3177,16 @@ void installEngineDetours() {
     g_repl.setResearchSync(g_cfg.researchSync);
     g_repl.setDeedSync(g_cfg.deedSync);
     g_repl.setFixtureSync(g_cfg.fixtureSync);
+    // Machine work detours (the operate() entry a body's OPERATE_MACHINERY
+    // action calls each frame). Ride the protocol-33 gate: they exist to keep
+    // machine output single-sourced while machines are replicated.
+    if (g_cfg.prodSync) {
+        int n = coop::engine::installMachineOperateHooks();
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[prod] operate detours installed %d/2", n);
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
+    }
     // Protocol 34: the HOST authors every storage/machine container near the
     // interest centers (the ~1 Hz census inside publishInventories); the join
     // reconciles via the translated key. Host-only flag - the join must never

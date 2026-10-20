@@ -1358,18 +1358,56 @@ bool operateMachineByHand(GameWorld* gw, const unsigned int mHand[5], float amou
 // crafting bench (BCTYPE_CRAFTING, has input/output buffers), kind 2 =
 // storage container (BCTYPE_STORAGE - protocol 34's chest subject), kind 3 =
 // research bench (BCTYPE_RESEARCH - spike 401's subject; NOT reachable through
-// findMachineTemplate, whose preference order tops out at training dummies). `skip`
+// findMachineTemplate, whose preference order tops out at training dummies), kind 4
+// = a crafting bench whose jobs need no blueprint (bench_yield_join). `skip`
 // selects the skip-th DISTINCT candidate in preference order: a template's
 // NAME does not reveal its BuildingClassType (run-170508: the first
 // "general storage" match placed as a non-STORAGE class), so the kind-2
 // caller places candidates in turn and verifies the LIVE building's class,
 // destroying rejects. All candidates buildable anywhere - drills/farms need
 // terrain resources so the probe never spawns them. Caller holds SEH.
+//
+// Candidates are matched on the template STRINGID first and on the English
+// display NAME only as a fallback: Kenshi localises GameData::name, so on a
+// non-English install (the harness copies run Turkish) every name test missed
+// and prod_sync / store_sync placed nothing ("probe-place kind=0 no template").
+// The sids are the gamedata.base BUILDING records the English name lists used
+// to land on (Wind Generator, Chain/Leather Armour Crafting Bench, Storage
+// Chest, Small Research Bench, ...), in the same preference order. The first
+// call also logs every BUILDING template's stringID + name once.
 static GameData* findProdTemplate(GameWorld* gw, int kind, int skip) {
     if (!gw || !g_getDataOfTypeFn) return 0;
     g_dataScratch.clear();
     g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
     unsigned int n = g_dataScratch.size();
+    static bool dumped = false;
+    if (!dumped) {
+        dumped = true;
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (!gd) continue;
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "[prod] template sid='%s' name='%s'",
+                      gd->stringID.c_str(), gd->name.c_str());
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    const char* genSids[]    = { "1999-gamedata.base", "1976-gamedata.base",
+                                 "1977-gamedata.base", "1978-gamedata.base",
+                                 "1854-gamedata.base" };
+    const char* craftSids[]  = { "2299-gamedata.base", "2262-gamedata.base",
+                                 "2033-gamedata.base", "2102-gamedata.base",
+                                 "2105-gamedata.base" };
+    // Chests are BCTYPE_USABLE (f5_store: 1459/879 REJECT class=2); the
+    // item-specific "Storage: ..." boxes are the STORAGE-class candidates.
+    const char* storeSids[]  = { "2940-gamedata.base", "2944-gamedata.base",
+                                 "2941-gamedata.base", "2942-gamedata.base",
+                                 "870-gamedata.base",  "1459-gamedata.base" };
+    const char* resSids[]    = { "1875-gamedata.base", "2006-gamedata.base" };
+    // kind 4 (bench_yield_join): a bench whose jobs need no blueprint - the
+    // first-aid desks craft from fabrics alone; the clothing bench is the backup.
+    const char* yieldSids[]  = { "1966-gamedata.base", "2267-gamedata.base",
+                                 "2929-gamedata.base" };
     const char* genPrefs[]   = { "small wind generator", "wind generator",
                                  "small generator", "generator" };
     const char* craftPrefs[] = { "armour crafting bench", "weapon smithing bench",
@@ -1378,24 +1416,35 @@ static GameData* findProdTemplate(GameWorld* gw, int kind, int skip) {
                                  "chest", "storage" };
     const char* resPrefs[]   = { "small research bench", "research bench",
                                  "research" };
+    const char* yieldPrefs[] = { "basic medical assembly desk", "medical assembly desk",
+                                 "clothing bench" };
+    const char** sids;
     const char** prefs;
-    unsigned int nPrefs;
-    if (kind == 0)      { prefs = genPrefs;   nPrefs = 4; }
-    else if (kind == 2) { prefs = storePrefs; nPrefs = 5; }
-    else if (kind == 3) { prefs = resPrefs;   nPrefs = 3; }
-    else                { prefs = craftPrefs; nPrefs = 4; }
-    GameData* seen[16];
+    unsigned int nSids, nPrefs;
+    if (kind == 0)      { sids = genSids;   nSids = 5; prefs = genPrefs;   nPrefs = 4; }
+    else if (kind == 2) { sids = storeSids; nSids = 6; prefs = storePrefs; nPrefs = 5; }
+    else if (kind == 3) { sids = resSids;   nSids = 2; prefs = resPrefs;   nPrefs = 3; }
+    else if (kind == 4) { sids = yieldSids; nSids = 3; prefs = yieldPrefs; nPrefs = 3; }
+    else                { sids = craftSids; nSids = 5; prefs = craftPrefs; nPrefs = 4; }
+    GameData* seen[32];
     unsigned int nSeen = 0;
-    for (unsigned int k = 0; k < nPrefs; ++k) {
-        for (unsigned int i = 0; i < n; ++i) {
-            GameData* gd = g_dataScratch[i];
-            if (!gd || !ciContains(gd->name.c_str(), prefs[k])) continue;
-            bool dup = false; // a name can match several prefs
-            for (unsigned int s = 0; s < nSeen; ++s)
-                if (seen[s] == gd) { dup = true; break; }
-            if (dup) continue;
-            if ((int)nSeen == skip) return gd;
-            if (nSeen < 16) seen[nSeen++] = gd;
+    // Pass 0: stringID, exact. Pass 1: English name substring (fallback).
+    for (int pass = 0; pass < 2; ++pass) {
+        unsigned int nk = (pass == 0) ? nSids : nPrefs;
+        for (unsigned int k = 0; k < nk; ++k) {
+            for (unsigned int i = 0; i < n; ++i) {
+                GameData* gd = g_dataScratch[i];
+                if (!gd) continue;
+                bool hit = (pass == 0) ? (gd->stringID == sids[k])
+                                       : ciContains(gd->name.c_str(), prefs[k]);
+                if (!hit) continue;
+                bool dup = false; // a template can match several entries
+                for (unsigned int s = 0; s < nSeen; ++s)
+                    if (seen[s] == gd) { dup = true; break; }
+                if (dup) continue;
+                if ((int)nSeen == skip) return gd;
+                if (nSeen < 32) seen[nSeen++] = gd;
+            }
         }
     }
     return 0;
@@ -1430,7 +1479,7 @@ int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
     // container census rightly skipped), so walk the preference-ordered
     // candidates: place, verify the LIVE building's class, destroy + retry on
     // mismatch. kinds 0/1 accept any machine class (the original behaviour);
-    // kind 2 demands BCTYPE_STORAGE, kind 3 demands BCTYPE_RESEARCH.
+    // kind 2 demands BCTYPE_STORAGE, kind 3 BCTYPE_RESEARCH, kind 4 BCTYPE_CRAFTING.
     const int MAX_CANDIDATES = 8;
     for (int cand = 0; cand < MAX_CANDIDATES; ++cand) {
         GameData* tmpl = 0;
@@ -1466,13 +1515,14 @@ int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
         bool classOk = true;
         if (kind == 2) classOk = (liveClass == (int)BCTYPE_STORAGE);
         if (kind == 3) classOk = (liveClass == (int)BCTYPE_RESEARCH);
+        if (kind == 4) classOk = (liveClass == (int)BCTYPE_CRAFTING);
         if (!classOk) {
             char b[160];
             _snprintf(b, sizeof(b) - 1,
                       "[prod] probe-place kind=%d REJECT sid='%s' class=%d "
                       "(want %s) - destroy + next candidate",
                       kind, sid, liveClass,
-                      kind == 3 ? "RESEARCH" : "STORAGE");
+                      kind == 3 ? "RESEARCH" : (kind == 4 ? "CRAFTING" : "STORAGE"));
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             destroyBuildingByHand(gw, localHand);
             continue;

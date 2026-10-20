@@ -527,5 +527,191 @@ int probeNativeSnapshot(GameWorld* gw) {
            loadedRecordCount == recordCount ? 1 : 0;
 }
 
+// ---- Crafting-bench job levers (bench_yield_join, 2026-10-20) ---------------
+// See EngineProbe.h. The queue, the job record and the finished-item entry are
+// KenshiLib-declared CraftingBuilding members, called directly (the GameData
+// container precedent above); every engine touch sits in an SEH frame.
+namespace {
+
+lektor<GameDataGroup> g_craftList; // main-thread scratch; the engine grows it
+
+typedef void (__fastcall* CraftDoneFn)(CraftingBuilding* self, Item* what);
+CraftDoneFn  g_craftDoneOrig = 0;
+unsigned int g_craftDoneN    = 0;
+bool         g_craftTraceOn  = false;
+
+// Caller holds SEH.
+CraftingBuilding* craftAt(const unsigned int h[5]) {
+    RootObject* ro = resolveObjectByHand(h);
+    if (!ro) return 0;
+    Building* b = static_cast<Building*>(ro);
+    if ((int)b->classType != (int)BCTYPE_CRAFTING) return 0;
+    return static_cast<CraftingBuilding*>(b);
+}
+
+// Caller holds SEH.
+void craftSid(GameData* gd, char* out, unsigned int len) {
+    if (!out || !len) return;
+    out[0] = '\0';
+    if (!gd) return;
+    strncpy(out, gd->stringID.c_str(), len - 1);
+    out[len - 1] = '\0';
+}
+
+// The protected updateOutput override, named through a derived class (the
+// FurnaceOperateAccess precedent in EngineInternal.cpp).
+struct CraftAccess : public CraftingBuilding {
+    static intptr_t updateOutputAddr() {
+        return KenshiLib::GetRealAddress(&CraftAccess::_NV_updateOutput);
+    }
+};
+
+// Log 512 live bytes of one engine function, as module offset + hex rows.
+void craftDumpCode(const char* fn, intptr_t addr) {
+    if (!addr) return;
+    unsigned __int64 base = (unsigned __int64)GetModuleHandleA(NULL);
+    unsigned char buf[512];
+    bool ok = false;
+    __try { memcpy(buf, (const void*)addr, sizeof(buf)); ok = true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    char b[200];
+    _snprintf(b, sizeof(b) - 1, "[craftspy] code fn=%s off=0x%llx read=%d", fn,
+              (unsigned long long)((unsigned __int64)addr - base), ok ? 1 : 0);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    if (!ok) return;
+    static const char* HEX = "0123456789abcdef";
+    for (unsigned int row = 0; row < sizeof(buf); row += 64) {
+        char hex[129];
+        for (unsigned int k = 0; k < 64; ++k) {
+            hex[k * 2]     = HEX[buf[row + k] >> 4];
+            hex[k * 2 + 1] = HEX[buf[row + k] & 15];
+        }
+        hex[128] = '\0';
+        _snprintf(b, sizeof(b) - 1, "[craftspy] code fn=%s +%03x %s", fn, row, hex);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void craftDoneLog(CraftingBuilding* self, Item* what) {
+    unsigned int mh[5] = { 0, 0, 0, 0, 0 };
+    char sid[48]; sid[0] = '\0';
+    unsigned int wi = 0, ws = 0;
+    __try {
+        readObjectHand(static_cast<RootObject*>(self), mh);
+        if (what) craftSid(what->getGameData(), sid, sizeof(sid));
+        wi = self->whosCrafting.index;
+        ws = self->whosCrafting.serial;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    ++g_craftDoneN;
+    char b[200];
+    _snprintf(b, sizeof(b) - 1,
+              "[craftspy] DONE mach=%u.%u.%u.%u.%u item='%s' who=%u,%u n=%u",
+              mh[0], mh[1], mh[2], mh[3], mh[4], sid, wi, ws, g_craftDoneN);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+void __fastcall craftDone_hook(CraftingBuilding* self, Item* what) {
+    craftDoneLog(self, what);
+    g_craftDoneOrig(self, what);
+}
+
+} // namespace
+
+int probeQueueCraft(GameWorld* gw, const unsigned int bHand[5], const char* preferSid,
+                    unsigned int typeCat, char* outSid, unsigned int outLen) {
+    if (outSid && outLen) outSid[0] = '\0';
+    if (!gw || !bHand) return 0;
+    GameData* fallback = (preferSid && preferSid[0])
+        ? findItemTemplateImpl(gw, preferSid, typeCat) : 0;
+    char b[240];
+    __try {
+        CraftingBuilding* cb = craftAt(bHand);
+        if (!cb) return 0;
+        g_craftList.clear();
+        cb->getAvailableCrafts(g_craftList);
+        unsigned int avail = g_craftList.size();
+        int pick = -1;
+        for (unsigned int i = 0; i < avail; ++i) {
+            GameData* g1 = g_craftList[i].g1;
+            if (i < 8) {
+                char s1[48], s2[48];
+                craftSid(g1, s1, sizeof(s1));
+                craftSid(g_craftList[i].g2, s2, sizeof(s2));
+                _snprintf(b, sizeof(b) - 1, "[craftq] avail[%u] item='%s' mat='%s'",
+                          i, s1, s2);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (pick < 0 && g1 && preferSid && g1->stringID == preferSid) pick = (int)i;
+        }
+        if (pick < 0 && avail > 0) pick = 0;
+        GameData* item = 0;
+        GameData* mat  = 0;
+        int rc = 0;
+        if (pick >= 0) {
+            item = g_craftList[pick].g1; mat = g_craftList[pick].g2; rc = 1;
+        } else if (fallback) {
+            item = fallback; rc = 2;
+        }
+        CraftingItem* job = 0;
+        if (item) {
+            YesNoMaybe crit(YesNoMaybe::MAYBE);
+            job = cb->_addCraft(item, mat, 0.0f, crit);
+            cb->repeat = true;
+            craftSid(item, outSid, outLen);
+        }
+        if (!job) rc = 0;
+        _snprintf(b, sizeof(b) - 1,
+                  "[craftq] queue avail=%u pick=%d rc=%d item='%s' job=%d queued=%d n=%u",
+                  avail, pick, rc, outSid ? outSid : "", job ? 1 : 0,
+                  cb->hasCraftingQueued() ? 1 : 0, (unsigned int)cb->crafting.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return rc;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[craftq] queue FAULTED");
+        return -1;
+    }
+}
+
+bool probeReadCraft(const unsigned int bHand[5], CraftRead* out) {
+    if (!bHand || !out) return false;
+    memset(out, 0, sizeof(*out));
+    out->progress = -1.0f; out->rate = -1.0f; out->endTime = -1.0f; out->err = -1;
+    __try {
+        CraftingBuilding* cb = craftAt(bHand);
+        if (!cb) return false;
+        out->queued = cb->hasCraftingQueued() ? 1 : 0;
+        out->nCraft = (int)cb->crafting.size();
+        out->repeat = cb->repeat ? 1 : 0;
+        if (out->nCraft > 0) {
+            CraftingItem* job = cb->getCraft(0);
+            if (job) {
+                out->progress = job->progress01;
+                out->rate     = job->rate;
+                out->endTime  = job->endTime;
+                out->err      = job->lastErrorCode;
+                if (job->item) craftSid(job->item->getGameData(), out->sid, sizeof(out->sid));
+            }
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool installCraftDoneTrace() {
+    if (g_craftTraceOn) return true;
+    intptr_t done = KenshiLib::GetRealAddress(&CraftingBuilding::addFinishedCraftItem);
+    craftDumpCode("operate",   KenshiLib::GetRealAddress(&CraftingBuilding::_NV_operate));
+    craftDumpCode("update",    KenshiLib::GetRealAddress(&CraftingBuilding::_NV_update));
+    craftDumpCode("updateOutput", CraftAccess::updateOutputAddr());
+    craftDumpCode("tryOperate", KenshiLib::GetRealAddress(&CraftingBuilding::_NV_tryOperate));
+    craftDumpCode("addCraft",  KenshiLib::GetRealAddress(&CraftingBuilding::_addCraft));
+    craftDumpCode("finished",  done);
+    if (!done) return false;
+    g_craftTraceOn = KenshiLib::AddHook(done, (void*)&craftDone_hook,
+                                        (void**)&g_craftDoneOrig) == KenshiLib::SUCCESS;
+    coop::logLine(g_craftTraceOn ? "[craftspy] DONE trace installed"
+                                 : "[craftspy] DONE trace hook FAILED");
+    return g_craftTraceOn;
+}
+
 } // namespace engine
 } // namespace coop

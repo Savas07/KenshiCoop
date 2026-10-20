@@ -559,3 +559,63 @@ comparison is made between local bodies. A hand compared with a key is a
 coincidence check that holds only until the first re-key or mint. (Still open:
 the carry self-heal, `applyPickup` on the streamed carried hand, resolves the
 raw key.)
+
+## 21. Reproducing an action reproduces its side effects
+
+Protocol 55 fixed the mining pose: the join's copy of a miner is now ordered onto
+the same node with a real player order, so it swings at the rock instead of
+standing still. But a Kenshi work pose is not cosmetic. The body's
+OPERATE_MACHINERY action calls `<Building>::operate` on the machine every frame,
+and AI-suspend only quiets the decision layer, so the copy really mined. Each
+client minted the ore into its OWN instance of the mine's container, and the
+container census then mirrored the host's units into the join's mine on top of
+the join's own. A join miner emptying its mine collected both: `mine_yield_join`
+measured 6 ore for 3 units of work (host crossings `driven=3`, join crossings
+`own=3`), the Workshop report's "2-3 ore per unit". The host-owned case looked
+clean on the owner's side but left phantom units in the join's mine
+(`mine_yield`: join crossings `driven=5`), which a join player looting the node
+would have taken.
+
+The fix follows the authority the channels already assumed: protocols 33/34 make
+the host the author of machine buffers and contents, so the join now skips
+`operate` for a worker it drives and for any machine a protocol-33 row has
+mirrored recently (`[prod] operate MIRROR` in the join log). The host's copy of a
+join miner does the work, and the join's mine fills only through the mirror. A
+machine the host does not mirror keeps local work, so a join far from the host
+still produces, once.
+
+Only the machine classes a two-client run showed double-producing are gated: the
+`ProductionBuilding` override (mines, which share it with generators and
+refiners) and the `CraftingBuilding` override. `bench_yield_join` queues a first
+aid kit on a medical desk on both clients with a join-owned worker: the
+observe-only build minted 7 kits for 4 crafts of work (`b7_bench`), the gated build
+mints only on the host. Farm, research and furnace keep their local `operate`.
+A furnace has no operator slot, research mints no item (protocol 38 already makes
+the host the tech authority), and no farm run exists to prove a gate would be
+correct, so detouring them would change behaviour nobody measured. A crafting
+queue is per client, so a host row reporting PRODUCTION_IMPOSSIBLE (state 3, the
+host bench has no job) does not mark the machine mirrored: a job queued only on
+the join still crafts there, once (`bench_yield_joinq`, `f7_benchq`).
+
+Making the host the only producer exposed a pose gap. The host's copy of the join
+worker dropped its action when the host bench finished a craft and filled, while
+the owner was back at work within a blip shorter than `TASK_CLEAR_MS`. The held
+pose was never released, so it was never re-taken, and the worker produced one
+kit for the whole run (`f7_bench`). A held machine pose whose copy reads idle for
+`TASK_LAPSE_MS` under a streamed work task is now re-posed (`[pose] lapse
+re-pose`), with backoff so a machine that stays full is not re-ordered every few
+seconds. (`f10_bench`: 5 host crafts, 0 join crafts, the worker gained 4 for the
+4 delivered.)
+
+Still open: when the re-posed host copy reaches the full bench before the join's
+pickup transfer lands, the transfer finds the bench empty and fabricates
+(`[xfer] APPLY ... moved=0 fab=1`). The host's copy then reads one kit high until
+the owner's next inventory snapshot, about 15 s later. Nothing persists: the final
+counts match and the total stays one kit per host craft. The original code shows
+the same transient (`b7_bench`, id=3), which is why `bench_yield_join` stays
+diagnostic.
+
+**Rule.** When a peer's action is reproduced to make it LOOK right, list what the
+action DOES. Anything that mints, consumes or moves state must run on exactly one
+client, and the gate has to count units, not poses: `mine_pose` was green the
+whole time, because the pose was exactly what was wrong.
