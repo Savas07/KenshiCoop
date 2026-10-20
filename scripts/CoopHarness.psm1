@@ -44,6 +44,7 @@ $script:CoopDiagEnvKeys = @(
     'KENSHICOOP_RESEARCH_SYNC'
     'KENSHICOOP_DEED_SYNC'
     'KENSHICOOP_STORE_SYNC'
+    'KENSHICOOP_VENDOR_SYNC'
     'KENSHICOOP_SQUAD_SYNC'
     'KENSHICOOP_LATEJOIN_SYNC'
     # --- log-only diagnostic traces (read outside Config; never gate behavior) ---

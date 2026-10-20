@@ -110,7 +110,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(SaveFileHeader)",          sizeof(SaveFileHeader),          19);
     CHECK_EQ("sizeof(SaveDoneHeader)",          sizeof(SaveDoneHeader),          11);
     CHECK_EQ("sizeof(SaveAckPacket)",           sizeof(SaveAckPacket),           20);
-    CHECK_EQ("sizeof(LoadGoPacket)",            sizeof(LoadGoPacket),            61);
+    CHECK_EQ("sizeof(LoadGoPacket)",            sizeof(LoadGoPacket),            62); // v58: +freshStart
     CHECK_EQ("sizeof(LoadReqPacket)",           sizeof(LoadReqPacket),           57);
     CHECK_EQ("sizeof(LoadNackPacket)",          sizeof(LoadNackPacket),          61);
     CHECK_EQ("sizeof(ProdPacket)",              sizeof(ProdPacket),              109);
@@ -121,6 +121,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
     CHECK_EQ("sizeof(CellClaimPacket)",         sizeof(CellClaimPacket),         21); // v49: cell claim
     CHECK_EQ("sizeof(InvXferAckPacket)",        sizeof(InvXferAckPacket),        18); // v50: transfer verdict
+    CHECK_EQ("sizeof(VendorDeltaPacket)",       sizeof(VendorDeltaPacket),       184); // v60: shop-counter stock change
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -310,8 +311,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v55: runtime-fixture identity)",
-             (int)PROTOCOL_VERSION, 55);
+    CHECK_EQ("PROTOCOL_VERSION (v60: shared vendor stock)",
+             (int)PROTOCOL_VERSION, 60);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -384,6 +385,10 @@ static void testSizes() {
     CHECK_EQ("INV_FLAG_TRUNCATED value", (int)INV_FLAG_TRUNCATED, 1);
     CHECK("INV_FLAG_TRUNCATED is a single bit",
           (INV_FLAG_TRUNCATED & (u8)(INV_FLAG_TRUNCATED - 1)) == 0);
+    // Protocol 60: the shop-counter flag shares the byte with TRUNCATED.
+    CHECK_EQ("INV_FLAG_SHOP value", (int)INV_FLAG_SHOP, 2);
+    CHECK("INV_FLAG_SHOP distinct from TRUNCATED", (INV_FLAG_SHOP & INV_FLAG_TRUNCATED) == 0);
+    CHECK_EQ("PKT_VENDOR_DELTA id", (int)PKT_VENDOR_DELTA, 52);
     // `count` must remain the LAST header field: the entry array is framed immediately
     // after it, so inserting `flags` anywhere else would shift the payload.
     {
@@ -499,6 +504,7 @@ static void testRoundTrips() {
     roundTrip<CharGenHeader>("CharGenHeader", (u8)PKT_CHARGEN);
     roundTrip<CellClaimPacket>("CellClaimPacket", (u8)PKT_CELL_CLAIM);
     roundTrip<InvXferAckPacket>("InvXferAckPacket", (u8)PKT_INV_XFER_ACK);
+    roundTrip<VendorDeltaPacket>("VendorDeltaPacket", (u8)PKT_VENDOR_DELTA);
 
     CHECK("packetType(null) == 0", packetType(0, 10) == 0);
     unsigned char b0[1] = { 0 };
@@ -1377,6 +1383,7 @@ static void testFlushWorldStateContract() {
     StatsPacket     stp; std::memset(&stp, 0, sizeof(stp));
     MoneyPacket     mo;  std::memset(&mo,  0, sizeof(mo));
     MoneyDeltaPacket md; std::memset(&md,  0, sizeof(md));
+    VendorDeltaPacket vdp; std::memset(&vdp, 0, sizeof(vdp));
     FactionPacket   fa;  std::memset(&fa,  0, sizeof(fa));
     TimePacket      ti;  std::memset(&ti,  0, sizeof(ti));
     DoorPacket      dp;  std::memset(&dp,  0, sizeof(dp));
@@ -1404,7 +1411,7 @@ static void testFlushWorldStateContract() {
     LoadReqPacket   lrq; std::memset(&lrq, 0, sizeof(lrq));
     LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
 
-    // --- Push one sentinel into every WORLD-STATE queue (34).
+    // --- Push one sentinel into every WORLD-STATE queue (35).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
     in.pushInv(1, 0, cKey, 0, 0);
@@ -1422,6 +1429,7 @@ static void testFlushWorldStateContract() {
     in.pushStats(1, stp);
     in.pushMoney(1, mo);
     in.pushMoneyDelta(1, md);
+    in.pushVendorDelta(1, vdp);
     in.pushFaction(1, fa);
     in.pushTime(1, ti);
     in.pushDoor(1, dp);
@@ -1475,6 +1483,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("stats",       InboundStats,       drainStats);
     WS_EMPTY("money",       InboundMoney,       drainMoney);
     WS_EMPTY("moneyDelta",  InboundMoneyDelta,  drainMoneyDeltas);
+    WS_EMPTY("vendorDelta", InboundVendorDelta, drainVendorDeltas);
     WS_EMPTY("faction",     InboundFaction,     drainFaction);
     WS_EMPTY("time",        InboundTime,        drainTime);
     WS_EMPTY("door",        InboundDoor,        drainDoor);

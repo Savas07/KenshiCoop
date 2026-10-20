@@ -1072,6 +1072,23 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # vendor_stock: protocol-60 shared vendor stock. Both sides log every
+        # shop counter near the bar and the per-trader aggregate at 1 Hz; the
+        # join opens the trade window with the nearest trader and buys one item
+        # (t=10/16 s), then the host does the same (t=30/36 s). Gates that the
+        # stock never reads 0 on one side while the other has goods, that the
+        # two stocks converge, that each purchase leaves the vendor on BOTH
+        # sides, the buyer gains exactly one, and the pool agrees. Real-session
+        # channel set (inv + world on, xfer defaulting on with inv).
+        vendor_stock = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'vendor_stock'
+            Gating   = @('vendor_stock', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # recruit_probe: mid-session recruitment phase-0 diagnostic (protocol
         # 23 - no recruit sync exists, nothing is forced off). Each side
         # recruits the nearest BAKED world NPC and then a RUNTIME spawn via

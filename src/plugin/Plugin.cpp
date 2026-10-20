@@ -81,6 +81,12 @@ static int coopInvOwnerClass(const unsigned int h[5]) {
     return g_repl.ownerClassForHand(h);
 }
 
+// Protocol 60 restock gate trampoline (same reason: the engine layer must not
+// know about the Replicator). Set on joins only.
+static bool vendorRefreshGate(unsigned int platContainer, unsigned int platSerial) {
+    return g_repl.vendorRefreshGated(platContainer, platSerial);
+}
+
 // assault_mint's victim query (ScenarioContext::pickMintedProxy). Same shape and
 // same reason as the classifier above: the scenario layer must not know about the
 // Replicator, and only the Replicator knows which local bodies are mints.
@@ -1932,6 +1938,10 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         // populated). KENSHICOOP_BLOCK_XFER=0 restores this replicate-the-trade path.
         if (g_cfg.xferSync)
             g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId());
+        // Protocol 60 (join): a local trade with a shop whose counters the host
+        // mirrors goes back to the host as per-item counter changes.
+        if (g_cfg.invSync && g_cfg.vendorSync)
+            g_repl.detectAndPublishVendorDeltas(gw, g_net, g_net.localId());
         // Phase W1 (bidirectional): BOTH clients stream the free ground items they
         // author in their interest sphere - owner-scoped netId spaces, peer items
         // filtered by the proxy echo guard - so a join-side drop of materials/food
@@ -2147,6 +2157,10 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
             // more while still defending a move that was refused.
             g_repl.applyXferAcks(gw, g_inbound, g_net.localId());
         }
+        // Protocol 60 (host): the joins' trades land in the real shop stock before
+        // the census captures it again.
+        if (g_cfg.vendorSync)
+            g_repl.applyVendorDeltas(gw, g_inbound);
         // Phase 4a: reconcile any peer-owned container we received a fresh snapshot
         // for (the join applies the host's container; the host skips its own).
         g_repl.applyInventories(gw);
@@ -3053,6 +3067,17 @@ void installEngineDetours() {
             coopLog("[shop] FAILED to install buyItem detour; purchase logging off");
     }
 
+    // Shared vendor stock (protocol 60): the trader-restock detour. On a join
+    // it skips the restock of shops whose counters the host mirrors; the gate
+    // stays unset on the host (its restock IS the shared stock).
+    if (g_cfg.vendorSync) {
+        if (coop::engine::installVendorHooks())
+            coopLog("[vendor] refreshInventory detour installed; shared vendor stock ON");
+        else
+            coopLog("[vendor] FAILED to install refreshInventory detour; join restock not gated");
+        if (!g_cfg.isHost) coop::engine::setVendorRefreshGate(&vendorRefreshGate);
+    }
+
     // Cross-owner trade veto (KENSHICOOP_BLOCK_XFER, default ON in real sessions):
     // refuse a UI inventory drag whose source + destination squad characters are
     // owned by different clients (item stays in the source bag) so ground drops
@@ -3112,6 +3137,7 @@ void installEngineDetours() {
     // census-author (host-authoritative world containers). Layered on invSync
     // (publishInventories is the carrier and is gated on it below).
     g_repl.setStoreSync(g_cfg.storeSync && g_cfg.isHost);
+    g_repl.setVendorSync(g_cfg.vendorSync && g_cfg.invSync);
     if (g_cfg.recruitSync) {
         if (coop::engine::installRecruitHook())
             coopLog("[recruit] recruit detour installed; recruitment sync ON");

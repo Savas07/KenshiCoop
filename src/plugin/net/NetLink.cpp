@@ -251,6 +251,7 @@ void NetLink::queueMoney(const MoneyPacket& pkt, u32 targetMask) {
     pushLocked(outCs_, outMoney_, om);
 }
 void NetLink::queueMoneyDelta(const MoneyDeltaPacket& pkt) { pushLocked(outCs_, outMoneyDelta_, pkt); }
+void NetLink::queueVendorDelta(const VendorDeltaPacket& pkt) { pushLocked(outCs_, outVendorDelta_, pkt); }
 
 void NetLink::queueFaction(const FactionPacket& pkt) { pushLocked(outCs_, outFaction_, pkt); }
 
@@ -1015,6 +1016,14 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushMoneyDelta(md.ownerId, md);
                         }
+                    } else if (isHost_ && type == PKT_VENDOR_DELTA) {
+                        // Reliable shop-counter stock change (protocol 60,
+                        // join -> host; the host alone owns the stock).
+                        VendorDeltaPacket vd;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &vd)
+                            && inbound_) {
+                            inbound_->pushVendorDelta(vd.ownerId, vd);
+                        }
                     } else if (type == PKT_FACTION) {
                         // Reliable player-faction relation row (protocol 24):
                         // host stream or join intent, disambiguated on apply.
@@ -1612,6 +1621,18 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < moneyDeltaPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&moneyDeltaPkts[i], sizeof(MoneyDeltaPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Shop-counter stock changes (protocol 60, join -> host): conservation
+        // intents like the money deltas - reliable + ordered, never coalesced.
+        std::vector<VendorDeltaPacket> vendorDeltaPkts;
+        EnterCriticalSection(&outCs_);
+        vendorDeltaPkts.swap(outVendorDelta_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < vendorDeltaPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&vendorDeltaPkts[i], sizeof(VendorDeltaPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             sendOut(out, CH_RELIABLE);
         }

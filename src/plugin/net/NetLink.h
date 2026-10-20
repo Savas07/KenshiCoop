@@ -126,6 +126,10 @@ public:
     // host). Emitted once per observed local change; ordered delivery is what
     // makes the host fold it exactly once.
     void queueMoneyDelta(const MoneyDeltaPacket& pkt);
+    // MAIN thread: queue a reliable shop-counter stock change (protocol 60,
+    // join -> host): one per item a join trade moved in or out of a counter
+    // the host mirrors.
+    void queueVendorDelta(const VendorDeltaPacket& pkt);
     void queueFaction(const FactionPacket& pkt);
     void queueTime(const TimePacket& pkt);
     void queueDoor(const DoorPacket& pkt);
@@ -330,6 +334,7 @@ private:
     struct OutMoney { MoneyPacket pkt; u32 mask; };
     std::vector<OutMoney>        outMoney_;
     std::vector<MoneyDeltaPacket> outMoneyDelta_;
+    std::vector<VendorDeltaPacket> outVendorDelta_; // protocol 60 (join -> host)
     std::vector<FactionPacket>   outFaction_;
     std::vector<TimePacket>      outTime_;
     std::vector<DoorPacket>      outDoor_;

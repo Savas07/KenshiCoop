@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 59;
+const u16 PROTOCOL_VERSION = 60;
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -89,7 +89,8 @@ enum PacketType {
     PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
     PKT_PEER_STATE       = 49,// RELIABLE roster edge: another join arrived/left (host -> joins, protocol 56); PeerStatePacket
     PKT_CHARGEN          = 50,// RELIABLE join character-creation result (join -> host -> joins, protocol 57); CharGenHeader + tail
-    PKT_ROSTER           = 51 // RELIABLE who is player N (host -> joins, protocol 59); RosterPacket
+    PKT_ROSTER           = 51,// RELIABLE who is player N (host -> joins, protocol 59); RosterPacket
+    PKT_VENDOR_DELTA     = 52 // RELIABLE join shop-counter stock change (join -> host, protocol 60); VendorDeltaPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -584,6 +585,11 @@ struct InvSnapshotHeader {
 
 // InvSnapshotHeader::flags bits.
 const u8 INV_FLAG_TRUNCATED = 0x01;
+// Protocol 60: the container is a SHOP COUNTER the host mirrors (the stock of a
+// trader). The receiver never trades against it locally without telling the
+// host: every change it sees there that the host's snapshot did not put there
+// (a purchase, a sale) goes back as a PKT_VENDOR_DELTA.
+const u8 INV_FLAG_SHOP      = 0x02;
 
 // A full snapshot ([header][InvItemEntry*count]) can now exceed one datagram (each entry
 // carries two 48-byte template ids), but inv snapshots ride the RELIABLE channel, which
@@ -810,6 +816,34 @@ enum XferAckVerdict {
     XFER_ACK_REJECT  = 0,
     XFER_ACK_ACCEPT  = 1,
     XFER_ACK_PARTIAL = 2
+};
+
+// ---- Protocol 60: shared vendor stock ---------------------------------------
+// A shop's goods live in its counters (BF_SHOP furniture owned by the trader's
+// platoon). The host censuses them like storage chests and mirrors them on the
+// PKT_INV_SNAPSHOT channel (flagged INV_FLAG_SHOP); a trade on the JOIN changes
+// only the join's copy, so the join reports each per-item change of a mirrored
+// counter here and the host applies it to the real stock, whose next snapshot
+// brings every client back in line. Only the counter side crosses: the buyer's
+// or seller's bag rides that player's own inventory snapshots and the cats the
+// money pool (protocol 52). deltaId is per-sender monotonic (idempotency).
+struct VendorDeltaPacket {
+    u8   type;       // = PKT_VENDOR_DELTA
+    u32  ownerId;    // network player id of the sender (the join that traded)
+    u32  deltaId;    // monotonic per-sender
+    // the counter's raw (save-stable) hand - the key its snapshots stream under
+    u32  cType;
+    u32  cContainer;
+    u32  cContainerSerial;
+    u32  cIndex;
+    u32  cSerial;
+    char stringID[48];
+    u32  itemType;   // GameData::type category
+    i32  delta;      // units: < 0 left the counter (bought), > 0 arrived (sold)
+    u16  quality;    // condition bucket of the stack (only used to fabricate a sale)
+    u8   level;      // craft grade, GRADE_NA when not applicable
+    char manufacturer[48];
+    char material[48];
 };
 
 // Reserved netId meaning "no/invalid world item".

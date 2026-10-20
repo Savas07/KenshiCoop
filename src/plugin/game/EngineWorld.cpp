@@ -1517,8 +1517,28 @@ static bool isContainerClassType(int t) {
     return t == (int)BCTYPE_STORAGE || isMachineClassType(t);
 }
 
+// Protocol 60: the shop owner of a building, when it is a SHOP COUNTER - the
+// furniture a trader's goods live in (vs_before2: BCTYPE_USABLE, special
+// function BF_SHOP). UseableStuff::shopOwner is the trader's PLATOON hand
+// (type PLATOON, index/serial 0 - only the container fields name it), so any
+// non-zero field marks a counter. Caller holds SEH.
+static bool counterOwnerOf(Building* b, unsigned int owner[5], int* fn) {
+    owner[0] = owner[1] = owner[2] = owner[3] = owner[4] = 0;
+    *fn = (int)b->getSpecialFunction();
+    UseableStuff* us = b->getUseableStuff();
+    if (us) {
+        const hand& h = us->shopOwner;
+        owner[0] = (unsigned int)h.type; owner[1] = h.container;
+        owner[2] = h.containerSerial;   owner[3] = h.index;
+        owner[4] = h.serial;
+    }
+    bool hasOwner = owner[1] != 0 || owner[2] != 0 || owner[3] != 0 || owner[4] != 0;
+    return hasOwner || *fn == (int)BF_SHOP;
+}
+
 // Fill a ContRead from a live container-bearing Building. Callers hold the
-// SEH frame and have already verified isContainerClassType(b->classType).
+// SEH frame and have already verified isContainerClassType(b->classType) or
+// counterOwnerOf (a shop counter).
 // The contents summary reads up to 64 entries (readInvItems carries its own
 // SEH) - the census's capacity measuring stick vs INV_ITEMS_MAX.
 static void fillContRead(Building* b, ContRead* r) {
@@ -1529,6 +1549,8 @@ static void fillContRead(Building* b, ContRead* r) {
     r->x = p.x; r->y = p.y; r->z = p.z;
     r->classType = (int)b->classType;
     r->complete  = b->_buildState.isComplete ? 1 : 0;
+    int fn = 0;
+    r->shop = counterOwnerOf(b, r->shopOwner, &fn) ? 1 : 0;
     Inventory* inv = ro->getInventory();
     r->hasInv = inv ? 1 : 0;
     if (inv) {
@@ -1557,7 +1579,7 @@ static void fillContRead(Building* b, ContRead* r) {
 }
 
 unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
-                                unsigned int maxOut) {
+                                unsigned int maxOut, bool includeShops) {
     if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
     unsigned int n = 0;
     __try {
@@ -1572,7 +1594,10 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                 RootObject* o = g_npcQuery[i];
                 if (!o) continue;
                 Building* b = static_cast<Building*>(o);
-                if (!isContainerClassType((int)b->classType)) continue;
+                if (!isContainerClassType((int)b->classType)) {
+                    unsigned int ow[5]; int fn = 0;
+                    if (!includeShops || !counterOwnerOf(b, ow, &fn)) continue;
+                }
                 // Incomplete sites ride protocol 27 until finished.
                 if (!b->_buildState.isComplete) continue;
                 unsigned int h[5];
@@ -1599,6 +1624,16 @@ bool readContainerByHand(const unsigned int cHand[5], ContRead* out) {
         if (!isContainerClassType((int)b->classType)) return false;
         fillContRead(b, out);
         return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool readShopCounterOwner(const unsigned int cHand[5], unsigned int owner[5]) {
+    if (!cHand || !owner) return false;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return false;
+    __try {
+        int fn = 0;
+        return counterOwnerOf(static_cast<Building*>(ro), owner, &fn);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
@@ -1789,6 +1824,175 @@ int probeVendorBuy(GameWorld* gw, const unsigned int vHand[5],
         coop::logLine("[shop] probe-buy SEH-except");
         return -1;
     }
+}
+
+// ---- Protocol 60: vendor stock ----------------------------------------------
+
+namespace {
+// Fill entries/qty for one inventory (readInvItems carries its own SEH).
+void summarizeInv(Inventory* inv, int* hasInv, int* nEntries, int* qtyTotal) {
+    *hasInv = inv ? 1 : 0; *nEntries = 0; *qtyTotal = 0;
+    if (!inv) return;
+    InvItemEntry ent[96];
+    unsigned int n = readInvItems(inv, ent, 0, 96);
+    int q = 0;
+    for (unsigned int i = 0; i < n; ++i) q += (ent[i].quantity < 1) ? 1 : (int)ent[i].quantity;
+    *nEntries = (int)n; *qtyTotal = q;
+}
+
+} // namespace
+
+unsigned int enumShopCountersNear(GameWorld* gw, float radius,
+                                  ShopCounterRead* out, unsigned int maxOut) {
+    if (!gw || !gw->player || !out || maxOut == 0 || !g_getObjsFn) return 0;
+    unsigned int n = 0;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return 0;
+        Character* ld = gw->player->playerCharacters[0];
+        if (!ld) return 0;
+        Ogre::Vector3 center = ld->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, radius, BUILDING, 256, 0);
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o) continue;
+            __try {
+                Building* b = static_cast<Building*>(o);
+                ShopCounterRead& r = out[n];
+                memset(&r, 0, sizeof(r));
+                if (!counterOwnerOf(b, r.owner, &r.fn)) continue;
+                if (!readObjectHand(o, r.hand)) continue;
+                r.classType = (int)b->classType;
+                Ogre::Vector3 p = o->getPosition();
+                r.x = p.x; r.y = p.y; r.z = p.z;
+                summarizeInv(invOf(o), &r.hasInv, &r.nEntries, &r.qtyTotal);
+                GameData* gd = o->getGameData();
+                if (gd) {
+                    strncpy(r.name, gd->name.c_str(), sizeof(r.name) - 1);
+                    r.name[sizeof(r.name) - 1] = '\0';
+                }
+                ++n;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+// Fill a TraderRead from a live character. Caller holds SEH.
+static void fillTraderRead(RootObject* ro, TraderRead* out) {
+    memset(out, 0, sizeof(*out));
+    out->isTrader = out->platTrader = out->hasVendorList = -1;
+    readObjectHand(ro, out->hand);
+    Character* c = static_cast<Character*>(ro);
+    if (g_charIsTraderFn) out->isTrader = g_charIsTraderFn(c) ? 1 : 0;
+    ActivePlatoon* ap = g_getPlatoonFn ? g_getPlatoonFn(c) : 0;
+    if (ap) {
+        if (g_platIsTraderFn) out->platTrader = g_platIsTraderFn(ap) ? 1 : 0;
+        if (g_platHasVendorListFn) out->hasVendorList = g_platHasVendorListFn(ap) ? 1 : 0;
+    }
+    summarizeInv(invOf(ro), &out->hasInv, &out->nEntries, &out->qtyTotal);
+    Ogre::Vector3 p = ro->getPosition();
+    out->x = p.x; out->y = p.y; out->z = p.z;
+    GameData* gd = ro->getGameData();
+    if (gd) {
+        strncpy(out->name, gd->name.c_str(), sizeof(out->name) - 1);
+        out->name[sizeof(out->name) - 1] = '\0';
+    }
+}
+
+bool readTraderByHand(const unsigned int tHand[5], TraderRead* out) {
+    if (!tHand || !out) return false;
+    memset(out, 0, sizeof(*out));
+    out->isTrader = out->platTrader = out->hasVendorList = -1;
+    RootObject* ro = resolveObjectByHand(tHand);
+    if (!ro) return false;
+    __try {
+        fillTraderRead(ro, out);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+unsigned int listTradersNear(GameWorld* gw, float radius, TraderRead* out,
+                             unsigned int maxOut) {
+    if (!gw || !gw->player || !out || maxOut == 0 || !g_getObjsFn) return 0;
+    unsigned int n = 0;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return 0;
+        Character* ld = gw->player->playerCharacters[0];
+        if (!ld) return 0;
+        Ogre::Vector3 center = ld->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, radius, CHARACTER, 256, 0);
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o) continue;
+            __try {
+                fillTraderRead(o, &out[n]);
+                if (out[n].isTrader == 1 || out[n].platTrader == 1) ++n;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+int openTradeWindow(const unsigned int buyerHand[5], const unsigned int traderHand[5]) {
+    if (!buyerHand || !traderHand || !g_guiShowTradeFn) return 0;
+    RootObject* buyer  = resolveObjectByHand(buyerHand);
+    RootObject* trader = resolveObjectByHand(traderHand);
+    ForgottenGUI* g = ::gui;
+    if (!buyer || !trader || !g) return 0;
+    __try {
+        g_guiShowTradeFn(g, &buyer->handle, &trader->handle, TW_MONEY_TRADING);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+void closeTradeWindow() {
+    ForgottenGUI* g = ::gui;
+    if (!g || !g_guiCloseTradeFn) return;
+    __try { g_guiCloseTradeFn(g); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
+                  const unsigned int buyerHand[5], bool pickLast,
+                  char* outSid, unsigned int sidLen, int* outQty) {
+    if (outSid && sidLen) outSid[0] = '\0';
+    if (outQty) *outQty = 0;
+    if (!gw || !srcHand || !buyerHand || !g_buyItemFn) return -1;
+    RootObject* src   = resolveObjectByHand(srcHand);
+    RootObject* buyer = resolveObjectByHand(buyerHand);
+    if (!src || !buyer) return -1;
+    __try {
+        Inventory* vinv = invOf(src);
+        Inventory* binv = invOf(buyer);
+        if (!vinv || !binv) return -1;
+        InvItemEntry ent[96];
+        Item* items[96];
+        unsigned int ne = readInvItems(vinv, ent, items, 96);
+        int pick = -1;
+        for (unsigned int i = 0; i < ne; ++i) {
+            if (!items[i] || ent[i].equipped) continue;
+            pick = (int)i;
+            if (!pickLast) break;
+        }
+        if (pick < 0) return 0;
+        if (outSid && sidLen) {
+            strncpy(outSid, ent[pick].stringID, sidLen - 1);
+            outSid[sidLen - 1] = '\0';
+        }
+        Item* got = g_buyItemFn(vinv, items[pick], buyer);
+        if (!got) return 0;
+        int q = got->quantity; if (q < 1) q = 1;
+        if (outQty) *outQty = q;
+        // The drop half of the trade-window drag: the bought stack lands in the
+        // buyer's bag; dropped at the buyer's feet only if the bag is full.
+        if (!binv->tryAddItem(got, q)) {                     // virtual
+            binv->addItem(got, q, /*dropOnFail=*/true, /*destroyOnFail=*/false);
+        }
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
 

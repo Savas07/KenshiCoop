@@ -38,14 +38,19 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
             contCensusMs_ = cnow;
             const unsigned int MAX_CONT = 48;
             static engine::ContRead rows[MAX_CONT]; // main-thread only
-            unsigned int n = engine::enumContainersNear(gw, 100.0f, rows, MAX_CONT);
+            // Protocol 60: with vendor sync the census also takes the SHOP
+            // COUNTERS (BF_SHOP furniture of any class) - a shop's stock.
+            unsigned int n = engine::enumContainersNear(gw, 100.0f, rows, MAX_CONT,
+                                                        vendorSync_);
             censusContainers_.clear();
+            censusShops_.clear();
             for (unsigned int i = 0; i < n; ++i) {
                 if (!rows[i].hasInv) continue; // no Inventory = nothing to author
                 Key k; k.t = rows[i].hand[0]; k.c = rows[i].hand[1];
                 k.cs = rows[i].hand[2]; k.i = rows[i].hand[3];
                 k.s = rows[i].hand[4];
                 censusContainers_.insert(k);
+                if (vendorSync_ && rows[i].shop) censusShops_.insert(k);
             }
         }
         owned.insert(censusContainers_.begin(), censusContainers_.end());
@@ -150,6 +155,7 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
             }
         }
         u8 sflags = trunc ? INV_FLAG_TRUNCATED : (u8)0;
+        if (censusShops_.count(*it) != 0) sflags |= INV_FLAG_SHOP; // protocol 60
         net.queueInvSnapshot(ownerId, keyKind, wireKey, items, n, sflags);
         pub.hash = hash; pub.lastSendMs = now; pub.lastSentN = n; pub.lastSentUnits = units;
         if (changed) {
@@ -191,6 +197,27 @@ void Replicator::applyInventories(GameWorld* gw) {
         // verbatim was a silent no-op, so the mine's output never crossed.
         unsigned int cHand[5];
         handForContainerKey(k, cHand, it->second.ownerId);
+        // Protocol 60: a mirrored shop counter holding a local change the vendor
+        // detector has not reported yet (a purchase or sale still settling) must
+        // not be reconciled now - that would undo the trade before it reaches
+        // the host. Defer until it is sent + latched (the detector settles in
+        // ~1 s); on deadline fall through. Shop keys never enter the protocol-37
+        // detector, so xferDefer_ is free to time this defer.
+        if (it->second.shop && vendorSync_ && vendorUnreported(gw, k, cHand)) {
+            const unsigned long VENDOR_DEFER_MS = 3000;
+            unsigned long now = nowMs();
+            unsigned long& since = xferDefer_[k];
+            if (since == 0) since = now;
+            if (now - since < VENDOR_DEFER_MS) {
+                it->second.dirty = true; // re-visit next tick
+                continue;
+            }
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[vendor] defer-expired hand=%u,%u,%u,%u,%u (unreported local change; applying)",
+                k.t, k.c, k.cs, k.i, k.s);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (it->second.shop) xferDefer_.erase(k);
         const InvItemEntry* items = it->second.items.empty() ? 0 : &it->second.items[0];
         unsigned int n = (unsigned int)it->second.items.size();
         // Protocol 37 (the race that blinded the detector in run 141024): if this
@@ -308,8 +335,10 @@ void Replicator::applyInventories(GameWorld* gw) {
             n = (unsigned int)adj.size();
         }
         engine::applyContainerContents(gw, cHand, items, n, it->second.truncated);
-        // Keep the transfer detector blind to the reconcile we just performed.
-        xferRebase(gw, k);
+        // Keep the transfer detector (or, for a mirrored shop counter, the
+        // vendor detector) blind to the reconcile we just performed.
+        if (it->second.shop && vendorSync_) vendorRebase(gw, k, cHand);
+        else xferRebase(gw, k);
         char b[160];
         _snprintf(b, sizeof(b) - 1,
             "[inv] APPLY hand=%u,%u,%u,%u,%u items=%u",
@@ -1613,8 +1642,11 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     // snapshot for. Both ends of any drag a player can perform live in this union.
     std::set<Key> tracked = ownedContainers_;
     tracked.insert(ownHands_.begin(), ownHands_.end());
+    // Protocol 60: a mirrored shop counter is the vendor detector's - a purchase
+    // pairs its loss with the buyer's gain exactly like a drag, and authoring it
+    // here as well would take the item out of the host's stock twice.
     for (std::map<Key, InvRecv>::iterator ri = invRecv_.begin(); ri != invRecv_.end(); ++ri)
-        tracked.insert(ri->first);
+        if (!(ri->second.shop && vendorSync_)) tracked.insert(ri->first);
     if (tracked.empty()) return;
 
     // Capture this scan's per-item totals for each resolvable container.
@@ -1966,6 +1998,152 @@ void Replicator::releaseXferLatch(const Key& k, const XKey& key, int delta) {
     le->second.delta += delta;
     if (le->second.delta == 0) lt->second.erase(le);
     if (lt->second.empty()) xferLatch_.erase(lt);
+}
+
+// ---- Protocol 60: shared vendor stock ---------------------------------------
+
+// Per-item totals of the container at cHand (loose + worn; top level only).
+void Replicator::vendorTotals(GameWorld* gw, const unsigned int cHand[5],
+                              std::map<XKey, int>& out) {
+    out.clear();
+    InvItemEntry items[INV_ITEMS_MAX];
+    unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX, 0);
+    for (unsigned int i = 0; i < n; ++i) {
+        int q = items[i].quantity; if (q < 1) q = 1;
+        out[XKey(std::string(items[i].stringID), items[i].itemType)] += q;
+    }
+}
+
+// The host just put this counter in a known state: that is the baseline every
+// later local change is measured against.
+void Replicator::vendorRebase(GameWorld* gw, const Key& k, const unsigned int cHand[5]) {
+    if (engine::resolveObjectByHand(cHand) == 0) return;
+    vendorTotals(gw, cHand, vendorBase_[k]);
+    vendorPend_.erase(k);
+}
+
+bool Replicator::vendorUnreported(GameWorld* gw, const Key& k, const unsigned int cHand[5]) {
+    std::map<Key, std::map<XKey, int> >::iterator bi = vendorBase_.find(k);
+    if (bi == vendorBase_.end()) return false; // never mirrored: nothing to protect
+    if (engine::resolveObjectByHand(cHand) == 0) return false;
+    std::map<XKey, int> cur;
+    vendorTotals(gw, cHand, cur);
+    return cur != bi->second;
+}
+
+bool Replicator::vendorRefreshGated(unsigned int platContainer, unsigned int platSerial) const {
+    return vendorOwners_.count(std::make_pair((u32)platContainer, (u32)platSerial)) != 0;
+}
+
+void Replicator::detectAndPublishVendorDeltas(GameWorld* gw, NetLink& net, u32 ownerId) {
+    if (!vendorSync_ || isHostRole()) return;
+    const unsigned long SCAN_MS   = 400;   // detector cadence (the protocol-37 one)
+    const unsigned long SETTLE_MS = 600;   // a stack on the trade cursor is not a trade yet
+    const unsigned long GRACE_MS  = 10000; // latch lifetime (the host answers by snapshot)
+    const unsigned long FRESH_MS  = 40000; // a mirror older than this no longer gates restock
+    unsigned long now = nowMs();
+    if (vendorScanMs_ != 0 && now - vendorScanMs_ < SCAN_MS) return;
+    vendorScanMs_ = now;
+    vendorOwners_.clear();
+    for (std::map<Key, InvRecv>::iterator ri = invRecv_.begin(); ri != invRecv_.end(); ++ri) {
+        if (!ri->second.shop) continue;
+        const Key& k = ri->first;
+        unsigned int cHand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        if (engine::resolveObjectByHand(cHand) == 0) continue;
+        // The restock gate: this counter's trader platoon, while the mirror is live.
+        unsigned int owner[5];
+        if (now - ri->second.recvMs < FRESH_MS && engine::readShopCounterOwner(cHand, owner))
+            vendorOwners_.insert(std::make_pair((u32)owner[1], (u32)owner[2]));
+        std::map<Key, std::map<XKey, int> >::iterator bi = vendorBase_.find(k);
+        if (bi == vendorBase_.end()) continue; // not applied yet: no baseline to diff
+        std::map<XKey, int> cur;
+        vendorTotals(gw, cHand, cur);
+        std::map<XKey, int>& base = bi->second;
+        std::map<XKey, std::pair<int, unsigned long> >& pend = vendorPend_[k];
+        std::set<XKey> keys;
+        for (std::map<XKey, int>::iterator b = base.begin(); b != base.end(); ++b) keys.insert(b->first);
+        for (std::map<XKey, int>::iterator c = cur.begin(); c != cur.end(); ++c) keys.insert(c->first);
+        for (std::set<XKey>::iterator ky = keys.begin(); ky != keys.end(); ++ky) {
+            std::map<XKey, int>::iterator bv = base.find(*ky);
+            std::map<XKey, int>::iterator cv = cur.find(*ky);
+            int have  = (cv != cur.end()) ? cv->second : 0;
+            int delta = have - ((bv != base.end()) ? bv->second : 0);
+            std::map<XKey, std::pair<int, unsigned long> >::iterator pe = pend.find(*ky);
+            if (delta == 0) { if (pe != pend.end()) pend.erase(pe); continue; }
+            if (pe == pend.end() || pe->second.first != delta) {
+                pend[*ky] = std::make_pair(delta, now);
+                continue;
+            }
+            if (now - pe->second.second < SETTLE_MS) continue;
+            // Settled: report it, take it into the baseline, latch the counter.
+            VendorDeltaPacket pkt; memset(&pkt, 0, sizeof(pkt));
+            pkt.type = (u8)PKT_VENDOR_DELTA; pkt.ownerId = ownerId;
+            pkt.deltaId = nextVendorDeltaId_++;
+            pkt.cType = k.t; pkt.cContainer = k.c; pkt.cContainerSerial = k.cs;
+            pkt.cIndex = k.i; pkt.cSerial = k.s;
+            strncpy(pkt.stringID, ky->first.c_str(), sizeof(pkt.stringID) - 1);
+            pkt.itemType = ky->second;
+            pkt.delta = delta;
+            pkt.level = GRADE_NA;
+            if (delta > 0) {
+                // A sale: the host fabricates the stack, so carry its identity.
+                InvItemEntry items[INV_ITEMS_MAX];
+                unsigned int n = engine::captureContainerContents(gw, cHand, items,
+                                                                  INV_ITEMS_MAX, 0);
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (items[i].itemType != ky->second) continue;
+                    if (ky->first != items[i].stringID) continue;
+                    pkt.quality = items[i].quality;
+                    pkt.level   = items[i].level;
+                    strncpy(pkt.manufacturer, items[i].manufacturer, sizeof(pkt.manufacturer) - 1);
+                    strncpy(pkt.material, items[i].material, sizeof(pkt.material) - 1);
+                    break;
+                }
+            }
+            net.queueVendorDelta(pkt);
+            if (have > 0) base[*ky] = have; else base.erase(*ky);
+            pend.erase(*ky);
+            XferLatch& L = xferLatch_[k][*ky];
+            L.delta += delta; L.deadlineMs = now + GRACE_MS;
+            if (L.delta == 0) xferLatch_[k].erase(*ky);
+            char b[224]; _snprintf(b, sizeof(b) - 1,
+                "[vendor] DELTA SEND id=%u counter=%u,%u,%u,%u,%u sid='%s' type=%u delta=%d",
+                pkt.deltaId, k.t, k.c, k.cs, k.i, k.s, pkt.stringID, pkt.itemType, delta);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (pend.empty()) vendorPend_.erase(k);
+    }
+}
+
+void Replicator::applyVendorDeltas(GameWorld* gw, Inbound& in) {
+    std::deque<InboundVendorDelta> got;
+    in.drainVendorDeltas(got);
+    if (got.empty() || !vendorSync_ || !isHostRole()) return;
+    for (std::deque<InboundVendorDelta>::iterator it = got.begin(); it != got.end(); ++it) {
+        const VendorDeltaPacket& p = it->pkt;
+        std::pair<u32, u32> id(p.ownerId, p.deltaId);
+        if (appliedVendorDeltas_.count(id) != 0) continue; // idempotent
+        appliedVendorDeltas_.insert(id);
+        if (appliedVendorDeltas_.size() > 4096) appliedVendorDeltas_.erase(appliedVendorDeltas_.begin());
+        unsigned int cHand[5] = { p.cType, p.cContainer, p.cContainerSerial, p.cIndex, p.cSerial };
+        char sid[sizeof(p.stringID) + 1];
+        memcpy(sid, p.stringID, sizeof(p.stringID)); sid[sizeof(p.stringID)] = '\0';
+        int done = 0;
+        if (p.delta < 0) {
+            done = -engine::removeItemsFromContainerBySid(gw, cHand, sid, p.itemType, -p.delta);
+        } else if (p.delta > 0) {
+            char man[sizeof(p.manufacturer) + 1], mat[sizeof(p.material) + 1];
+            memcpy(man, p.manufacturer, sizeof(p.manufacturer)); man[sizeof(p.manufacturer)] = '\0';
+            memcpy(mat, p.material, sizeof(p.material)); mat[sizeof(p.material)] = '\0';
+            done = engine::addItemsToContainerBySid(gw, cHand, sid, p.itemType, p.delta,
+                                                    (int)p.quality, man, mat, p.level);
+        }
+        char b[224]; _snprintf(b, sizeof(b) - 1,
+            "[vendor] DELTA APPLY id=%u from=%u counter=%u,%u,%u,%u,%u sid='%s' delta=%d applied=%d",
+            p.deltaId, p.ownerId, cHand[0], cHand[1], cHand[2], cHand[3], cHand[4], sid,
+            p.delta, done);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
 }
 
 

@@ -240,6 +240,12 @@ typedef void  (__fastcall* OwnSetMoneyFn)(Ownerships* self, int amount);
 typedef Item* (__fastcall* BuyItemFn)(Inventory* self, Item* itemToBuy,
                                       RootObject* sendingTo);
 typedef void  (__fastcall* PlatoonRefreshInvFn)(ActivePlatoon* self, bool firstTime);
+// Vendor stock (protocol 60): trader identity + the trade-window open path.
+typedef bool  (__fastcall* CharIsTraderFn)(const Character* self);
+typedef bool  (__fastcall* PlatBoolFn)(const ActivePlatoon* self);
+typedef void  (__fastcall* GuiShowTradeFn)(ForgottenGUI* self, const hand* a,
+                                           const hand* b, TradeWindowType type);
+typedef void  (__fastcall* GuiCloseTradeFn)(ForgottenGUI* self);
 
 // property deeds (protocol 54): the owned-object SET on the player faction's
 // Ownerships. Reference params cross as pointers (the __fastcall thunk ABI the
@@ -493,6 +499,11 @@ extern OwnSetMoneyFn g_ownSetMoneyFn;
 extern BuyItemFn     g_buyItemFn;
 extern PlatoonRefreshInvFn g_platoonRefreshInvFn;
 extern ShopGetTraderFn     g_shopGetTraderFn;
+extern CharIsTraderFn  g_charIsTraderFn;
+extern PlatBoolFn      g_platIsTraderFn;
+extern PlatBoolFn      g_platHasVendorListFn;
+extern GuiShowTradeFn  g_guiShowTradeFn;
+extern GuiCloseTradeFn g_guiCloseTradeFn;
 
 // property deeds (protocol 54)
 extern OwnAddObjFn   g_ownAddObjFn;

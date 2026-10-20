@@ -764,6 +764,11 @@ int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
                              const char* sid, unsigned int typeCat, int qty,
                              int qualityBucket, const char* manufacturer,
                              const char* material, unsigned char level = GRADE_NA);
+// SEH-guarded (protocol 60): remove and destroy up to `qty` units of (sid,
+// typeCat) from the container at cHand, loose stacks first. Returns the number
+// removed.
+int removeItemsFromContainerBySid(GameWorld* gw, const unsigned int cHand[5],
+                                  const char* sid, unsigned int typeCat, int qty);
 
 // SEH-guarded (trade_probe / cross-owner transfers): move up to `qty` of (sid, typeCat)
 // from the container at srcHand into the container at dstHand by RELOCATING the real
@@ -2098,14 +2103,20 @@ struct ContRead {
     int   firstQty;       // first captured entry's quantity
     char  name[40];       // template name (diagnostics)
     char  sid[48];        // template GameData stringID
+    int   shop;           // protocol 60: a SHOP COUNTER (BF_SHOP / shopOwner set)
+    unsigned int shopOwner[5]; // its UseableStuff::shopOwner (trader PLATOON hand)
 };
 // SEH-guarded enumeration of COMPLETE container-bearing buildings (STORAGE +
 // the machine classes) within radius of the interest centers (dual-interest,
 // deduped). Per row the contents are captured (up to 64 entries) into the
 // count/qty/hash summary - the capacity question's measuring stick. Returns
-// the count written.
+// the count written. includeShops (protocol 60) also takes the SHOP COUNTERS,
+// whatever their class - the host's vendor-stock census.
 unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
-                                unsigned int maxOut);
+                                unsigned int maxOut, bool includeShops = false);
+// SEH-guarded: the shopOwner (trader PLATOON hand) of the shop counter at
+// cHand. False when it does not resolve or is not a shop counter.
+bool readShopCounterOwner(const unsigned int cHand[5], unsigned int owner[5]);
 // SEH-guarded single-container read by local hand. Returns false when the hand
 // does not resolve locally or is not a container-bearing building class.
 bool readContainerByHand(const unsigned int cHand[5], ContRead* out);
@@ -2198,6 +2209,72 @@ int ensureVendorStock(GameWorld* gw, const unsigned int vHand[5]);
 int probeVendorBuy(GameWorld* gw, const unsigned int vHand[5],
                    const unsigned int buyerHand[5],
                    char* outSid, unsigned int sidLen);
+
+// ---- Protocol 60: vendor stock ----------------------------------------------
+// Kenshi's shop stock lives in the shop's COUNTERS - storage furniture whose
+// UseableStuff::shopOwner names the trader character - and the trade UI's
+// ShopTrader wrapper only aggregates their sections. These readers expose the
+// counters and their owning trader so the vendor_stock scenario can compare
+// both clients' stock per trader.
+struct ShopCounterRead {
+    unsigned int hand[5];  // counter hand (readObjectHand layout)
+    unsigned int owner[5]; // UseableStuff::shopOwner: the trader's PLATOON hand
+                           // (type PLATOON; only container/containerSerial set)
+    int   classType;       // BuildingClassType
+    int   fn;              // Building::getSpecialFunction() (BF_SHOP = shop counter)
+    int   hasInv;          // getInventory() != null
+    int   nEntries;        // captured entries
+    int   qtyTotal;        // summed quantity
+    float x, y, z;
+    char  name[40];        // template name (diagnostics)
+};
+// SEH-guarded: every building within radius of the local leader that is a
+// shop counter (shopOwner set, or special function BF_SHOP). Returns count.
+unsigned int enumShopCountersNear(GameWorld* gw, float radius,
+                                  ShopCounterRead* out, unsigned int maxOut);
+// Trader character readout (identity + the engine's own trader predicates).
+struct TraderRead {
+    unsigned int hand[5];
+    int   isTrader;        // Character::isATrader (-1 unresolved)
+    int   platTrader;      // ActivePlatoon::getIsTrader (-1 unresolved)
+    int   hasVendorList;   // ActivePlatoon::getHasVendorList (-1 unresolved)
+    int   hasInv, nEntries, qtyTotal; // the character's own inventory
+    float x, y, z;
+    char  name[40];
+};
+// SEH-guarded read of the character at tHand. False when it does not resolve.
+bool readTraderByHand(const unsigned int tHand[5], TraderRead* out);
+// SEH-guarded: every character within radius of the local leader that the
+// engine calls a trader (Character::isATrader or its platoon's getIsTrader).
+unsigned int listTradersNear(GameWorld* gw, float radius, TraderRead* out,
+                             unsigned int maxOut);
+// SEH-guarded: open the engine's trade window between the buyer and the
+// trader exactly as the dialogue "Trade" option does (ForgottenGUI::
+// showTradeWindow, money trading). Returns 1 requested, 0 unresolved, -1 fault.
+int openTradeWindow(const unsigned int buyerHand[5], const unsigned int traderHand[5]);
+// SEH-guarded: close any open trade window.
+void closeTradeWindow();
+// SEH-guarded: ONE purchase exactly as the trade window performs it - the
+// engine's Inventory::buyItem on the stock container at srcHand (debits the
+// player pool, credits the shop, takes the stack out of stock), then the
+// returned stack is put into the buyer's inventory (the drop half of the UI
+// drag; buyItem itself only hands the item back). pickLast selects the last
+// loose stack instead of the first. Writes the bought sid + units.
+// Returns 1 bought, 0 nothing to buy / refused, -1 fault or unresolved.
+int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
+                  const unsigned int buyerHand[5], bool pickLast,
+                  char* outSid, unsigned int sidLen, int* outQty);
+// Protocol 60, the join's half of host-owned stock: a trader's own stock
+// refresh (ActivePlatoon::refreshInventory) must not restock a shop whose
+// counters the host mirrors, or the join would show - and report back as
+// trades - goods the host never made. The gate is asked with the platoon's
+// hand container fields (what shopOwner names); true skips the refresh
+// ("[vendor] REFRESH-SKIP"). A null gate (host, sync off) never skips.
+typedef bool (*VendorRefreshGateFn)(unsigned int platContainer, unsigned int platSerial);
+void setVendorRefreshGate(VendorRefreshGateFn fn);
+// Detour ActivePlatoon::refreshInventory: every trader refresh logs
+// "[vendor] REFRESH" and consults the gate above.
+bool installVendorHooks();
 
 // ---- Consensus game-speed sync ----------------------------------------------
 

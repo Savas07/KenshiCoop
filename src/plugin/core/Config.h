@@ -568,6 +568,16 @@ struct Config {
     // the A/B escape hatch.
     bool          storeSync;
 
+    // KENSHICOOP_VENDOR_SYNC (default ON): shared vendor stock (protocol 60).
+    // A shop's goods live in its counters (BF_SHOP furniture, not storage),
+    // which no channel carried: every client bought from its own copy, so one
+    // player could empty a shop the other still saw full. The host censuses
+    // the counters with the storage chests and mirrors them (INV_FLAG_SHOP);
+    // a join reports each change a trade makes to a mirrored counter as a
+    // PKT_VENDOR_DELTA the host applies, and skips its own restock of those
+    // shops. Layered on invSync + storeSync. "0" is the A/B escape hatch.
+    bool          vendorSync;
+
     // KENSHICOOP_SQUAD_SYNC (default ON): squad management sync (protocol 35)
     // - a squad-tab MOVE re-containers the body (its hand changes) exactly
     // like a recruit, but no engine function owns the UI path, so the roster
