@@ -779,6 +779,164 @@ function Test-MineOutput {
         applied = $applied; onPaired = $onPaired; notApplied = $dropped })
 }
 
+# mine_yield / mine_yield_join: one unit of mining work must pay the owner ONE
+# unit of ore. Reads the 1 Hz "SCENARIO MINEYIELD" samples both sides log for
+# the same miner (owner=1 on the owner's side, its copy on the other), the
+# owner's COLLECT moves, and the machine-work detour's "[prod] operate CROSS"
+# lines (one per whole unit a machine minted on that client, driven=1 when the
+# worker was a peer's copy). Machine output is host-simulated (protocols 33/34),
+# so the HOST's crossings for the miner are the authoritative production, and a
+# crossing on the JOIN is a second sim minting the same work. Gates:
+#   yield   - owner's ore gain == host crossings (+-Slack), at least one unit
+#   single  - zero join-side crossings for the miner (one sim produces)
+#   fab     - zero [xfer] APPLY of the ore with fab>0 (the host had to invent it)
+#   parity  - the copy ends holding what the owner holds
+# Before the fix (2026-10-20, 2-3 ore per unit in a Workshop report) the join
+# minted too: its copy of a host miner filled the join's mine, and a join miner
+# was paid by both sims, the host's half fabricated on arrival.
+function Get-MineYieldRows {
+    param([string]$File)
+    $rx = [regex]'^\[(\d+):(\d+):(\d+)\.(\d+)\].*SCENARIO MINEYIELD side=(\w+) arm=(\w+) owner=(\d) t=(\d+) miner=(\d+),(\d+) task=(-?\d+) ore=(-?\d+) mine=([\d.]+) mineAmt=(-?[\d.]+) mineInv=(-?\d+) sid=''([^'']*)'''
+    $rows = @()
+    if (-not (Test-Path $File)) { return $rows }
+    foreach ($line in [System.IO.File]::ReadLines((Resolve-Path $File))) {
+        $m = $rx.Match($line)
+        if (-not $m.Success) { continue }
+        $wall = ((([int]$m.Groups[1].Value * 60) + [int]$m.Groups[2].Value) * 60 + [int]$m.Groups[3].Value) * 1000 + [int]$m.Groups[4].Value
+        $rows += [pscustomobject]@{
+            wall = $wall; side = $m.Groups[5].Value; arm = $m.Groups[6].Value
+            owner = [int]$m.Groups[7].Value; t = [long]$m.Groups[8].Value
+            miner = "$($m.Groups[9].Value),$($m.Groups[10].Value)"; task = [int]$m.Groups[11].Value
+            ore = [int]$m.Groups[12].Value; mine = $m.Groups[13].Value
+            mineAmt = [double]$m.Groups[14].Value; mineInv = [int]$m.Groups[15].Value
+            sid = $m.Groups[16].Value }
+    }
+    return $rows
+}
+
+function Get-MineCrosses {
+    param([string]$File, [string]$Miner, [int]$UntilWall = [int]::MaxValue)
+    $rx = [regex]'^\[(\d+):(\d+):(\d+)\.(\d+)\].*\[prod\] operate CROSS mach=([\d.]+) who=(\d+,\d+) driven=(\d)'
+    $c = @{ own = 0; driven = 0 }
+    if (-not (Test-Path $File)) { return $c }
+    foreach ($line in [System.IO.File]::ReadLines((Resolve-Path $File))) {
+        $m = $rx.Match($line)
+        if (-not $m.Success -or $m.Groups[6].Value -ne $Miner) { continue }
+        $wall = ((([int]$m.Groups[1].Value * 60) + [int]$m.Groups[2].Value) * 60 + [int]$m.Groups[3].Value) * 1000 + [int]$m.Groups[4].Value
+        if ($wall -gt $UntilWall) { continue }
+        if ([int]$m.Groups[7].Value -eq 1) { $c.driven++ } else { $c.own++ }
+    }
+    return $c
+}
+
+function Test-MineYield {
+    param([string]$HostFile, [string]$JoinFile, [int]$OrderAtMs = 18000, [int]$Slack = 1,
+          [int]$CollectLagMs = 6000)
+    $H = @(Get-MineYieldRows -File $HostFile)
+    $J = @(Get-MineYieldRows -File $JoinFile)
+    if ($H.Count -lt 10 -or $J.Count -lt 10) {
+        Write-Host "  MINE-YIELD FAIL - insufficient MINEYIELD samples (host=$($H.Count) join=$($J.Count))"
+        return (Add-GateResult -Name "mine_yield" -Status FAIL -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
+    }
+    $arm = $H[0].arm
+    $O = if ($arm -eq 'host') { $H } else { $J }     # owner's real miner
+    $C = if ($arm -eq 'host') { $J } else { $H }     # the peer's copy of it
+    $pre = @($O | Where-Object { $_.t -lt $OrderAtMs -and $_.ore -ge 0 })
+    $base = if ($pre.Count) { $pre[-1].ore } else { $O[0].ore }
+    # Judge only the window both clients were sampling (the join stops first).
+    $endWall = [Math]::Min($H[-1].wall, $J[-1].wall)
+    $Ow = @($O | Where-Object { $_.wall -le $endWall })
+    $gain = $Ow[-1].ore - $base
+    $miner = $O[0].miner
+    # A unit minted in the last CollectLagMs may not have reached the miner yet
+    # (4 s collect cadence + the join's intent round trip): count crossings up
+    # to that margin, and let Slack absorb one boundary unit either way.
+    $until = $endWall - $CollectLagMs
+    $hc = Get-MineCrosses -File $HostFile -Miner $miner -UntilWall $until
+    # Join crossings inside the judged window only: once the host has exited,
+    # the join's unmirrored machine rightly works locally again.
+    $jc = Get-MineCrosses -File $JoinFile -Miner $miner -UntilWall $endWall
+    $auth = $hc.own + $hc.driven
+    $joinMinted = $jc.own + $jc.driven
+    $sid = $Ow[-1].sid
+    $fab = 0
+    foreach ($f in @($HostFile, $JoinFile)) {
+        foreach ($m in (Select-String -Path $f -Pattern ("\[xfer\] APPLY .*sid='" + [regex]::Escape($sid) + "'.*\bfab=(\d+)") -AllMatches).Matches) {
+            if ([int]$m.Groups[1].Value -gt 0) { $fab++ }
+        }
+    }
+    $collected = 0
+    foreach ($m in (Select-String -Path $(if ($arm -eq 'host') { $HostFile } else { $JoinFile }) -Pattern 'SCENARIO MINEYIELD COLLECT .*\bmoved=(\d+)' -AllMatches).Matches) {
+        $collected += [int]$m.Groups[1].Value
+    }
+    # Final parity: the copy's LAST sample must match what the owner held when it
+    # was taken (within 8 s: the owner snapshot rides a ~0.35-1.8 s settle +
+    # reliable delivery), or the owner's final count if the owner stopped first.
+    # Read the copy past the joint window on purpose: after a join loot from the
+    # host-authored mine, the host's protocol-37 latch holds the moved unit on its
+    # copy until the grace expires (~10-15 s, "[xfer] latch-expired ... delta=1"),
+    # so mid-window the copy can legitimately read one high.
+    $copyLast = $C[-1]
+    $copyEnd = $copyLast.ore
+    $ownerNear = @($O | Where-Object { $_.wall -ge ($copyLast.wall - 8000) -and $_.wall -le $copyLast.wall } | ForEach-Object { $_.ore })
+    if ($ownerNear.Count -eq 0) { $ownerNear = @($O[-1].ore) }
+    $parity = ($ownerNear -contains $copyEnd)
+    $yieldOk = ($auth -ge 1) -and ([Math]::Abs($gain - $auth) -le $Slack)
+    $ok = $yieldOk -and ($joinMinted -eq 0) -and ($fab -eq 0) -and $parity
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $why = @()
+    if (-not $yieldOk)     { $why += "yield" }
+    if ($joinMinted -gt 0) { $why += "join-minted" }
+    if ($fab -gt 0)        { $why += "ore-fab" }
+    if (-not $parity)      { $why += "parity" }
+    Write-Host ("  MINE-YIELD [$arm-owned] $v - owner gain=$gain (base=$base end=$($Ow[-1].ore) collected=$collected) " +
+                "authoritative(host crossings)=$auth [own=$($hc.own) driven=$($hc.driven)] " +
+                "join crossings=$joinMinted [own=$($jc.own) driven=$($jc.driven)] oreFab=$fab " +
+                "copyEnd=$copyEnd parity=$parity$(if ($why.Count) { ' FAILED: ' + ($why -join ',') })")
+    return (Add-GateResult -Name "mine_yield" -Status $v -Metrics @{
+        gain = $gain; authoritative = $auth; hostOwn = $hc.own; hostDriven = $hc.driven
+        joinOwn = $jc.own; joinDriven = $jc.driven; oreFab = $fab; parity = [int]$parity
+        collected = $collected } -Detail ($why -join ','))
+}
+
+# machine_single (2026-10-20, the machine-class generalisation of mine_yield):
+# a machine is worked by ONE sim. The machine-work detour logs a ~5 s aggregate
+# per worker/machine pair ("[prod] operate mach=.. who=.. driven=.. calls=..
+# sum=<work applied> skipped=<work withheld>"). The join must apply no worker's
+# machine work while the host mirrors the machine (sum=0, no CROSS lines); the
+# host's lines prove the work happened at all. who=0,0 rows (a building's own
+# per-frame self-call, logged by the first diagnostic build) are not worker
+# work and are ignored. SKIP when nobody worked a machine in the run.
+function Test-MachineSingle {
+    param([string]$HostFile, [string]$JoinFile)
+    $agg = [regex]'\[prod\] operate mach=([\d.]+) who=(\d+,\d+) driven=(\d) calls=(\d+) sum=([\d.]+) skipped=(\d+)'
+    $count = {
+        param($File)
+        $r = @{ worked = 0; skipped = 0; cross = 0; machines = @{} }
+        if (-not (Test-Path $File)) { return $r }
+        foreach ($m in (Select-String -Path $File -Pattern $agg -AllMatches).Matches) {
+            if ($m.Groups[2].Value -eq '0,0') { continue }
+            if ([double]$m.Groups[5].Value -gt 0) { $r.worked++; $r.machines[$m.Groups[1].Value] = $true }
+            $r.skipped += [int]$m.Groups[6].Value
+        }
+        $r.cross = @(Select-String -Path $File -Pattern '\[prod\] operate CROSS .*who=(?!0,0 )').Count
+        return $r
+    }
+    $h = & $count $HostFile
+    $j = & $count $JoinFile
+    if ($h.worked -eq 0 -and $j.worked -eq 0 -and $j.skipped -eq 0) {
+        Write-Host "  MACHINE-SINGLE SKIP - no machine work logged on either side"
+        return (Add-GateResult -Name "machine_single" -Status SKIP -Detail "no machine work")
+    }
+    $ok = ($j.worked -eq 0) -and ($j.cross -eq 0) -and ($h.worked -gt 0)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host ("  MACHINE-SINGLE $v - host work rows=$($h.worked) (machines=$($h.machines.Count)) crossings=$($h.cross); " +
+                "join work rows=$($j.worked) (machines=$($j.machines.Count)) crossings=$($j.cross) withheld calls=$($j.skipped)")
+    return (Add-GateResult -Name "machine_single" -Status $v -Metrics @{
+        hostWork = $h.worked; hostCross = $h.cross; joinWork = $j.worked
+        joinCross = $j.cross; joinSkipped = $j.skipped })
+}
+
 # mine_clear (2026-07-15 job-removal fix): removing a job on the host while the
 # character stays STATIONARY streams task=NONE continuously; the join must RELEASE
 # the held operate pose after TASK_CLEAR_MS (logs "[pose] task-clear ...") instead
