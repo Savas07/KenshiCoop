@@ -498,3 +498,14 @@ receiver of that body's identity, and an ownership change has to end every drive
 binding the old owner's stream created, not only the one the event names.
 A mirrored test arm (here, a host recruit run alongside the join recruit) is what
 separates "the receiver cannot resolve it" from "the feature is broken".
+
+Two receiver-side follow-ups the recruit arms exposed. The host inserts a peer's
+recruit into its squad with `setFaction`, but `playerCharacters` refreshes a tick
+later, so for one publish the body passed the NPC capture as a world NPC under its
+fresh local hand; the recruiter REQ'd that hand and minted a phantom twin into its
+own squad (`rj_after2`: join squad +2). A pinned squad hand is now never streamed
+as an NPC (`[recruit] NPC-SKIP`). And a bar recruit is usually sitting: the peer's
+copy kept its stool action (OPERATE_MACHINERY) after the re-key, an AI-suspended
+copy never ends it, so it sat frozen or crawled while the owner ran. A squad copy
+in a seat/work pose whose owner moves with no task now ends it (`[heal] POSE`) -
+the same staleness rule the get-up heal already applied.
