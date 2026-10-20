@@ -858,17 +858,20 @@ private:
 //   * SCENARIO VTRADER  - every trader character near the leader;
 //   * SCENARIO VBAG     - each tab leader's bag multiset (the buyer's side);
 //   * SCENARIO VWALLET  - the shared player pool.
-// Trade sessions (open the engine's trade window with the shopkeeper, buy,
+// Trade sessions (open the engine's trade window with the shopkeeper, trade,
 // close): host seeds the pool at t=4 s; join 10/14/18 s buys the FIRST stack;
 // host 24/28/32 s buys the LAST stack; join 38/42/46 s buys out EVERY
 // remaining stack (one player emptying the shop is exactly where the other
-// player's view reading full instead of 0 shows); end at t=62 s.
+// player's view reading full instead of 0 shows); join 50/53/56 s SELLS one
+// stack back, host 60/63/66 s sells one too (the merchant pays: its cash must
+// read the same on both screens - VSTOCK cash=); end at t=74 s.
 // The C++ gate only asserts the script ran; Test-VendorStock judges the sync.
 class VendorStockScenario : public TimedScenario {
 public:
     VendorStockScenario()
         : TimedScenario("vendor_stock", /*evidenceMs=*/1000),
-          picked_(false), seeded_(false), step_(0), buys_(0), sawCounter_(false) {
+          picked_(false), seeded_(false), step_(0), buys_(0), sells_(0),
+          sawCounter_(false) {
         memset(thand_, 0, sizeof(thand_));
         memset(trader_, 0, sizeof(trader_));
     }
@@ -907,19 +910,19 @@ public:
             }
         }
         if (ctx.elapsedMs >= DURATION_MS) {
-            passed_ = sawCounter_ && picked_ && buys_ > 0;
+            passed_ = sawCounter_ && picked_ && buys_ > 0 && sells_ > 0;
             return true;
         }
         return false;
     }
 
 private:
-    enum BuyMode { BUY_FIRST, BUY_LAST, BUY_ALL };
+    enum BuyMode { BUY_FIRST, BUY_LAST, BUY_ALL, SELL };
     struct Session { unsigned long openAt, buyAt, closeAt; BuyMode mode; };
     static const Session HOST_SESSIONS[];
     static const Session JOIN_SESSIONS[];
-    static const unsigned int N_HOST_SESSIONS = 1;
-    static const unsigned int N_JOIN_SESSIONS = 2;
+    static const unsigned int N_HOST_SESSIONS = 2;
+    static const unsigned int N_JOIN_SESSIONS = 3;
 
 private:
     typedef std::map<std::string, int> Multiset;
@@ -984,6 +987,7 @@ private:
         }
         for (unsigned int k = 0; k < no; ++k) {
             Multiset m; unsigned int nc = 0;
+            int cash = -1; // the first counter's cash (every counter of one shop reads the same holder)
             for (unsigned int i = 0; i < n; ++i) {
                 if (!sameHand(rows[i].owner, owners[k])) continue;
                 InvItemEntry items[INV_ITEMS_MAX];
@@ -991,22 +995,26 @@ private:
                 unsigned int ne = engine::captureContainerContents(
                     ctx.gw, rows[i].hand, items, INV_ITEMS_MAX, &h);
                 addEntries(m, items, ne);
+                if (nc == 0) engine::readShopCash(rows[i].hand, &cash);
                 ++nc;
             }
             engine::TraderRead tr;
             memset(&tr, 0, sizeof(tr));
             bool live = picked_ && sameHand(owners[k], thand_) &&
                         engine::readTraderByHand(trader_, &tr);
+            // The trader platoon's own wallet: which object holds the shop's cash.
+            int tcash = -1;
+            if (live) engine::readWalletByHand(trader_, &tcash);
             int q = 0;
             std::string items = render(m, &q);
             std::string line;
             char b[320];
             _snprintf(b, sizeof(b) - 1,
                       "SCENARIO VSTOCK thand=%u,%u,%u,%u,%u counters=%u n=%u qty=%d "
-                      "live=%d isTrader=%d plat=%d vl=%d own=%d/%d "
+                      "cash=%d tcash=%d live=%d isTrader=%d plat=%d vl=%d own=%d/%d "
                       "tpos=%.1f,%.1f,%.1f t=%lu items=",
                       owners[k][0], owners[k][1], owners[k][2], owners[k][3], owners[k][4],
-                      nc, (unsigned int)m.size(), q, live ? 1 : 0,
+                      nc, (unsigned int)m.size(), q, cash, tcash, live ? 1 : 0,
                       tr.isTrader, tr.platTrader, tr.hasVendorList,
                       tr.nEntries, tr.qtyTotal, tr.x, tr.y, tr.z, ctx.elapsedMs);
             b[sizeof(b) - 1] = '\0';
@@ -1128,6 +1136,7 @@ private:
     // purchase is taken from the counter holding the most units.
     void doBuy(const ScenarioContext& ctx, BuyMode mode) {
         unsigned int bh[5];
+        if (mode == SELL) { doSell(ctx); return; }
         if (!ownLeaderHand(ctx, bh)) { logBuy(ctx, -2, 0, 0, ""); return; }
         for (unsigned int guard = 0; guard < MAX_BUYS; ++guard) {
             engine::ShopCounterRead rows[MAX_COUNTERS];
@@ -1163,8 +1172,37 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
+    // One sale: the last loose stack of this side's tab leader goes to the
+    // shop's first counter through the same engine call a purchase uses, with
+    // the roles swapped. VSELL carries the pool and the shop cash around it.
+    void doSell(const ScenarioContext& ctx) {
+        unsigned int sh[5];
+        unsigned int dst[5] = { 0, 0, 0, 0, 0 };
+        engine::ShopCounterRead rows[MAX_COUNTERS];
+        unsigned int n = engine::enumShopCountersNear(ctx.gw, RADIUS, rows, MAX_COUNTERS);
+        for (unsigned int i = 0; i < n; ++i)
+            if (sameHand(rows[i].owner, thand_)) { memcpy(dst, rows[i].hand, sizeof(dst)); break; }
+        char sid[48]; sid[0] = '\0';
+        int qty = 0, res = -2, w0 = -1, w1 = -1, c0 = -1, c1 = -1;
+        if (ownLeaderHand(ctx, sh) && (dst[3] != 0 || dst[4] != 0)) {
+            engine::readPlayerWallet(ctx.gw, &w0);
+            engine::readShopCash(dst, &c0);
+            res = engine::vendorBuyInto(ctx.gw, sh, dst, /*pickLast=*/true, sid, sizeof(sid), &qty);
+            engine::readPlayerWallet(ctx.gw, &w1);
+            engine::readShopCash(dst, &c1);
+        }
+        if (res == 1) ++sells_;
+        char b[256];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO VSELL who=%s res=%d qty=%d dst=%u,%u,%u,%u,%u sid='%s' "
+                  "wallet=%d->%d cash=%d->%d t=%lu",
+                  ctx.isHost ? "host" : "join", res, qty,
+                  dst[0], dst[1], dst[2], dst[3], dst[4], sid, w0, w1, c0, c1, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
     static const unsigned long SEED_AT_MS      = 4000;
-    static const unsigned long DURATION_MS     = 62000;
+    static const unsigned long DURATION_MS     = 74000;
     static const unsigned int  MAX_COUNTERS    = 32;
     static const unsigned int  MAX_SQUAD       = 32;
     static const unsigned int  MAX_TRADERS     = 16;
@@ -1175,17 +1213,20 @@ private:
     bool          picked_, seeded_;
     unsigned int  step_;       // session step: 3 per session (open, buy, close)
     unsigned int  buys_;       // stacks bought by this side
+    unsigned int  sells_;      // stacks sold by this side
     bool          sawCounter_;
     unsigned int  thand_[5];   // the shop owner (trader PLATOON hand) - the stock key
     unsigned int  trader_[5];  // the shopkeeper character
 };
 const float VendorStockScenario::RADIUS = 100.0f;
 const VendorStockScenario::Session VendorStockScenario::HOST_SESSIONS[] = {
-    { 24000, 28000, 32000, VendorStockScenario::BUY_LAST }
+    { 24000, 28000, 32000, VendorStockScenario::BUY_LAST },
+    { 60000, 63000, 66000, VendorStockScenario::SELL }
 };
 const VendorStockScenario::Session VendorStockScenario::JOIN_SESSIONS[] = {
     { 10000, 14000, 18000, VendorStockScenario::BUY_FIRST },
-    { 38000, 42000, 46000, VendorStockScenario::BUY_ALL }
+    { 38000, 42000, 46000, VendorStockScenario::BUY_ALL },
+    { 50000, 53000, 56000, VendorStockScenario::SELL }
 };
 
 // recruit_probe (protocol 23 phase 0, probe tier): mid-session recruitment

@@ -1995,6 +1995,28 @@ int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
+bool readShopCash(const unsigned int cHand[5], int* outCash) {
+    if (outCash) *outCash = -1;
+    if (!cHand || !outCash) return false;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return false;
+    __try { *outCash = ro->getMoney(); return true; }       // virtual
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool setShopCash(const unsigned int cHand[5], int target, int* outAfter) {
+    if (outAfter) *outAfter = -1;
+    if (!cHand || target < 0) return false;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return false;
+    __try {
+        int cur = ro->getMoney();                             // virtual
+        bool ok = (cur == target) || ro->takeMoney(cur - target); // virtual; < 0 pays in
+        if (outAfter) *outAfter = ro->getMoney();
+        return ok;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 
 } // namespace engine
 } // namespace coop

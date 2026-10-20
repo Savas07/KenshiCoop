@@ -2264,6 +2264,15 @@ void closeTradeWindow();
 int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
                   const unsigned int buyerHand[5], bool pickLast,
                   char* outSid, unsigned int sidLen, int* outQty);
+// A SALE is the same call with the roles swapped (srcHand = the seller's
+// character, buyerHand = the shop counter): the engine debits the counter's
+// cash, credits the player pool, and the stack lands on the counter.
+// SEH-guarded (protocol 60): the shop's cash as the counter reports it
+// (RootObject::getMoney - the money a trade at this counter moves).
+bool readShopCash(const unsigned int cHand[5], int* outCash);
+// SEH-guarded: move the counter's cash to `target` through the engine's own
+// takeMoney (a negative amount pays in). *outAfter = the re-read value.
+bool setShopCash(const unsigned int cHand[5], int target, int* outAfter);
 // Protocol 60, the join's half of host-owned stock: a trader's own stock
 // refresh (ActivePlatoon::refreshInventory) must not restock a shop whose
 // counters the host mirrors, or the join would show - and report back as
