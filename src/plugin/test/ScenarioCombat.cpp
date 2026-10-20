@@ -2222,10 +2222,12 @@ public:
     explicit HostPcFightScenario(bool mint)
         : TimedScenario(mint ? "host_pc_fight_mint" : "host_pc_fight", 500),
           mint_(mint), haveOwn_(false), havePeer_(false), haveVic_(false),
+          havePeerVic_(false), haveFled_(false),
           issued_(false), pickFailLogged_(false), spawned_(false), buffed_(false),
-          nEnemies_(0), lastOrderMs_(0), lastPickMs_(0) {
+          nEnemies_(0), lastOrderMs_(0) {
         for (int j = 0; j < 5; ++j) {
             ownHand_[j] = 0; peerHand_[j] = 0; vic_[j] = 0; lastVic_[j] = 0;
+            peerVic_[j] = 0; fled_[j] = 0;
         }
     }
 
@@ -2274,39 +2276,81 @@ private:
     static const unsigned int  ENEMY_N           = 4;
     static const float         FIGHTER_STATS;    // own squad + enemies (all stats)
     static const float         MINT_FIGHT_DIST;  // join attacks a mint this close
+    static const float         FLEE_DIST;        // a resident victim this far ran
+    static const unsigned long JOIN_GRACE_MS     = 3000;
 
-    // Both sides, resident variant: the nearest upright bar NPC near our own
-    // leader (falling back to the peer leader's crowd - the save bakes it around
-    // the HOST leader), re-picked when the victim goes down. The order is a
-    // keep-alive: orderAttackByHand no-ops while the attacker is fighting.
+    // Resident variant: the nearest upright bar NPC near each leader (falling back
+    // to the peer leader's crowd - the save bakes it around the HOST leader). A bar
+    // NPC that is merely attacked tends to FLEE, and then the fight is a sprint
+    // across the map (runs 162420/170458: both leaders chased one fleeing NPC at
+    // 70-120 u/s, their copies 100-330 u behind) - a chase, not the melee the
+    // report is about. So the HOST, which authors every bar NPC, also orders each
+    // leader's victim onto that leader: its own victim both ways, and the join
+    // leader's victim onto the join leader. The join gives that attacker
+    // JOIN_GRACE_MS to engage before it orders a pick of its own (a no-op while
+    // it is already fighting). A victim that still runs (> FLEE_DIST from its
+    // leader) or goes down is dropped and the next one picked. The orders are
+    // keep-alives: orderAttackByHand no-ops while the attacker is fighting.
     void tickResident(const ScenarioContext& ctx) {
         if (!haveOwn_ || ctx.elapsedMs < FIGHT_AT_MS) return;
-        if (haveVic_) {
-            Character* v = engine::resolveCharByHand(vic_[3], vic_[4], vic_[0],
-                                                     vic_[1], vic_[2]);
-            if (!v || bodyFlags(engine::readBodyState(v)) != 0) {
-                char b[128]; _snprintf(b, sizeof(b) - 1,
-                    "SCENARIO HPFIGHT victim down side=%s vic=%u,%u (re-picking)",
-                    ctx.isHost ? "host" : "join", vic_[3], vic_[4]);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-                haveVic_ = false;
-            }
-        }
-        if (!haveVic_ && (lastPickMs_ == 0 || (ctx.elapsedMs - lastPickMs_) >= ORDER_EVERY_MS)) {
-            lastPickMs_ = ctx.elapsedMs;
-            haveVic_ = engine::pickCombatVictim(ctx.gw, ownHand_, 0, vic_, 0);
+        dropLostVictim(ctx, vic_, haveVic_, ownHand_, true);
+        if (ctx.isHost && havePeer_) dropLostVictim(ctx, peerVic_, havePeerVic_, peerHand_, false);
+        if (lastOrderMs_ != 0 && (ctx.elapsedMs - lastOrderMs_) < ORDER_EVERY_MS) return;
+        if (!ctx.isHost && ctx.elapsedMs < FIGHT_AT_MS + JOIN_GRACE_MS) return;
+        lastOrderMs_ = ctx.elapsedMs;
+        if (!haveVic_) {
+            const unsigned int* ex = havePeerVic_ ? peerVic_ : 0;
+            const unsigned int* ex2 = haveFled_ ? fled_ : 0;
+            haveVic_ = engine::pickCombatVictim(ctx.gw, ownHand_, ex, vic_, ex2);
             if (!haveVic_ && havePeer_)
-                haveVic_ = engine::pickCombatVictim(ctx.gw, peerHand_, 0, vic_, 0);
+                haveVic_ = engine::pickCombatVictim(ctx.gw, peerHand_, ex, vic_, ex2);
             if (!haveVic_ && !pickFailLogged_) {
                 coop::logLine("SCENARIO HPFIGHT pick FAILED (no upright NPC; retrying)");
                 pickFailLogged_ = true;
             }
         }
-        if (haveVic_ && (lastOrderMs_ == 0 || (ctx.elapsedMs - lastOrderMs_) >= ORDER_EVERY_MS)) {
-            lastOrderMs_ = ctx.elapsedMs;
+        if (ctx.isHost && havePeer_ && !havePeerVic_) {
+            havePeerVic_ = engine::pickCombatVictim(ctx.gw, peerHand_, haveVic_ ? vic_ : 0,
+                                                    peerVic_, haveFled_ ? fled_ : 0);
+        }
+        if (haveVic_) {
             bool ok = engine::orderAttackByHand(ctx.gw, ownHand_, vic_);
+            if (ctx.isHost) engine::orderAttackByHand(ctx.gw, vic_, ownHand_);
             noteIssued(ctx, vic_, vic_, ok);
         }
+        if (ctx.isHost && havePeerVic_) engine::orderAttackByHand(ctx.gw, peerVic_, peerHand_);
+    }
+
+    // Drop a victim that went down or ran: it no longer gives its leader a fight.
+    // For our OWN leader the chase goal is cleared too, so the next order (which
+    // no-ops on a body that is still fighting) can retarget it.
+    void dropLostVictim(const ScenarioContext& ctx, unsigned int vic[5], bool& have,
+                        const unsigned int leaderHand[5], bool own) {
+        if (!have) return;
+        Character* v = engine::resolveCharByHand(vic[3], vic[4], vic[0], vic[1], vic[2]);
+        Character* l = engine::resolveCharByHand(leaderHand[3], leaderHand[4], leaderHand[0],
+                                                 leaderHand[1], leaderHand[2]);
+        const char* why = 0;
+        if (!v || bodyFlags(engine::readBodyState(v)) != 0) {
+            why = "down";
+        } else {
+            float vx = 0, vy = 0, vz = 0, lx = 0, ly = 0, lz = 0;
+            if (l && engine::readPos(v, &vx, &vy, &vz) && engine::readPos(l, &lx, &ly, &lz)) {
+                float dx = vx - lx, dz = vz - lz;
+                if (dx * dx + dz * dz > FLEE_DIST * FLEE_DIST) why = "fled";
+            }
+        }
+        if (!why) return;
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO HPFIGHT victim %s side=%s leader=%u,%u vic=%u,%u (re-picking)",
+            why, ctx.isHost ? "host" : "join", leaderHand[3], leaderHand[4], vic[3], vic[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (why[0] == 'f') {
+            for (int j = 0; j < 5; ++j) fled_[j] = vic[j];
+            haveFled_ = true;
+            if (own && l) engine::clearGoals(l);
+        }
+        have = false;
     }
 
     // HOST, mint variant: spawn once, then keep the even-numbered enemies on our
@@ -2480,17 +2524,20 @@ private:
     bool          haveOwn_;
     bool          havePeer_;
     bool          haveVic_;
+    bool          havePeerVic_; // host, resident: the victim ordered onto the join leader
+    bool          haveFled_;    // resident: the last victim that ran (excluded from picks)
     bool          issued_;
     bool          pickFailLogged_;
     bool          spawned_;
     bool          buffed_;
     unsigned int  nEnemies_;
     unsigned long lastOrderMs_;
-    unsigned long lastPickMs_;
     unsigned int  ownHand_[5];
     unsigned int  peerHand_[5];
     unsigned int  vic_[5];
     unsigned int  lastVic_[5];
+    unsigned int  peerVic_[5];
+    unsigned int  fled_[5];
     unsigned int  enemy_[ENEMY_N][5];
 };
 
@@ -2498,6 +2545,8 @@ const float HostPcFightScenario::FIGHTER_STATS = 120.0f;
 // Close enough that the proxy is live and visible on the join (inside the stream
 // bubble), well inside any plausible aggro radius.
 const float HostPcFightScenario::MINT_FIGHT_DIST = 40.0f;
+// Past pickCombatVictim's 30 u pick radius plus a melee lunge: the victim is running.
+const float HostPcFightScenario::FLEE_DIST = 45.0f;
 
 } // namespace
 
