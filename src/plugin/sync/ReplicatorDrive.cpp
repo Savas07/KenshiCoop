@@ -961,6 +961,31 @@ void Replicator::applyTargets(GameWorld* gw) {
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         }
+        // The same staleness for a SEAT/work pose (recruit_seated): a bar NPC
+        // recruited off its stool keeps the stool action on the peer's copy -
+        // posed by our applyOrder under the key the re-key retired, or natively
+        // (the host's own NPC before the join recruited it) - and an AI-suspended
+        // copy never ends it, so it sat frozen while the owner ran (rj_before1:
+        // gap 108 u) or crawled at the action's pace (rj_after2: 15 u/s vs 55).
+        // Once the OWNER moves with no task of its own, the pose is stale: end
+        // it, forget the applied pose, and re-issue the walk at once.
+        if (isSquad && out.cMoving != 0 && out.task == TASK_NONE &&
+            (now - d.poseHealTick) >= POSE_HEAL_MS) {
+            int lt = engine::readTaskKey(c);
+            bool stalePose = engine::taskIsSeatPose(lt) ||
+                             (d.issuedTask != TASK_NONE && lt == (int)d.issuedTask);
+            if (stalePose && !coop::bodyIsDown(engine::readBodyState(c))) {
+                d.poseHealTick = now;
+                bool ok = engine::endAction(c);
+                d.taskApplied = false; d.taskBad = false; d.taskRetries = 0;
+                d.issuedTask = TASK_NONE; d.taskNoneTick = 0;
+                d.haveDest = false;            // the next walk branch re-issues the order
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[heal] POSE hand=%u,%u task=%d ok=%d after=%d",
+                    out.hIndex, out.hSerial, lt, ok ? 1 : 0, engine::readTaskKey(c));
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
 
         // ---- Stealth posture (protocol 20) -------------------------------------
         // Continuous mode apply: the streamed BODY_SNEAK bit IS Character::

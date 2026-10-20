@@ -1527,6 +1527,10 @@ bool putSubjectInFurniture(GameWorld* gw, const unsigned int subjHand[5], int ki
 // path (bed_pose), so the occupancy machinery must not fight it - the
 // replicator scopes its edges/carve-out/self-heal away from them.
 bool taskIsBedPose(int t);
+// Seat / station poses a bar NPC holds (OPERATE_MACHINERY - Kenshi's stool -,
+// PRETEND_TO_OPERATE_MACHINERY, SIT_AROUND, SIT_ON_THRONE): a driven squad copy
+// still in one while its owner walks with no task is holding a stale pose.
+bool taskIsSeatPose(int t);
 // Self-heal helper (lost/late ENTER edge): find the nearest matching fixture
 // (kind: 1 bed, 2 cage) within 'radius' of the streamed position and place
 // the occupant in it (the continuous bodyState bit carries no furniture hand).

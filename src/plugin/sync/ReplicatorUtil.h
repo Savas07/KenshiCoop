@@ -194,6 +194,7 @@ const unsigned long CARRY_DROP_MS = 3000; // stream must stop reporting the carr
                                           // this long before the local copy drops
 const unsigned long PHYS_HEAL_MS  = 1000; // min gap between locomotion-body restores
 const unsigned long GETUP_HEAL_MS = 250;  // min gap between stale get-up releases
+const unsigned long POSE_HEAL_MS  = 500;  // min gap between stale seat-pose releases
 // Squad glide: source covering this many times its own gait speed per wall
 // second, at running pace, for GLIDE_SUSTAIN_MS = the owner's sim runs faster
 // than ours (clock catch-up). 1.35 missed the catch-up tail (slew ~1.3 still

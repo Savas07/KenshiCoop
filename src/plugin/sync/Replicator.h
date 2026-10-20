@@ -954,6 +954,7 @@ private:
         unsigned long carryHealTick;  // last self-heal pickup attempt (throttle)
         unsigned long physHealTick;   // last locomotion-body restore attempt (throttle)
         unsigned long getUpHealTick;  // last stale get-up release (throttle)
+        unsigned long poseHealTick;   // last stale seat/work-pose release (throttle)
         unsigned long glideUntilMs;   // squad glide regime held until (0 = never)
         unsigned long glideFastSinceMs; // source outrunning its gait since (0 = not)
         float         glideStallX, glideStallZ; // copy position anchor for the stall test
@@ -1063,7 +1064,7 @@ private:
                    combatOverTick(0), npcSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
-                   carryHealTick(0), physHealTick(0), getUpHealTick(0),
+                   carryHealTick(0), physHealTick(0), getUpHealTick(0), poseHealTick(0),
                    glideUntilMs(0), glideFastSinceMs(0), glideStallX(0), glideStallZ(0),
                    glideStallSinceMs(0), glideActive(false), glideFrames(0),
                    dbgRegime(0), dbgMs(0), dbgGap(0), dbgVlen(0), dbgNx(0), dbgNy(0), dbgNz(0),
