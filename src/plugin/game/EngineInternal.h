@@ -339,7 +339,7 @@ typedef CombatClass* (__fastcall* GetCombatClassFn)(Character* self);
 
 struct SaveEdgeRec { char name[48]; int autosave; int suppressed; };
 struct LoadEdgeRec { char name[48]; int suppressed; };
-struct RecruitEdgeRec { unsigned int before[5]; unsigned int after[5]; };
+struct RecruitEdgeRec { unsigned int before[5]; unsigned int after[5]; Character* who; };
 struct SquadHandRec { unsigned int h[5]; };
 struct BuildEdgeRec {
     unsigned int hand[5];

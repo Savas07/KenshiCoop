@@ -37,6 +37,15 @@ void Replicator::logHardSnap(Character* c, const EntityState& out, const char* k
     skipped = 0;
 }
 
+bool Replicator::ownsLocalBody(Character* c, unsigned int lh[5]) const {
+    if (!c || !engine::readObjectHand(reinterpret_cast<RootObject*>(c), lh)) {
+        memset(lh, 0, 5 * sizeof(unsigned int));
+        return false;
+    }
+    Key lk; lk.t = lh[0]; lk.c = lh[1]; lk.cs = lh[2]; lk.i = lh[3]; lk.s = lh[4];
+    return pinOwned_.count(lk) != 0 || ownHands_.count(lk) != 0;
+}
+
 void Replicator::applyTargets(GameWorld* gw) {
     (void)gw;
     unsigned long now = nowMs();
@@ -143,6 +152,10 @@ void Replicator::applyTargets(GameWorld* gw) {
                         proxyByKey_.find(it->first);
                     if (pit != proxyByKey_.end()) c = pit->second;
                 }
+                // Never park a body WE own (judged by its local hand): see
+                // ownsLocalBody at the main drive below.
+                unsigned int ohh[5] = { 0, 0, 0, 0, 0 };
+                if (c && ownsLocalBody(c, ohh)) c = 0;
                 if (c) {
                     if (dmgGuard_) engine::addDamageGuard(c);
                     if (engine::isLocalPlayerChar(gw, c)) {
@@ -291,6 +304,24 @@ void Replicator::applyTargets(GameWorld* gw) {
                 continue;
             }
         }
+        // Never drive a body WE own, judged by its LOCAL hand. The key vetoes at
+        // the top of the loop only see the wire key, and the old wire key of a
+        // body we just recruited still resolves to it while the peer's stream
+        // tail for it is in flight (recruit_join rj_before2: the host's NPC
+        // stream drove the join's own recruit for the whole leg, drv=1).
+        unsigned int lh[5] = { 0, 0, 0, 0, 0 };
+        if (ownsLocalBody(c, lh)) {
+            std::map<Key, unsigned long>::iterator ol = ownSkipLogMs_.find(it->first);
+            if (ol == ownSkipLogMs_.end() || (now - ol->second) >= 2000) {
+                ownSkipLogMs_[it->first] = now;
+                char ob[176]; _snprintf(ob, sizeof(ob) - 1,
+                    "[drive] SKIP-OWNED wire=%u,%u,%u,%u,%u local=%u,%u,%u,%u,%u",
+                    it->first.t, it->first.c, it->first.cs, it->first.i, it->first.s,
+                    lh[0], lh[1], lh[2], lh[3], lh[4]);
+                ob[sizeof(ob) - 1] = '\0'; coop::logLine(ob);
+            }
+            continue;
+        }
         drivenChars_.insert(c);
         d.dbgRegime = DR_NONE; d.dbgMs = now;
         drivenSeen_[c] = now; // recently-driven grace for the authority passes
@@ -304,9 +335,9 @@ void Replicator::applyTargets(GameWorld* gw) {
         // peer has never heard of. Nothing downstream could tell that from a
         // despawn: combat_kill read "victim vanished 14 s before the KO event"
         // as no post-event samples, for a run in which everything worked.
+        // (lh was read by the ownership veto just above.)
         {
-            unsigned int lh[5] = { 0, 0, 0, 0, 0 };
-            if (engine::readObjectHand(reinterpret_cast<RootObject*>(c), lh) &&
+            if ((lh[0] | lh[1] | lh[2] | lh[3] | lh[4]) &&
                 (lh[3] != it->first.i || lh[4] != it->first.s ||
                  lh[0] != it->first.t || lh[1] != it->first.c ||
                  lh[2] != it->first.cs)) {

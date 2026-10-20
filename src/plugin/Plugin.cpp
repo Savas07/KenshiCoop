@@ -1911,6 +1911,16 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         g_repl.applyEvents(gw, g_inbound);
     }
     if (worldLive) {
+        // Recruitment sync (protocol 23): drain the recruit detour's edge queue
+        // into reliable EVT_RECRUIT events (subject = the key the peer knows the
+        // body by, actor = its new hand), release our drive of the recruit and
+        // pin it to its recruiter. The receive half (re-key) lives in
+        // applyEvents above. BEFORE publishOwned: this tick's partition (and a
+        // brand-new tab's one-shot decideTabs verdict) must already see the pin,
+        // and the edge must leave in the same flush as the new hand's first
+        // batch so the peer re-keys before it could REQ the hand.
+        if (g_cfg.recruitSync)
+            g_repl.publishRecruits(gw, g_net, g_net.localId());
         // CharCreate: while the join's character editor is open the edited bodies
         // sit on the editor platform at the world origin - don't publish that.
         if (!g_chargenSuppressPublish)
@@ -1997,14 +2007,6 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
             g_repl.publishMoneyPool(replCtx(gw));
             g_repl.applyMoneyPool(replCtx(gw));
         }
-        // Recruitment sync (protocol 23): drain the recruit detour's edge queue
-        // into reliable EVT_RECRUIT events (subject = old hand, actor = new
-        // hand) and pin recruited hands to their recruiter's ownership. The
-        // receive half (re-key) lives in applyEvents above. Ordered after
-        // publishOwned so this tick's recruits pin BEFORE next tick's census.
-    if (g_cfg.recruitSync)
-        g_repl.publishRecruits(gw, g_net, g_net.localId());
-
     // Squad management sync (protocol 35): poll the roster's pointer->hand
     // baseline (~2 Hz; a squad-tab move re-containers the body but the
     // Character* survives) and author reliable EVT_SQUAD_MOVE re-key edges,

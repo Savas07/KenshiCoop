@@ -2062,29 +2062,121 @@ void Replicator::applyBuildDoors(const SyncContext& ctx) {
     }
 }
 
+bool Replicator::recruitWireKeyOf(Character* c, Key* out) const {
+    if (!c || !out) return false;
+    std::map<Character*, Key>::const_iterator ct = canonicalOf_.find(c);
+    if (ct != canonicalOf_.end()) { *out = ct->second; return true; }
+    for (std::map<Key, Character*>::const_iterator pt = proxyByKey_.begin();
+         pt != proxyByKey_.end(); ++pt) {
+        if (pt->second == c) { *out = pt->first; return true; }
+    }
+    return false;
+}
+
+void Replicator::releaseRecruitDrive(Character* c, const Key& wire) {
+    for (std::map<Key, Character*>::iterator pt = proxyByKey_.begin();
+         pt != proxyByKey_.end(); ) {
+        if (pt->second == c) proxyByKey_.erase(pt++);
+        else ++pt;
+    }
+    targets_.erase(wire);
+    spawnReq_.erase(wire);
+    unresolvedHands_.erase(wire);
+    forceReqHands_.erase(wire);
+    life_.erase(wire);
+    canonicalOf_.erase(c);
+    drivenSeen_.erase(c);
+    drivenChars_.erase(c);
+    // A body we minted is no longer a proxy once we recruit it: every teardown
+    // that destroys mints (peer leave, rekey repair) must leave it standing.
+    mintedBodies_.erase(c);
+    rekeyedOld_[wire] = nowMs();
+}
+
+bool Replicator::homeRecruit(GameWorld* gw, Character* c, unsigned int outHand[5]) {
+    unsigned int h[5];
+    if (!c || !engine::readObjectHand(reinterpret_cast<RootObject*>(c), h)) return false;
+    std::pair<u32, u32> tab((u32)h[1], (u32)h[2]);
+    bool known = false;
+    for (unsigned int i = 0; i < lastCtnrs_.size(); ++i)
+        if (lastCtnrs_[i] == tab) { known = true; break; }
+    if (!known || ownsTab(tab, tabRankFor(tab, lastCtnrs_))) return false;
+    // Our lowest-ranked tab is home (the one the rank rule gives us first).
+    int home = -1;
+    unsigned int homeRank = 0xFFFFFFFFu;
+    for (unsigned int i = 0; i < lastCtnrs_.size(); ++i) {
+        if (lastCtnrs_[i] == tab) continue;
+        unsigned int r = tabRankFor(lastCtnrs_[i], lastCtnrs_);
+        if (ownsTab(lastCtnrs_[i], r) && r < homeRank) { home = (int)i; homeRank = r; }
+    }
+    if (home < 0) return false;
+    unsigned int target[5] = { h[0], lastCtnrs_[home].first, lastCtnrs_[home].second, 0, 0 };
+    if (!engine::joinPlayerSquadAt(gw, c, target)) return false;
+    unsigned int nh[5];
+    if (!engine::readObjectHand(reinterpret_cast<RootObject*>(c), nh)) return false;
+    if (nh[1] != target[1] || nh[2] != target[2]) return false; // the lever did not land
+    memcpy(outHand, nh, sizeof(nh));
+    return true;
+}
+
 void Replicator::publishRecruits(GameWorld* gw, NetLink& net, u32 ownerId) {
-    (void)gw;
     if (!recruitSync_) return; // hook is only installed when the sync is on
     engine::RecruitEdge edges[8];
     unsigned int n = engine::drainRecruitEdges(edges, 8);
     for (unsigned int i = 0; i < n; ++i) {
-        // Pin ownership BEFORE the wire: from this tick publishOwned streams
-        // the new hand no matter which tab rank its container maps to.
-        Key nk; nk.t = edges[i].after[0]; nk.c = edges[i].after[1];
-        nk.cs = edges[i].after[2]; nk.i = edges[i].after[3]; nk.s = edges[i].after[4];
+        Character* c = edges[i].who;
+        // The SUBJECT must name the body the way the PEER knows it. A recruit
+        // we were driving (the host authors every NPC near a shared cell) can
+        // sit under a local hand the peer never heard of - the combat/sitter
+        // detach re-containers our copy - and an unresolvable subject made the
+        // peer mint a duplicate into its squad while its real NPC kept
+        // streaming under the old key and driving OUR recruit (recruit_join
+        // rj_before2: host REKEY-FALLBACK + proxy BOUND, join drv=1 all leg).
+        Key sk; sk.t = edges[i].before[0]; sk.c = edges[i].before[1];
+        sk.cs = edges[i].before[2]; sk.i = edges[i].before[3]; sk.s = edges[i].before[4];
+        Key wire;
+        const bool peerBound = recruitWireKeyOf(c, &wire);
+        if (peerBound) {
+            sk = wire;
+            // It is ours now: drop the drive we held for it (the CONTROL-FLIP
+            // teardown the peer's tab move used to be the only way to get).
+            releaseRecruitDrive(c, wire);
+        }
+        // Home: a recruit belongs to its recruiter's tab, as a host recruit
+        // lands in the host's. Then pin the hand it holds NOW (drain time) -
+        // from this tick publishOwned streams it whatever tab it sits in.
+        unsigned int fh[5];
+        memcpy(fh, edges[i].after, sizeof(fh));
+        const bool homed = homeRecruit(gw, c, fh);
+        if (!homed && c) {
+            unsigned int cur[5];
+            if (engine::readObjectHand(reinterpret_cast<RootObject*>(c), cur))
+                memcpy(fh, cur, sizeof(fh));
+        }
+        Key nk; nk.t = fh[0]; nk.c = fh[1]; nk.cs = fh[2]; nk.i = fh[3]; nk.s = fh[4];
         pinOwned_.insert(nk);
+        pinPeer_.erase(nk);
+        if (peerBound || homed) {
+            char ob[240];
+            _snprintf(ob, sizeof(ob) - 1,
+                      "[recruit] OWN local=%u,%u,%u,%u,%u wire=%u,%u,%u,%u,%u "
+                      "released=%d homed=%d hand=%u,%u,%u,%u,%u",
+                      edges[i].before[0], edges[i].before[1], edges[i].before[2],
+                      edges[i].before[3], edges[i].before[4],
+                      sk.t, sk.c, sk.cs, sk.i, sk.s, peerBound ? 1 : 0, homed ? 1 : 0,
+                      nk.t, nk.c, nk.cs, nk.i, nk.s);
+            ob[sizeof(ob) - 1] = '\0'; coop::logLine(ob);
+        }
         EventPacket ev;
         memset(&ev, 0, sizeof(ev));
         ev.type    = (u8)PKT_EVENT;
         ev.event   = EVT_RECRUIT;
         ev.ownerId = ownerId;
         ev.eventId = nextEventId_++;
-        ev.sType = edges[i].before[0]; ev.sContainer = edges[i].before[1];
-        ev.sContainerSerial = edges[i].before[2];
-        ev.sIndex = edges[i].before[3]; ev.sSerial = edges[i].before[4];
-        ev.aType = edges[i].after[0]; ev.aContainer = edges[i].after[1];
-        ev.aContainerSerial = edges[i].after[2];
-        ev.aIndex = edges[i].after[3]; ev.aSerial = edges[i].after[4];
+        ev.sType = sk.t; ev.sContainer = sk.c; ev.sContainerSerial = sk.cs;
+        ev.sIndex = sk.i; ev.sSerial = sk.s;
+        ev.aType = nk.t; ev.aContainer = nk.c; ev.aContainerSerial = nk.cs;
+        ev.aIndex = nk.i; ev.aSerial = nk.s;
         net.queueEvent(ev);
         char b[176];
         _snprintf(b, sizeof(b) - 1,

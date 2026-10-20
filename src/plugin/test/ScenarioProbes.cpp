@@ -1233,9 +1233,10 @@ private:
 // Two mirrored legs in one run (clock from ARM), each recruiter ordering its
 // own recruit around while the other client mirrors it:
 //   leg H (control arm) t=6s   HOST recruits the nearest NPC it authors
-//          (prefers a posed one); t=9-18s host move-orders it, join drives.
+//          (prefers a free-standing one); t=9-18s host move-orders it, join
+//          drives.
 //   leg J               t=22s  JOIN recruits the nearest NPC it DRIVES from
-//          the host's stream (prefers posed + re-keyed); t=25-34s join
+//          the host's stream (prefers re-keyed, then posed); t=25-34s join
 //          move-orders it, host drives.
 // Both sides find the other leg's recruit as the NEW squad member (pointer
 // set difference) and log, per leg: 2 Hz SCENARIO RJ role samples (the
@@ -1344,10 +1345,14 @@ private:
         return true;
     }
 
-    // Leg H: an NPC this client AUTHORS (not driven, not bound to a peer key).
-    // Leg J: an NPC this client DRIVES from the host's stream. Both prefer a
-    // posed body (the bar sitter); leg J also prefers one whose local hand
-    // differs from the host's wire key (re-containered by the sitter detach).
+    // Leg H: an NPC this client AUTHORS (not driven, not bound to a peer key);
+    // prefers a free-standing one (the peer's copy of a SEATED host recruit
+    // never stands up - rj_before1 - a separate symmetric gap this control
+    // arm must not trip over). Leg J: an NPC this client DRIVES from the host's
+    // stream - the realistic bar recruit first: one whose local hand differs
+    // from the host's wire key (re-containered by the sitter/combat detach),
+    // posed before free-standing. Nearest within PICK_RADIUS of our own tab
+    // leader wins inside a tier. One SCENARIO RJ pick line says what was seen.
     Character* pickSubject(const ScenarioContext& ctx, const Leg& L, int li,
                            float* outDist, int* outPosed, BodyRoleView* outRole) {
         if (!ctx.bodyRole) return 0;
@@ -1356,25 +1361,38 @@ private:
         static Character*  chars[MAX_NPC]; // main-thread only
         static EntityState st[MAX_NPC];
         unsigned int n = engine::listNpcs(ctx.gw, chars, st, MAX_NPC);
+        unsigned int eligible = 0, driven = 0, distant = 0;
+        float nearest = -1.0f;
         Character* best = 0; int bestTier = 99; float bestD = 0.0f;
         for (unsigned int i = 0; i < n; ++i) {
             Character* c = chars[i];
             if (!c || isBase(c) || c == legs_[1 - li].subj) continue;
-            float dx = st[i].x - ax, dz = st[i].z - az;
-            float d = sqrtf(dx * dx + dz * dz);
-            if (d > PICK_RADIUS) continue;
             BodyRoleView v;
             if (!ctx.bodyRole(c, &v) || v.squad || v.minted) continue;
             bool peerDriven = v.driven || v.canon || v.proxy;
+            if (peerDriven) ++driven;
             if (L.hostRecruits == peerDriven) continue;
+            float dx = st[i].x - ax, dz = st[i].z - az;
+            float d = sqrtf(dx * dx + dz * dz);
+            if (nearest < 0.0f || d < nearest) nearest = d;
+            if (d > PICK_RADIUS) { ++distant; continue; }
+            ++eligible;
             bool posed   = st[i].task != TASK_NONE && !taskIsCombat(st[i].task);
             bool rekeyed = peerDriven && !sameHand(v.local, v.wire);
-            int tier = (posed ? 0 : 2) + (rekeyed ? 0 : 1);
+            int tier = L.hostRecruits ? (posed ? 1 : 0)
+                                      : ((rekeyed ? 0 : 2) + (posed ? 0 : 1));
             if (!best || tier < bestTier || (tier == bestTier && d < bestD)) {
                 best = c; bestTier = tier; bestD = d;
                 *outDist = d; *outPosed = posed ? 1 : 0; *outRole = v;
             }
         }
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO RJ pick leg=%c who=%s npcs=%u peerDriven=%u eligible=%u "
+                  "far=%u nearest=%.1f tier=%d anchor=%.1f,%.1f",
+                  L.id, ctx.isHost ? "host" : "join", n, driven, eligible, distant,
+                  nearest, best ? bestTier : -1, ax, az);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         return best;
     }
 
@@ -1496,7 +1514,7 @@ private:
     std::vector<Character*> base_;
     Leg                     legs_[2];
 };
-const float RecruitJoinScenario::PICK_RADIUS = 80.0f;
+const float RecruitJoinScenario::PICK_RADIUS = 200.0f; // the listNpcs query reach
 
 // squad_probe (protocol 35 phase 0, probe tier; squadSync forced OFF) /
 // squad_sync (probe=false, full tier; squadSync ON). Moving a unit between

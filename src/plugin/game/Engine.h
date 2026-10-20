@@ -1740,7 +1740,10 @@ bool installShopHook();
 // programmatic) records its before/after hand pair. The Replicator drains the
 // queue once per tick into EVT_RECRUIT (subject = old hand, actor = new hand);
 // the peer re-keys its local copy of the old hand to the new stream key.
-struct RecruitEdge { unsigned int before[5]; unsigned int after[5]; };
+// 'who' is the recruited body itself (pointer identity survives the
+// re-container; read only through SEH-guarded calls) so the drain can find
+// the key the PEER streams it under and release this side's drive of it.
+struct RecruitEdge { unsigned int before[5]; unsigned int after[5]; Character* who; };
 bool installRecruitHook();
 unsigned int drainRecruitEdges(RecruitEdge* out, unsigned int maxOut);
 

@@ -366,6 +366,19 @@ function Test-RecruitProbe {
                 -Metrics @{ legs = $legs.Count } -Detail $detail)
 }
 
+# The hand a recruit is finally streamed under. publishRecruits re-homes a
+# recruit the engine parked in another player's tab (a join recruit lands in the
+# host's) into its recruiter's own tab and announces THAT hand, logging
+# "[recruit] OWN local=<before> ... hand=<final>" on the recruiter. No OWN line
+# (nothing re-homed or released) = the recruit kept the hand the scenario saw.
+function Get-RecruitFinalHand {
+    param([string]$File, [string]$Before, [string]$After)
+    $rx = "\[recruit\] OWN local=" + [regex]::Escape($Before) + " wire=[\d,]+ released=\d homed=\d hand=([\d,]+)"
+    $m = @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue) | Select-Object -First 1
+    if ($null -ne $m) { return $m.Matches[0].Groups[1].Value }
+    return $After
+}
+
 # recruit_sync (protocol 23): the gated recruitment-convergence oracle. Each
 # side recruits a BAKED world NPC and a RUNTIME spawn; the gate is that every
 # recruited hand CONVERGED on the peer:
@@ -389,7 +402,8 @@ function Test-RecruitSync {
         foreach ($m in @(Select-String -Path $pair[1] -Pattern $rRegex -ErrorAction SilentlyContinue)) {
             $legs["$side/$($m.Matches[0].Groups[2].Value)"] = @{
                 res   = [int]$m.Matches[0].Groups[3].Value
-                after = $m.Matches[0].Groups[5].Value
+                after = (Get-RecruitFinalHand -File $pair[1] -Before $m.Matches[0].Groups[4].Value `
+                                              -After $m.Matches[0].Groups[5].Value)
             }
         }
     }
@@ -567,8 +581,9 @@ function Test-RecruitCtl {
 #      drives or AI-suspends it (drv=0 ais=0); P never owns or pins it owned and
 #      drives it in at least half of its samples;
 #   4. R's move orders execute (owner gait median >= RUN_MIN) and P's copy follows
-#      (driver gait >= GAIT_RATIO x owner; time-paired planar gap median <=
-#      FOLLOW_MAX);
+#      (driver gait >= GAIT_RATIO x owner; time-paired planar gap median within
+#      the drive's own trailing budget - snapSec of owner travel, the lag past
+#      which the walk-drive itself hard-snaps - floored at FOLLOW_MIN);
 #   5. both squads grew by exactly one and the recruit sits in the same tab
 #      container on both games;
 #   6. P sends no owned-channel lines for it ([stats] SEND, [med] SEND npc=0,
@@ -582,7 +597,11 @@ function Test-RecruitJoin {
     $peerWho  = if ($Leg -eq 'J') { 'host' } else { 'join' }
     $legStart = if ($Leg -eq 'J') { 22000 } else { 6000 }   # scenario recruit times
     $LEG_MS = 15000; $SETTLE_MS = 1500; $WALK_FROM = 3000; $WALK_MS = 9000
-    $RUN_MIN = 1.0; $GAIT_RATIO = 0.5; $FOLLOW_MAX = 20.0; $PAIR_MS = 300
+    $RUN_MIN = 1.0; $GAIT_RATIO = 0.5; $FOLLOW_MIN = 20.0; $PAIR_MS = 300
+    # The driver's snap budget from its config line (snapSec=0.75 default).
+    $snapSec = 0.75
+    $sm = @(Select-String -Path $peerFile -Pattern 'drive catchupK=[\d.]+ snapDist=[\d.]+u snapSec=([\d.]+)' -ErrorAction SilentlyContinue) | Select-Object -First 1
+    if ($null -ne $sm) { $snapSec = [double]$sm.Matches[0].Groups[1].Value }
     $stamp = '^\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]'
     $why = @()
     $recOff  = Get-LogClockOffsetMs -File $recFile
@@ -596,8 +615,9 @@ function Test-RecruitJoin {
         return (Add-GateResult -Name $gate -Status "FAIL" -Detail "$recWho never logged SCENARIO RJ recruit leg=$Leg")
     }
     $g = $rm.Matches[0].Groups
-    $res = [int]$g[1].Value; $before = $g[3].Value; $after = $g[4].Value
-    Write-Host "    FINDING: leg=$Leg recruiter=$recWho res=$res subject=$($g[2].Value) before=$before after=$after wire=$($g[5].Value) posed=$($g[6].Value)"
+    $res = [int]$g[1].Value; $before = $g[3].Value
+    $after = Get-RecruitFinalHand -File $recFile -Before $before -After $g[4].Value
+    Write-Host "    FINDING: leg=$Leg recruiter=$recWho res=$res subject=$($g[2].Value) before=$before after=$($g[4].Value) final=$after wire=$($g[5].Value) posed=$($g[6].Value)"
     if ($res -ne 1) {
         Write-Host "  RECRUIT-JOIN[$Leg] FAIL - recruit failed locally (res=$res subject=$($g[2].Value))"
         return (Add-GateResult -Name $gate -Status "FAIL" -Detail "recruit failed locally (res=$res subject=$($g[2].Value))")
@@ -709,9 +729,10 @@ function Test-RecruitJoin {
         if ($null -ne $best) { $gaps += [math]::Sqrt([math]::Pow($best.x - $r.x, 2) + [math]::Pow($best.z - $r.z, 2)) }
     }
     $gapMed = _rjMedian $gaps
+    $followMax = [math]::Max($FOLLOW_MIN, $snapSec * $ownMed)
     if ($gaps.Count -lt 5) { $why += "too few time-paired walk samples ($($gaps.Count)) to judge the follow" }
-    elseif ($gapMed -gt $FOLLOW_MAX) { $why += "$peerWho's copy does not follow (median gap $([math]::Round($gapMed,1)) u > $FOLLOW_MAX)" }
-    Write-Host ("    FINDING: gait owner n={0} med={1} driver n={2} med={3}; follow pairs={4} medGap={5}" -f $own.Count, [math]::Round($ownMed, 2), $drv.Count, [math]::Round($drvMed, 2), $gaps.Count, [math]::Round($gapMed, 1))
+    elseif ($gapMed -gt $followMax) { $why += "$peerWho's copy does not follow (median gap $([math]::Round($gapMed,1)) u > $([math]::Round($followMax,1)) = ${snapSec}s of owner travel)" }
+    Write-Host ("    FINDING: gait owner n={0} med={1} driver n={2} med={3}; follow pairs={4} medGap={5} max={6}" -f $own.Count, [math]::Round($ownMed, 2), $drv.Count, [math]::Round($drvMed, 2), $gaps.Count, [math]::Round($gapMed, 1), [math]::Round($followMax, 1))
 
     # --- 5. squad membership + tab parity ---------------------------------------
     foreach ($pair in @(@($recWho, $recFile), @($peerWho, $peerFile))) {
