@@ -224,6 +224,8 @@ int              g_recvOpenIdx = -1;   // fileIdx of the open handle
 HANDLE           g_recvHandle = INVALID_HANDLE_VALUE;
 std::vector<u32> g_recvCrcs;           // incremental FNV per fileIdx
 std::vector<u8>  g_recvSeen;           // fileIdx touched at least once
+bool             g_recvHasQuick = false; // staging received a quick.save
+bool             g_recvRefused  = false; // BEGIN refused (unsafe name); DONE reports FAILED
 unsigned long    g_recvStartTick = 0;
 
 // Scenario gate accessors' backing state.
@@ -284,6 +286,43 @@ std::string saveFolderFor(const std::string& name) {
     // The engine/environment hand back an ANSI path; carry it as UTF-8 like
     // every other path in here.
     return pathJoin(U8(W(root).c_str()), name);
+}
+
+static bool endsWith(const std::string& s, const char* suffix) {
+    size_t n = strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+bool saveNameSafe(const std::string& name) {
+    if (name.empty() || name == "." || name == "..") return false;
+    for (size_t i = 0; i < name.size(); ++i) {
+        unsigned char c = (unsigned char)name[i];
+        if (c < 0x20 || strchr("<>:\"/\\|?*", (int)c) != 0) return false;
+    }
+    char last = name[name.size() - 1];
+    if (last == '.' || last == ' ') return false;
+    if (endsWith(name, "__incoming") || endsWith(name, "__old")) return false;
+    return true;
+}
+
+void recoverStrandedSave(const std::string& name) {
+    if (!saveNameSafe(name)) return;
+    std::string finalDir = saveFolderFor(name);
+    std::string oldDir   = finalDir + "__old";
+    if (attrsOf(oldDir) == INVALID_FILE_ATTRIBUTES) return;
+    if (attrsOf(finalDir) != INVALID_FILE_ATTRIBUTES) {
+        // The swap completed; only the backup removal was lost.
+        removeTree(oldDir, 0);
+        return;
+    }
+    bool moved = MoveFileExW(W(oldDir).c_str(), W(finalDir).c_str(),
+                             MOVEFILE_WRITE_THROUGH) != 0;
+    char b[224];
+    _snprintf(b, sizeof(b) - 1, "[save] RECOVER %s stranded save '%s' from __old (err=%lu)",
+              moved ? "restored" : "FAILED to restore", name.c_str(),
+              moved ? 0ul : GetLastError());
+    b[sizeof(b) - 1] = '\0';
+    if (moved) coop::logLine(b); else coop::logErrLine(b);
 }
 
 void listSaves(std::vector<SaveListEntry>& out, unsigned int maxOut) {
@@ -627,9 +666,28 @@ void onSaveBegin(const SaveBeginPacket& b) {
     g_recvTotalBytes = b.totalBytes;
     g_recvBytes      = 0;
     g_recvStartTick  = GetTickCount();
-    g_recvStaging    = saveFolderFor(g_recvName + "__incoming");
     g_recvCrcs.assign(b.fileCount, fnv1aInit());
     g_recvSeen.assign(b.fileCount, 0);
+    g_recvHasQuick   = false;
+    g_recvRefused    = false;
+
+    // An unsafe name never derives a path: saveFolderFor("") is the save ROOT,
+    // and ".." or a separator escapes it. Nothing is staged; the matching DONE
+    // reports FAILED so the host gets its NACK and the commit latch still moves.
+    if (!saveNameSafe(g_recvName)) {
+        g_recvActive  = false;
+        g_recvRefused = true;
+        g_recvStaging.clear();
+        char eb[224];
+        _snprintf(eb, sizeof(eb) - 1,
+                  "[save] XFER-RECV REFUSED id=%u unsafe name='%s' (nothing staged)",
+                  b.xferId, name);
+        eb[sizeof(eb) - 1] = '\0'; coop::logErrLine(eb);
+        return;
+    }
+    // Heal a crashed commit of this save before re-staging over it.
+    recoverStrandedSave(g_recvName);
+    g_recvStaging    = saveFolderFor(g_recvName + "__incoming");
 
     // A fresh staging folder: stale partials from an aborted transfer would
     // otherwise pollute the CRC verify.
@@ -671,6 +729,7 @@ void onSaveFile(const SaveFileHeader& h, const char* path, const unsigned char* 
         }
         g_recvOpenIdx = (int)h.fileIdx;
         g_recvSeen[h.fileIdx] = 1;
+        if (_stricmp(rel.c_str(), "quick.save") == 0) g_recvHasQuick = true;
     }
 
     LONG hi = 0;
@@ -690,11 +749,18 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
                u16* outFiles, unsigned __int64* outBytes) {
     if (outFiles) *outFiles = 0;
     if (outBytes) *outBytes = 0;
-    if (!g_recvActive || d.xferId != g_recvXferId) return 0;
+    const bool refused = g_recvRefused && d.xferId == g_recvXferId;
+    if (!refused && (!g_recvActive || d.xferId != g_recvXferId)) return 0;
     recvCloseFile();
-    g_recvActive = false;
+    g_recvActive  = false;
+    g_recvRefused = false;
 
-    bool ok = (d.fileCount == g_recvFileCount);
+    // Commit only a non-empty, complete, CRC-verified staging that holds the
+    // file Kenshi loads. Anything less must leave the existing save alone: a
+    // 0-file DONE used to pass (0 == 0, empty loop) and swap an EMPTY folder
+    // over the join's save, then delete the backup.
+    bool ok = !refused && g_recvFileCount > 0 && crcs != 0 &&
+              d.fileCount == g_recvFileCount;
     unsigned int bad = 0;
     if (ok) {
         for (u16 i = 0; i < d.fileCount; ++i) {
@@ -702,14 +768,20 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
         }
     }
 
+    if (ok && !g_recvHasQuick) ok = false; // complete but unloadable
+
     if (ok) {
-        // Commit: swap the staged folder over save/<name>/ - the previous
-        // save is only removed AFTER the new one is in place.
         std::string finalDir = saveFolderFor(g_recvName);
         std::string oldDir   = finalDir + "__old";
-        removeTree(oldDir, 0);
+        // A leftover __old is either a stranded real save (restore it) or a
+        // finished swap's backup (drop it). If it survives recovery it may be
+        // the ONLY copy - never delete it to make room; abort instead.
+        recoverStrandedSave(g_recvName);
+        if (attrsOf(oldDir) != INVALID_FILE_ATTRIBUTES) ok = false;
+        // Commit: swap the staged folder over save/<name>/ - the previous
+        // save is only removed AFTER the new one is in place.
         bool hadOld = false;
-        if (attrsOf(finalDir) != INVALID_FILE_ATTRIBUTES) {
+        if (ok && attrsOf(finalDir) != INVALID_FILE_ATTRIBUTES) {
             hadOld = (MoveFileExW(W(finalDir).c_str(), W(oldDir).c_str(),
                                   MOVEFILE_WRITE_THROUGH) != 0);
             if (!hadOld) ok = false;
@@ -722,7 +794,9 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
         }
         if (ok && hadOld) removeTree(oldDir, 0);
     }
-    if (!ok) removeTree(g_recvStaging, 0); // never leave a half-written loadable save
+    // Never leave a half-written loadable save. A refused BEGIN staged nothing
+    // (empty path: removeTree("") would walk the CURRENT directory).
+    if (!ok && !g_recvStaging.empty()) removeTree(g_recvStaging, 0);
 
     if (outFiles) *outFiles = ok ? g_recvFileCount : 0;
     if (outBytes) *outBytes = ok ? g_recvBytes : 0;

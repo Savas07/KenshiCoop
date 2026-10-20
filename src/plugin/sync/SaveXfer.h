@@ -53,6 +53,24 @@ void listSaves(std::vector<SaveListEntry>& out, unsigned int maxOut);
 void setSaveRootForTest(const std::string& root);
 #endif
 
+// A received transfer name must resolve to exactly one folder directly under
+// the save root. Rejects: empty, "." / "..", any byte Windows forbids in a
+// file name (control bytes, < > : " / \ | ? *), a trailing '.' or ' ' (Windows
+// strips those, so two names would alias one folder) and our own "__incoming" /
+// "__old" suffixes (a transfer must never target another save's staging or
+// backup). Bytes >= 0x80 are allowed - non-ASCII save names are legitimate.
+// Without this, saveFolderFor("") is the save ROOT and a commit would move the
+// whole save folder.
+bool saveNameSafe(const std::string& name);
+
+// Heals a crashed commit of save 'name'. onSaveDone swaps by moving <name> to
+// <name>__old and then the verified staging to <name>; a crash (or a failed
+// restore) between the two moves strands the real save in <name>__old, which
+// the lobby list hides. Restores it when <name> is missing; reclaims a
+// redundant __old when <name> exists (the swap finished, only the cleanup
+// didn't). No-op for an unsafe name.
+void recoverStrandedSave(const std::string& name);
+
 // Recursive inventory of 'folder': file count, total bytes, and the newest
 // last-write FILETIME (as u64). Returns false when the folder doesn't exist.
 bool folderInventory(const std::string& folder, unsigned int* outFiles,

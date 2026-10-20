@@ -896,6 +896,102 @@ static void testSaveXferRoundTrip() {
     xferNukeDir(rootStr);
 }
 
+// ---- 3d. Save-transfer commit gate (upstream PR #16) ----------------------------
+// The commit swap replaces the join's save, so every DONE that is not a complete,
+// verified, loadable copy of a safely named save must leave the disk alone:
+//   - a 0-file transfer used to verify (0 == 0) and swap an EMPTY folder in;
+//   - a name with "..\" escaped the save root and replaced a folder outside it;
+//   - a transfer without quick.save installed an unloadable save;
+//   - a crash between the two commit moves stranded the save in <name>__old,
+//     and the next transfer of that save deleted the stranded copy.
+// Driven through the real receiver only (no direct helper calls), so the same
+// test runs against the pre-fix receiver as the BEFORE evidence.
+static bool xferFileIs(const std::string& path, const std::vector<unsigned char>& want) {
+    std::vector<unsigned char> got;
+    return xferReadWhole(path, &got) && got == want;
+}
+
+static bool xferExists(const std::string& path) {
+    return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void testSaveXferCommitGate() {
+    std::printf("== save-transfer commit gate (empty/unsafe/unloadable/stranded) ==\n");
+    char tmp[MAX_PATH]; tmp[0] = '\0';
+    GetTempPathA(sizeof(tmp), tmp);
+    char outer[MAX_PATH];
+    _snprintf(outer, sizeof(outer) - 1, "%skc_xfer_gate_%lu", tmp,
+              (unsigned long)GetCurrentProcessId());
+    outer[sizeof(outer) - 1] = '\0';
+    const std::string outerStr = outer;
+    const std::string rootStr  = outerStr + "\\save";
+    xferNukeDir(outerStr);
+    CreateDirectoryA(outerStr.c_str(), 0);
+    CreateDirectoryA(rootStr.c_str(), 0);
+    savexfer::setSaveRootForTest(rootStr);
+
+    std::vector<unsigned char> quick(3000), plat(700);
+    for (unsigned i = 0; i < quick.size(); ++i) quick[i] = (unsigned char)(i * 5 + 1);
+    for (unsigned i = 0; i < plat.size();  ++i) plat[i]  = (unsigned char)(i * 3 + 2);
+    XferSrcFile good[2];
+    good[0].rel = "quick.save";               good[0].data = &quick[0]; good[0].len = (unsigned)quick.size();
+    good[1].rel = "platoon\\Nameless_0.platoon"; good[1].data = &plat[0]; good[1].len = (unsigned)plat.size();
+    const std::string save = savexfer::saveFolderFor("Coop");
+    u32 id = 100;
+
+    CHECK("gate baseline commit", xferRun("Coop", good, 2, ++id, -1) == 1);
+
+    // 1) Empty transfer: refused, save untouched, commit latch still moves.
+    u32 seq = savexfer::commitSeq();
+    CHECK("gate 0-file transfer refused", xferRun("Coop", good, 0, ++id, -1) == 0);
+    CHECK("gate 0-file transfer keeps the save", xferFileIs(save + "\\quick.save", quick));
+    CHECK("gate 0-file DONE still bumps commitSeq", savexfer::commitSeq() == seq + 1);
+
+    // 2) No quick.save: complete and CRC-clean but unloadable - refused.
+    CHECK("gate transfer without quick.save refused", xferRun("Coop", good + 1, 1, ++id, -1) == 0);
+    CHECK("gate unloadable transfer keeps the save", xferFileIs(save + "\\quick.save", quick));
+
+    // 3) Root escape: "..\victim" must not replace a folder outside the save root.
+    const std::string victim = outerStr + "\\victim";
+    CreateDirectoryA(victim.c_str(), 0);
+    std::vector<unsigned char> sentinel(1, 0x5A);
+    {
+        HANDLE h = CreateFileA((victim + "\\keep.txt").c_str(), GENERIC_WRITE, 0, 0,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+        DWORD w = 0; WriteFile(h, &sentinel[0], 1, &w, 0); CloseHandle(h);
+    }
+    seq = savexfer::commitSeq();
+    CHECK("gate escaping name refused", xferRun("..\\victim", good, 2, ++id, -1) == 0);
+    CHECK("gate escaping name leaves the outside folder", xferFileIs(victim + "\\keep.txt", sentinel));
+    CHECK("gate escaping name stages nothing outside", !xferExists(victim + "__incoming"));
+    CHECK("gate refused BEGIN's DONE bumps commitSeq", savexfer::commitSeq() == seq + 1);
+    CHECK("gate empty name refused", xferRun("", good, 2, ++id, -1) == 0);
+    CHECK("gate backup-suffix name refused", xferRun("Coop__old", good, 2, ++id, -1) == 0);
+    CHECK("gate trailing-dot name refused", xferRun("Coop.", good, 2, ++id, -1) == 0);
+
+    // 4) Legitimate names still commit (non-ASCII bytes, inner dots).
+    CHECK("gate non-ASCII name commits", xferRun("Kay\xc4\xb1t", good, 2, ++id, -1) == 1);
+    CHECK("gate inner-dots name commits", xferRun("run..2", good, 2, ++id, -1) == 1);
+
+    // 5) Stranded commit (crash between the two moves): the save lives only in
+    // <name>__old. A FAILED transfer of it must restore it, not leave it hidden.
+    // Its own save, so the earlier cases cannot cascade into this one.
+    const std::string strand = savexfer::saveFolderFor("Strand");
+    CHECK("gate stranded baseline commit", xferRun("Strand", good, 2, ++id, -1) == 1);
+    CHECK("gate simulate stranded save", MoveFileA(strand.c_str(), (strand + "__old").c_str()) != 0);
+    CHECK("gate corrupt transfer of stranded save fails", xferRun("Strand", good, 2, ++id, 0) == 0);
+    CHECK("gate stranded save restored", xferFileIs(strand + "\\quick.save", quick));
+    CHECK("gate stranded backup consumed", !xferExists(strand + "__old"));
+    // ...and a clean transfer over a stranded save still commits.
+    CHECK("gate re-strand", MoveFileA(strand.c_str(), (strand + "__old").c_str()) != 0);
+    CHECK("gate clean transfer over stranded save commits", xferRun("Strand", good, 2, ++id, -1) == 1);
+    CHECK("gate committed save intact", xferFileIs(strand + "\\platoon\\Nameless_0.platoon", plat));
+    CHECK("gate no backup left", !xferExists(strand + "__old"));
+
+    savexfer::setSaveRootForTest(std::string());
+    xferNukeDir(outerStr);
+}
+
 // ---- 4. Content hash (the inventory convergence key) -----------------------------
 
 static InvItemEntry makeEntry() {
@@ -1824,6 +1920,7 @@ int main() {
     testSaveCrc();
     testFolderFingerprint();
     testSaveXferRoundTrip();
+    testSaveXferCommitGate();
     testContentHash();
     testInterp();
     testOwnRanks();
