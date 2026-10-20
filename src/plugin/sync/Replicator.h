@@ -1189,6 +1189,9 @@ private:
     // Per wire key: last "[drive] SKIP-OWNED" line (2 s throttle) - a peer
     // stream that resolves to a body WE own (a recruit's old key) is refused.
     std::map<Key, unsigned long> ownSkipLogMs_;
+    // Pinned squad hands the near-band NPC capture dropped (one
+    // "[recruit] NPC-SKIP" line per hand): see publishOwned.
+    std::set<Key>             pinNpcSkipLogged_;
     // Step-5 hysteresis: consecutive-frame counters per hand so a brief stream
     // hiccup doesn't suppress (needs ~1 s unstreamed) and a boundary NPC doesn't
     // flicker back (needs ~2 s streamed dwell to restore). Spike 18: the hard
