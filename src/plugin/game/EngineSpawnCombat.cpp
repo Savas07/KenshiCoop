@@ -1729,20 +1729,20 @@ int applyTaskOrder(Character* c, const EntityState& e) {
 }
 
 // Stage 3c (join-side): reproduce a streamed combat intent. e.task is a combat
-// stance (TASK_COMBAT_MELEE or TASK_COMBAT_WAIT) and the subject hand is the attack
-// target; resolve it to a local Character and order THIS body to focus-melee it
-// (UNPROVOKED so it engages regardless of faction). The join's own engine then
-// animates the fight (draw/swing/footwork) - we replicate the CAUSE, not the
-// animation. A WAITING copy gets the same goal (it enters combat stance and menaces
-// the target); the difference is the CALLER never timer-re-issues it. Returns 2
-// ordered / 1 target not loaded here / 0 no-op / -1 fault. orderMeleeAttack clears
-// prior goals so a re-issue cleanly re-targets. breakOrder additionally flushes a
-// committed player order (seat inject) via the order-path attack - without it a
-// seated copy ignores the goal (see the helper).
-int applyCombat(Character* c, const EntityState& e, bool breakOrder) {
+// stance (TASK_COMBAT_MELEE or TASK_COMBAT_WAIT) and its subject is the attack
+// target; the caller resolved that WIRE key to the local 'target' body (a minted
+// proxy or a re-keyed body has a different local hand, so the raw subject hand is
+// not resolvable here). Order THIS body to focus-melee it (UNPROVOKED so it
+// engages regardless of faction). The join's own engine then animates the fight
+// (draw/swing/footwork) - we replicate the CAUSE, not the animation. A WAITING copy
+// gets the same goal (it enters combat stance and menaces the target); the
+// difference is the CALLER never timer-re-issues it. Returns 2 ordered / 1 target
+// not loaded here / 0 no-op / -1 fault. orderMeleeAttack clears prior goals so a
+// re-issue cleanly re-targets. breakOrder additionally flushes a committed player
+// order (seat inject) via the order-path attack - without it a seated copy ignores
+// the goal (see the helper).
+int applyCombat(Character* c, Character* target, const EntityState& e, bool breakOrder) {
     if (!c || !coop::taskIsCombat(e.task)) return 0;
-    Character* target = resolveCharByHand(e.sIndex, e.sSerial, e.sType,
-                                          e.sContainer, e.sContainerSerial);
     if (!target) return 1; // opponent not loaded on this client -> caller just holds
     if (breakOrder && !orderMeleeAttackViaOrder(c, target)) return -1;
     return orderMeleeAttack(c, target) ? 2 : -1;
@@ -1754,11 +1754,9 @@ int applyCombat(Character* c, const EntityState& e, bool breakOrder) {
 // body of a non-hostile faction (world_parity camp: host Holy Sentinels beat
 // the escaped-prisoner PC, join sentinels idle at task 65535 through every
 // reissue). attackTarget skips that re-decision and starts the fight directly.
-int forceAttack(Character* c, const EntityState& e) {
+int forceAttack(Character* c, Character* target, const EntityState& e) {
     if (!c || !coop::taskIsCombat(e.task)) return 0;
     if (!g_attackTargetFn) return 0;
-    Character* target = resolveCharByHand(e.sIndex, e.sSerial, e.sType,
-                                          e.sContainer, e.sContainerSerial);
     if (!target) return 1;
     __try {
         g_attackTargetFn(c, target);

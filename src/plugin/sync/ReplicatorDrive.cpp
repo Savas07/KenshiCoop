@@ -37,6 +37,22 @@ void Replicator::logHardSnap(Character* c, const EntityState& out, const char* k
     skipped = 0;
 }
 
+Character* Replicator::bodyForKey(const Key& k, bool* viaProxy, bool* staleProxy) const {
+    if (viaProxy) *viaProxy = false;
+    if (staleProxy) *staleProxy = false;
+    Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+    if (c || !(spawnSync_ || recruitSync_)) return c;
+    std::map<Key, Character*>::const_iterator pit = proxyByKey_.find(k);
+    if (pit == proxyByKey_.end()) return 0;
+    unsigned int lh[5];
+    if (!pit->second || !engine::readHand(pit->second, lh)) {
+        if (staleProxy) *staleProxy = true;
+        return 0;
+    }
+    if (viaProxy) *viaProxy = true;
+    return pit->second;
+}
+
 void Replicator::applyTargets(GameWorld* gw) {
     (void)gw;
     unsigned long now = nowMs();
@@ -169,43 +185,38 @@ void Replicator::applyTargets(GameWorld* gw) {
         default: break;
         }
 
-        Character* c = engine::resolve(out);
         // Protocol 21: a streamed hand with NO local body is a host RUNTIME
         // spawn (roaming squad, dialog ambush - its hand exists only in the
         // host's session). If a proxy was already minted for it, drive THAT
-        // body - this single translation point makes the proxy inherit the
-        // entire world-NPC path below (AI-suspend, damage guard, combat,
-        // down/death latches).
+        // body - this single translation point (bodyForKey) makes the proxy
+        // inherit the entire world-NPC path below (AI-suspend, damage guard,
+        // combat, down/death latches), and the combat branch resolves its
+        // TARGET through the same function.
         // (Protocol 23 reuses the same translation point for RE-KEYED recruit
         // bodies, so the lookup also runs when only recruit sync is on.)
-        bool viaProxy = false;
-        if (!c && (spawnSync_ || recruitSync_)) {
-            std::map<Key, Character*>::iterator pit = proxyByKey_.find(it->first);
-            if (pit != proxyByKey_.end()) { c = pit->second; viaProxy = true; }
-        }
+        bool viaProxy = false, staleProxy = false;
+        Character* c = bodyForKey(it->first, &viaProxy, &staleProxy);
         // Phase 2 crash hardening: a minted proxy pointer can be freed by the
         // engine in the window between the ~1 Hz syncSpawns liveness sweep and
-        // this 20 Hz drive (mint/zone churn on town/camp approach). Prove the
-        // pointer is still live with a cheap SEH-guarded hand read BEFORE we
-        // dereference it below; a dead read means the body was reaped, so unbind
-        // and let the census/REQ machinery re-mint if the host still streams it.
-        // Only minted proxies need this - engine::resolve() returns bodies from
-        // the engine's own live lookup. targets_ is being iterated here, so we
-        // only touch the OTHER maps and let the 30 s targets_ prune (or a clean
-        // next-tick re-resolve) handle this key.
-        if (viaProxy) {
-            unsigned int lh[5];
-            if (!engine::readHand(c, lh)) {
-                char sb[160]; _snprintf(sb, sizeof(sb) - 1,
-                    "[drive] STALE unbind hand=%u,%u,%u,%u,%u c=%p",
-                    it->first.t, it->first.c, it->first.cs, it->first.i,
-                    it->first.s, (void*)c);
-                sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
-                proxyByKey_.erase(it->first);
-                spawnReq_.erase(it->first);   // allow a fresh REQ/mint cycle
-                lifeSet(it->first, LIFE_UNKNOWN, "drive-stale");
-                continue;
-            }
+        // this 20 Hz drive (mint/zone churn on town/camp approach). bodyForKey
+        // proves the pointer is still live with a cheap SEH-guarded hand read
+        // BEFORE anything below dereferences it; a dead read means the body was
+        // reaped, so unbind and let the census/REQ machinery re-mint if the host
+        // still streams it. Only minted proxies need this - engine::resolve()
+        // returns bodies from the engine's own live lookup. targets_ is being
+        // iterated here, so we only touch the OTHER maps and let the 30 s
+        // targets_ prune (or a clean next-tick re-resolve) handle this key.
+        if (staleProxy) {
+            std::map<Key, Character*>::iterator sp = proxyByKey_.find(it->first);
+            char sb[160]; _snprintf(sb, sizeof(sb) - 1,
+                "[drive] STALE unbind hand=%u,%u,%u,%u,%u c=%p",
+                it->first.t, it->first.c, it->first.cs, it->first.i,
+                it->first.s, (void*)(sp != proxyByKey_.end() ? sp->second : 0));
+            sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+            proxyByKey_.erase(it->first);
+            spawnReq_.erase(it->first);   // allow a fresh REQ/mint cycle
+            lifeSet(it->first, LIFE_UNKNOWN, "drive-stale");
+            continue;
         }
         if (!c) {
             // Unresolved-hand telemetry (Phase 0 diagnostics; logged even with
@@ -1016,9 +1027,27 @@ void Replicator::applyTargets(GameWorld* gw) {
             // between combo sections and slot rotations (the crowd lesson).
             bool localFighting = engine::readCombat(c, &lc) &&
                                  (lc.inCombat || lc.modeActive);
+            // The streamed target's LOCAL body, through the same translation the
+            // drive uses for its own subject (bodyForKey). A target the owner
+            // simulates natively is streamed under the owner's raw hand, and on
+            // this client that body can be a MINTED proxy (the raw hand never
+            // resolves here: applyCombat answered r=1 on every re-issue and the
+            // copy of a fighting PC stood idle) or a body our own combat detach
+            // RE-KEYED (its local hand no longer equals the wire key).
+            Key tk; tk.t = out.sType; tk.c = out.sContainer; tk.cs = out.sContainerSerial;
+            tk.i = out.sIndex; tk.s = out.sSerial;
+            Character* wantTgt = bodyForKey(tk, 0, 0);
             // The copy is engaged with the WRONG body (the local brawl grabbed it).
-            bool wrongLocalTgt = localFighting && lc.hasTarget &&
-                (lc.target[3] != out.sIndex || lc.target[4] != out.sSerial);
+            // Judged on BODIES, not hands: comparing the local target hand with
+            // the wire key latched "wrong" for the right body under a re-keyed or
+            // minted hand, and every re-issue then clearGoals-reset a correct
+            // fight while the 6 u walk band (correctFight=false) pulled the copy
+            // out of it. Unjudgeable (either body unresolved here) = not wrong.
+            Character* haveTgt = (localFighting && lc.hasTarget)
+                ? engine::resolveCharByHand(lc.target[3], lc.target[4], lc.target[0],
+                                            lc.target[1], lc.target[2])
+                : 0;
+            bool wrongLocalTgt = wantTgt && haveTgt && haveTgt != wantTgt;
             // The host retargeted since our last order.
             bool tgtChanged = d.combatArmed &&
                 (d.combatTgtIdx != out.sIndex || d.combatTgtSer != out.sSerial);
@@ -1078,7 +1107,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // AI just re-locks the wrong enemy). Throttled by the same re-issue
                 // backoff, so this is not a per-frame clearGoals thrash.
                 if (wrongLocalTgt) engine::clearGoals(c);
-                int r = engine::applyCombat(c, out, breakSeat);
+                int r = engine::applyCombat(c, wantTgt, out, breakSeat);
                 if (breakSeat && r == 2) {
                     d.taskApplied = false; d.taskBad = false;
                     d.issuedTask  = TASK_NONE;
@@ -1094,7 +1123,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 int fr = -2; // -2 = not attempted
                 if (r == 2 && !hostWaiting && !localFighting &&
                     d.combatOrders >= 2) {
-                    fr = engine::forceAttack(c, out);
+                    fr = engine::forceAttack(c, wantTgt, out);
                 }
                 d.combatArmed = true; d.combatTick = now;
                 if (d.combatOrders < 1000000u) ++d.combatOrders;
@@ -1115,14 +1144,24 @@ void Replicator::applyTargets(GameWorld* gw) {
             // and say so - but on a COOLDOWN: a snap that cannot stick (mid-stagger,
             // stale interp while the host body sprints) must not re-fire every frame
             // (measured: one hand snapped ~50x/s at constant drift).
-            // The walk band never runs while the copy is still ARMING (an active
-            // stance with re-issues left): walkTo is the player-move/HIGH_PRIORITY-
-            // destination path and it STOMPS a pending attack goal, so walk-driving
-            // there keeps the copy from ever engaging (player_combat: the striker
-            // must arm and land real blood on the victim's owner). Once armed - or
-            // once the arming budget is spent (a copy that won't fight here) - the
-            // walk band is what keeps a non-engaging body tracking the host's
-            // roaming brawl (combat_crowd: without it, medians hit 50+ u).
+            // A driven SQUAD copy (a peer's player character) is walked by the
+            // player MOVE-ORDER path, and a player order replaces whatever the copy
+            // was doing in the fight: the attack it is arming, the stance it holds
+            // in the attack-slot ring, the swing it is in. So a squad copy is never
+            // walk-converged inside the churn ceiling (COMBAT_SNAP_DIST, the band a
+            // correctly-engaged fight already owns), and not at all while it is
+            // still ARMING (an active stance with re-issues left) - only the true-
+            // leave snap moves it then. Before this, every combo-gap flicker of the
+            // local fight read and every WAITING sample turned into a jog to the
+            // owner's spot instead of a swing (host_pc_fight: the copy of a fighting
+            // PC was walk-ordered in 23-71% of its owner's fight samples), and an
+            // arming copy never engaged (player_combat: the striker must arm and
+            // land real blood on the victim's owner). Past the ceiling, or once the
+            // arming budget is spent (a copy that won't fight here), the walk band
+            // keeps it tracking the owner's roaming brawl.
+            // World-NPC copies keep the soft bands and converge while arming
+            // (combat_crowd: without it, medians hit 50+ u); their walkTo is a
+            // HIGH_PRIORITY destination, not a player order.
             if (haveActual) {
                 bool arming = !hostWaiting && !localFighting &&
                               d.combatOrders <= COMBAT_REISSUE_CAP;
@@ -1136,10 +1175,11 @@ void Replicator::applyTargets(GameWorld* gw) {
                   if (d.interp.latest(&nn, &cvx, &cvy, &cvz))
                       srcVel = std::sqrt(cvx * cvx + cvy * cvy + cvz * cvz); }
                 // Convergence-first correction (2026-07-16 smoothness pass). A
-                // correctly-engaged fight owns its footwork up to the churn ceiling
-                // (COMBAT_SNAP_DIST); every other copy (arming / idle / WAITING /
-                // wrong-target) converges above a soft band - tighter for a waiting
-                // stance that should not wander. Above the leave band the body
+                // correctly-engaged fight (and any squad copy, above) owns its
+                // footwork up to the churn ceiling (COMBAT_SNAP_DIST); every other
+                // world-NPC copy (arming / idle / WAITING / wrong-target) converges
+                // above a soft band - tighter for a waiting stance that should not
+                // wander. Above the leave band the body
                 // FAST-SLIDES to the host pose (a quick walk, gait preserved); an
                 // INSTANT teleport is reserved for a true LEAVE only (very far, a
                 // source teleport, or a drift that SAT over the band for
@@ -1147,7 +1187,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // spikes converge - they never warp.
                 bool correctFight = localFighting && !wrongLocalTgt;
                 float softBand  = hostWaiting ? COMBAT_WAIT_DIST : combatSoftDist_;
-                float leaveBand = correctFight ? combatSnapDist_ : softBand;
+                float leaveBand = (correctFight || isSquad) ? combatSnapDist_ : softBand;
                 if (drift > combatSnapDist_) {
                     if (d.combatOverTick == 0) d.combatOverTick = now;
                 } else {
@@ -1192,7 +1232,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                         arming ? 1 : 0, hostWaiting ? 1 : 0,
                         d.interp.lastSegMs(), d.combatSnapCount);
                       b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
-                } else if (drift > leaveBand) {
+                } else if (drift > leaveBand && !(isSquad && arming)) {
                     // Fast catch-up slide: speed scales with drift (~1 s to close),
                     // clamped so a big gap glides quickly without a teleport. walkTo
                     // floors sub-1 speeds to RUN, so small converges stay a walk.

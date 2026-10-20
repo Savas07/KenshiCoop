@@ -545,22 +545,26 @@ bool readCombat(Character* c, CombatRead* out);
 bool readCombatByHand(const unsigned int hand[5], CombatRead* out);
 
 // Join-side combat apply: e.task is a combat stance (TASK_COMBAT_MELEE or
-// TASK_COMBAT_WAIT) and the subject hand is the attack target. Resolve it locally
-// and order THIS body to focus-melee it, so the join's own engine animates the
-// fight (replicate the cause, not the animation).
+// TASK_COMBAT_WAIT) and its subject is the attack target; 'target' is that
+// subject's LOCAL body, resolved by the caller (Replicator::bodyForKey - the
+// subject is a WIRE key and may be a minted proxy or a re-keyed body here, so a
+// raw hand lookup is not a translation). Orders THIS body to focus-melee it, so
+// the join's own engine animates the fight (replicate the cause, not the
+// animation).
 // breakOrder=true additionally routes the attack through the player-ORDER path
 // (addOrder clear=true) FIRST: a seat-injected copy holds a player order at its
 // stool which outranks the AI goal, so the goal alone never starts the fight.
-// Returns 2 ordered / 1 target not loaded / 0 no-op (not a combat intent) / -1 fault.
-int applyCombat(Character* c, const EntityState& e, bool breakOrder);
+// Returns 2 ordered / 1 target not loaded (target == 0) / 0 no-op (not a combat
+// intent) / -1 fault.
+int applyCombat(Character* c, Character* target, const EntityState& e, bool breakOrder);
 
 // Engagement escalation (world_parity camp): both the goal and order attack
 // paths are silently dropped by the running local AI when the target is a
 // locally player-owned body of a non-hostile faction (escaped-prisoner
 // recapture: host guards fight, join guards idle). Character::attackTarget is
-// the AI's own commit-an-attack entry and bypasses that validation. Returns
-// 2 forced / 1 target not loaded / 0 no-op / -1 fault.
-int forceAttack(Character* c, const EntityState& e);
+// the AI's own commit-an-attack entry and bypasses that validation. 'target' as
+// for applyCombat. Returns 2 forced / 1 target not loaded / 0 no-op / -1 fault.
+int forceAttack(Character* c, Character* target, const EntityState& e);
 
 // duel test scene: spawn two mutually-hostile non-squad NPCs in front of the leader
 // from the SAME nearby faction so they are PEACEFUL on spawn (no attack issued here).

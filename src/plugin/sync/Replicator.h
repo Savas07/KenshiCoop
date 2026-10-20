@@ -1090,6 +1090,18 @@ private:
                    bool haveActual, float ax, float ay, float az, unsigned long now,
                    bool isSquad);
 
+    // The ONE wire-key -> local-body translation. Both the drive subject and every
+    // streamed SUBJECT the drive acts on (the combat target) go through it, so the
+    // attack is aimed at the same body the drive moves for that key. The key's own
+    // hand when it resolves here; otherwise the proxy minted/adopted for it
+    // (protocol 21/23 - a proxy's key is the PEER's hand, which never resolves
+    // here), *viaProxy set. A proxy pointer can be freed by the engine between the
+    // ~1 Hz liveness sweep and this use, so it is proven live with a SEH-guarded
+    // hand read first; a dead one returns 0 with *staleProxy set (only the drive
+    // loop, which owns the binding, unbinds it). Read-only. Either out-param may
+    // be 0.
+    Character* bodyForKey(const Key& k, bool* viaProxy, bool* staleProxy) const;
+
     // Drive-tick epilogue (Phase 7 Workstream C): the self-contained post-loop
     // passes split out of applyTargets. Each reads/writes only Replicator members
     // and the tick clock (`now`) - never any per-body loop local - so the split is
