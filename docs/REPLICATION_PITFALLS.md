@@ -492,12 +492,25 @@ local body (own hand, else the live proxy) for the drive subject AND the combat
 target; `applyCombat`/`forceAttack` take that body, and "wrong target" compares
 bodies, never hands.
 
-Two follow-ups the same scenario proved for copies of player characters: a walk
-order is a player move order, so it replaces the copy's attack (squad copies now
-converge only past the churn ceiling and never while arming); and the re-issue
-budget was spent by the owner's own re-targets inside one brawl, after which a
-copy that dropped out was never re-ordered (squad copies get a fresh budget per
-owner target and are re-ordered right after a snap).
+Two follow-ups the same scenario proved for copies of player characters. First, a
+walk order is a player move order: it flips the copy's task to MOVE_ON_FREE_WILL
+and drops the attack until the next re-issue. With the trace on
+(`KENSHICOOP_DEBUG_COMBAT_COPY=1`, `[combat] trace` / `[combat] walk`), every idle
+stretch of the join's copy began with a band walk at 20-26 u of drift while the
+copy was hitting the right body (lead_trace1). A squad copy whose lock resolved to
+its owner's target is now ENGAGED for `COMBAT_LOCK_HOLD_MS` across the lock's
+between-swing blinks: no walk band, no sustained-drift warp (a big distance or a
+source teleport still snaps), no disengaged re-issue. host_pc_fight_mint went
+from 15% engaged (walk-ordered 74%) to 100%, host_pc_fight from 54% to 84%.
+Second, the re-issue budget was spent by the owner's own re-targets inside one
+brawl, after which a copy that dropped out was never re-ordered (squad copies get
+a fresh budget per owner target and are re-ordered right after a snap).
+
+In a multi-enemy brawl both engines pick their next victim themselves every
+0.5-2 s, so "same body at the same instant" is not a parity both sides can hold
+without a `clearGoals` re-issue per flip — the churn that cancelled the swings.
+The gate scores a copy as engaged when it fights any body its owner fights in that
+brawl (within 5 s); same-body parity is reported beside it.
 
 **Rule.** Any field that carries a peer's key — a subject, a target, a carrier —
 has to go through the same key-to-body translation as the body itself, and any
