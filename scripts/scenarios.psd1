@@ -1173,6 +1173,20 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # recruit_seated: recruit_join's script with both legs recruiting a
+        # POSED (seated/working) NPC - the bar recruit. The host recruits one it
+        # authors (recruit_seated_host), the join one it drives from the host's
+        # stream (recruit_seated); same Test-RecruitJoin gates plus "the subject
+        # really was posed". The peer's copy of a seated recruit must stand up and
+        # follow the recruiter's orders. Save 'sync'.
+        recruit_seated = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'recruit_seated'
+            Gating   = @('recruit_seated', 'recruit_seated_host', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # faction_probe: faction-relation phase-0 diagnostic (protocol 24 -
         # factionSync forced OFF; the affectRelations detours stay on for
         # cause-attribution evidence). Both sides log a 1 Hz FACREL series

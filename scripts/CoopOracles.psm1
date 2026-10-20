@@ -138,6 +138,8 @@ function Invoke-OneOracle {
         "recruit_ctl"   { return (Test-RecruitCtl      -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_join"  { return (Test-RecruitJoin     -HostFile $HostLog -JoinFile $JoinLog -Leg J) }
         "recruit_join_host" { return (Test-RecruitJoin -HostFile $HostLog -JoinFile $JoinLog -Leg H) }
+        "recruit_seated" { return (Test-RecruitJoin -HostFile $HostLog -JoinFile $JoinLog -Leg J -Seated) }
+        "recruit_seated_host" { return (Test-RecruitJoin -HostFile $HostLog -JoinFile $JoinLog -Leg H -Seated) }
         "faction_probe" { return (Test-FactionProbe    -HostFile $HostLog -JoinFile $JoinLog) }
         "faction_sync"  { return (Test-FactionSync     -HostFile $HostLog -JoinFile $JoinLog) }
         "time_probe"    { return (Test-TimeProbe       -HostFile $HostLog -JoinFile $JoinLog) }

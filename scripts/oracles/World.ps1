@@ -589,8 +589,10 @@ function Test-RecruitCtl {
 #   6. P sends no owned-channel lines for it ([stats] SEND, [med] SEND npc=0,
 #      [inv] SEND) and authors no squad move for it.
 function Test-RecruitJoin {
-    param([string]$HostFile, [string]$JoinFile, [ValidateSet('J', 'H')][string]$Leg = 'J')
+    param([string]$HostFile, [string]$JoinFile, [ValidateSet('J', 'H')][string]$Leg = 'J',
+          [switch]$Seated)
     $gate     = if ($Leg -eq 'J') { 'recruit_join' } else { 'recruit_join_host' }
+    if ($Seated) { $gate = $gate -replace '^recruit_join', 'recruit_seated' }
     $recFile  = if ($Leg -eq 'J') { $JoinFile } else { $HostFile }
     $peerFile = if ($Leg -eq 'J') { $HostFile } else { $JoinFile }
     $recWho   = if ($Leg -eq 'J') { 'join' } else { 'host' }
@@ -621,6 +623,10 @@ function Test-RecruitJoin {
     if ($res -ne 1) {
         Write-Host "  RECRUIT-JOIN[$Leg] FAIL - recruit failed locally (res=$res subject=$($g[2].Value))"
         return (Add-GateResult -Name $gate -Status "FAIL" -Detail "recruit failed locally (res=$res subject=$($g[2].Value))")
+    }
+    if ($Seated -and $g[6].Value -ne '1') {
+        Write-Host "  RECRUIT-JOIN[$Leg] FAIL - seated arm recruited a body that was not posed"
+        return (Add-GateResult -Name $gate -Status "FAIL" -Detail "seated arm: subject was not posed (posed=0) - path not exercised")
     }
     $tRec = [int]$g[7].Value
     $fm = @(Select-String -Path $peerFile -Pattern "$stamp.*SCENARIO RJ found leg=$Leg who=$peerWho hand=([\d,]+) wire=([\d,]+) minted=(\d) proxy=(\d) t=(\d+)" -ErrorAction SilentlyContinue) | Select-Object -First 1
@@ -768,6 +774,14 @@ function Test-RecruitJoin {
             if ((Convert-StampToMs -Groups $m.Matches[0].Groups -OffsetMs $peerOff) -ge $foundWall) { $sent++ }
         }
         if ($sent -gt 0) { $why += "$peerWho published the recruit as its own ($sent owned-channel/squad-move lines)" }
+        # ...and the recruiter never minted a twin of its own recruit from a hand
+        # the peer leaked for it (rj_after2: the host streamed its fresh local
+        # hand as a world NPC for one tick, the join minted it into its squad).
+        $twin = 0
+        foreach ($hh in $hands) {
+            $twin += @(Select-String -Path $recFile -Pattern "\[spawn\] proxy BOUND hand=$([regex]::Escape($hh)) sid=" -ErrorAction SilentlyContinue).Count
+        }
+        if ($twin -gt 0) { $why += "$recWho minted a phantom twin of its own recruit from $peerWho's hand (proxy BOUND x$twin)" }
     }
 
     $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }

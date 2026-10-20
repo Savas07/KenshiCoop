@@ -1247,7 +1247,11 @@ private:
 // so one run shows the asymmetry.
 class RecruitJoinScenario : public TimedScenario {
 public:
-    RecruitJoinScenario() : TimedScenario("recruit_join", /*evidenceMs=*/0) {
+    // seated=true is recruit_seated: both legs recruit a POSED (seated/working)
+    // NPC - the bar recruit - instead of preferring a free-standing one.
+    explicit RecruitJoinScenario(bool seated)
+        : TimedScenario(seated ? "recruit_seated" : "recruit_join", /*evidenceMs=*/0),
+          seated_(seated) {
         initLeg(legs_[0], 'H', true,  H_RECRUIT_AT_MS);
         initLeg(legs_[1], 'J', false, J_RECRUIT_AT_MS);
     }
@@ -1377,10 +1381,14 @@ private:
             if (nearest < 0.0f || d < nearest) nearest = d;
             if (d > PICK_RADIUS) { ++distant; continue; }
             ++eligible;
-            bool posed   = st[i].task != TASK_NONE && !taskIsCombat(st[i].task);
+            bool posed   = st[i].task != TASK_NONE && !taskIsCombat(st[i].task) &&
+                           !taskIsCarry(st[i].task) && !taskIsGetUp((int)st[i].task);
+            if (seated_ && !posed) continue;
             bool rekeyed = peerDriven && !sameHand(v.local, v.wire);
+            // Standing arms prefer free-standing bodies (leg J re-keyed first);
+            // the seated arms only see posed ones (leg J re-keyed first).
             int tier = L.hostRecruits ? (posed ? 1 : 0)
-                                      : ((rekeyed ? 0 : 2) + (posed ? 0 : 1));
+                                      : ((posed ? 2 : 0) + (rekeyed ? 0 : 1));
             if (!best || tier < bestTier || (tier == bestTier && d < bestD)) {
                 best = c; bestTier = tier; bestD = d;
                 *outDist = d; *outPosed = posed ? 1 : 0; *outRole = v;
@@ -1511,6 +1519,7 @@ private:
     static const unsigned int  MAX_NPC         = 128;
     static const float         PICK_RADIUS;
 
+    bool                    seated_;
     std::vector<Character*> base_;
     Leg                     legs_[2];
 };
@@ -2721,7 +2730,8 @@ Scenario* makeProbeScenario(const std::string& name) {
     if (name == "recruit_probe") return new RecruitProbeScenario(true);
     if (name == "recruit_sync")  return new RecruitProbeScenario(false);
     if (name == "recruit_ctl")   return new RecruitCtlScenario();
-    if (name == "recruit_join")  return new RecruitJoinScenario();
+    if (name == "recruit_join")  return new RecruitJoinScenario(false);
+    if (name == "recruit_seated") return new RecruitJoinScenario(true);
     if (name == "squad_probe")   return new SquadProbeScenario(true);
     if (name == "squad_sync")    return new SquadProbeScenario(false);
     if (name == "faction_probe") return new FactionProbeScenario(true);
