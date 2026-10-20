@@ -936,6 +936,27 @@ int groundItemLiveness(const unsigned int itemHand[5], float outPos[3]);
 // (spawnWorldItemProxy hands one back) before calling.
 int groundObjectLiveness(RootObject* obj, float outPos[3], bool* outPickedUp);
 
+// SEH-guarded (protocol 61): the nearest FREE ground item of template `sid` within
+// `tol` of pos, skipping the objects in excl[] (0 if none). Sphere-query based, so
+// it can miss in towns: callers that hold a handle-tracked copy try that first.
+RootObject* nearestFreeGroundItemAt(GameWorld* gw, const float pos[3], const char* sid,
+                                    float tol, RootObject* const* excl, unsigned int nExcl);
+
+// SEH-guarded (TEST): number of FREE ground items of template `sid` within radius of pos.
+int countFreeGroundItemsAt(GameWorld* gw, const float pos[3], const char* sid, float radius);
+
+// SEH-guarded (TEST): put the nearest FREE ground item of `sid` within tol of pos into
+// the inventory at cHand through the engine's own tryAddItem (the UI pickup path).
+// Returns 1 on success.
+int pickupGroundItemAt(GameWorld* gw, const unsigned int cHand[5], const float pos[3],
+                       const char* sid, float tol);
+
+// SEH-guarded (TEST): an ITEM template every client resolves identically (same game
+// data): the one whose stringID equals `prefer`, or whose name contains it, when
+// given; else the common template addTestItemsToContainer seeds. Writes sid + type.
+bool commonItemTemplate(GameWorld* gw, char* outSid, unsigned int outLen, unsigned int* outType,
+                        const char* prefer = 0);
+
 // SEH-guarded (join): spawn a LOCAL proxy ground item from the template (sid, typeCat) at
 // world position (x,y,z), so the join renders a host-dropped item where the host sees it.
 // Returns the spawned object (cull/update it later) or 0. The join owns this proxy; it is

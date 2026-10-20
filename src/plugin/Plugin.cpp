@@ -2212,6 +2212,9 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
             // so destroy our real copy. Runs AFTER applyWorldItems so a snapshot and the
             // claim that retires it in the same batch resolve in authored order.
             g_repl.applyWorldClaims(gw, g_inbound, g_net.localId());
+            // Protocol 61: a peer took a save-native ground item (never streamed), so
+            // destroy our own copy of it - the native half of the pickup mirror.
+            g_repl.applyNativeTakes(gw, g_inbound, g_net.localId());
         }
         // Host-authoritative world: only the JOIN hides/freezes any local NPC the
         // host isn't streaming (so the join can't run a divergent copy). The host IS

@@ -2346,6 +2346,29 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $false
         }
+        # world_native_pickup gates SAVE-NATIVE ground items (upstream #44/#63/#66): both
+        # clients hold their own copy of two items only the scan can find; no spot may ever
+        # show two copies (a native streaming onto the peer's own), and the host's pickup
+        # of one must remove the join's copy while the other stays.
+        world_native_pickup = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'native_pickup'
+            Gating   = @('native_pickup', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
+        # world_native_pickup_stack: the same gate with a STACKING template the host
+        # already carries, so its pickup can MERGE into that stack (the common UI case) -
+        # the notice must still fire when the ground item joins an existing stack.
+        world_native_pickup_stack = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'native_pickup'
+            Gating   = @('native_pickup', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
         # inv_regear gates the W2 round trip's ONE-INSTANCE invariant: after the peer picks
         # up gear WE dropped, the item is in its bag AND gone from our ground - the manual
         # session's "a few items stayed on the host's ground" was the duplicate outcome.

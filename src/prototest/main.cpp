@@ -123,6 +123,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(InvXferAckPacket)",        sizeof(InvXferAckPacket),        18); // v50: transfer verdict
     CHECK_EQ("sizeof(VendorDeltaPacket)",       sizeof(VendorDeltaPacket),       188); // v60: shop-counter stock/cash change
     CHECK_EQ("sizeof(VendorCashPacket)",        sizeof(VendorCashPacket),        29);  // v60: merchant cash mirror
+    CHECK_EQ("sizeof(NativeTakenPacket)",       sizeof(NativeTakenPacket),       69);  // v61: save-native pickup notice
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -312,8 +313,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v60: shared vendor stock)",
-             (int)PROTOCOL_VERSION, 60);
+    CHECK_EQ("PROTOCOL_VERSION (v61: save-native pickup notice)",
+             (int)PROTOCOL_VERSION, 61);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -391,6 +392,7 @@ static void testSizes() {
     CHECK("INV_FLAG_SHOP distinct from TRUNCATED", (INV_FLAG_SHOP & INV_FLAG_TRUNCATED) == 0);
     CHECK_EQ("PKT_VENDOR_DELTA id", (int)PKT_VENDOR_DELTA, 52);
     CHECK_EQ("PKT_VENDOR_CASH id", (int)PKT_VENDOR_CASH, 53);
+    CHECK_EQ("PKT_NATIVE_TAKEN id", (int)PKT_NATIVE_TAKEN, 54);
     // `count` must remain the LAST header field: the entry array is framed immediately
     // after it, so inserting `flags` anywhere else would shift the payload.
     {
@@ -508,6 +510,7 @@ static void testRoundTrips() {
     roundTrip<InvXferAckPacket>("InvXferAckPacket", (u8)PKT_INV_XFER_ACK);
     roundTrip<VendorDeltaPacket>("VendorDeltaPacket", (u8)PKT_VENDOR_DELTA);
     roundTrip<VendorCashPacket>("VendorCashPacket", (u8)PKT_VENDOR_CASH);
+    roundTrip<NativeTakenPacket>("NativeTakenPacket", (u8)PKT_NATIVE_TAKEN);
 
     CHECK("packetType(null) == 0", packetType(0, 10) == 0);
     unsigned char b0[1] = { 0 };
@@ -1388,6 +1391,7 @@ static void testFlushWorldStateContract() {
     MoneyDeltaPacket md; std::memset(&md,  0, sizeof(md));
     VendorDeltaPacket vdp; std::memset(&vdp, 0, sizeof(vdp));
     VendorCashPacket vcp; std::memset(&vcp, 0, sizeof(vcp));
+    NativeTakenPacket ntp; std::memset(&ntp, 0, sizeof(ntp));
     FactionPacket   fa;  std::memset(&fa,  0, sizeof(fa));
     TimePacket      ti;  std::memset(&ti,  0, sizeof(ti));
     DoorPacket      dp;  std::memset(&dp,  0, sizeof(dp));
@@ -1422,6 +1426,7 @@ static void testFlushWorldStateContract() {
     in.pushWorldItems(1, 0, 0);
     in.pushWorldRemove(1, 0, 0);
     in.pushWorldClaim(1, 2, 0, 0);
+    in.pushNativeTaken(1, ntp);
     in.pushNpcCensus(1, 0, 0, 0);
     in.pushWorldDrop(1, wdp);
     in.pushWorldPickup(1, wpp);
@@ -1477,6 +1482,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("worldItems",  InboundWorldItems,  drainWorldItems);
     WS_EMPTY("worldRemove", InboundWorldRemove, drainWorldRemove);
     WS_EMPTY("worldClaim",  InboundWorldClaim,  drainWorldClaim);
+    WS_EMPTY("nativeTaken", InboundNativeTaken, drainNativeTaken);
     WS_EMPTY("npcCensus",   InboundNpcCensus,   drainNpcCensus);
     WS_EMPTY("worldDrop",   InboundWorldDrop,   drainWorldDrops);
     WS_EMPTY("worldPickup", InboundWorldPickup, drainWorldPickups);

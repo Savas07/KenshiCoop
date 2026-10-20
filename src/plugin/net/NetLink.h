@@ -133,6 +133,9 @@ public:
     // MAIN thread: queue the merchant cash of a mirrored counter (protocol 60,
     // host -> joins).
     void queueVendorCash(const VendorCashPacket& pkt);
+    // MAIN thread: queue a save-native pickup notice (protocol 61, any -> all;
+    // the host relays a join's to the other joins).
+    void queueNativeTaken(const NativeTakenPacket& pkt);
     void queueFaction(const FactionPacket& pkt);
     void queueTime(const TimePacket& pkt);
     void queueDoor(const DoorPacket& pkt);
@@ -339,6 +342,7 @@ private:
     std::vector<MoneyDeltaPacket> outMoneyDelta_;
     std::vector<VendorDeltaPacket> outVendorDelta_; // protocol 60 (join -> host)
     std::vector<VendorCashPacket>  outVendorCash_;  // protocol 60 (host -> joins)
+    std::vector<NativeTakenPacket> outNativeTaken_; // protocol 61 (any -> all)
     std::vector<FactionPacket>   outFaction_;
     std::vector<TimePacket>      outTime_;
     std::vector<DoorPacket>      outDoor_;

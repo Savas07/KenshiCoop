@@ -368,6 +368,30 @@ static u32 worldTrackHash(const char* sid, u32 type, u16 qty, u16 qual) {
     return h ? h : 1u;
 }
 
+void Replicator::rememberDrop(std::vector<RecentDrop>& v, const char* sid,
+                              float x, float y, float z, unsigned long now, size_t cap) {
+    if (!sid || !sid[0] || cap == 0) return;
+    if (v.size() >= cap) v.erase(v.begin());
+    RecentDrop d; memset(&d, 0, sizeof(d));
+    strncpy(d.stringID, sid, sizeof(d.stringID) - 1);
+    d.x = x; d.y = y; d.z = z; d.ms = now;
+    v.push_back(d);
+}
+
+bool Replicator::takeRecentDrop(std::vector<RecentDrop>& v, const char* sid, float x, float z,
+                                float tol, unsigned long now, unsigned long maxAgeMs) {
+    for (size_t i = 0; i < v.size(); ) {
+        if (maxAgeMs != 0 && now - v[i].ms > maxAgeMs) { v.erase(v.begin() + i); continue; }
+        float dx = v[i].x - x, dz = v[i].z - z;
+        if (dx * dx + dz * dz <= tol * tol && strcmp(v[i].stringID, sid) == 0) {
+            v.erase(v.begin() + i);
+            return true;
+        }
+        ++i;
+    }
+    return false;
+}
+
 RootObject* Replicator::liveWorldProxy(const WorldProxy& wp) {
     if (!wp.obj) return 0;
     // No verified hand: nothing to check against, so this is the pre-existing
@@ -413,43 +437,21 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (live) proxyObjs.insert(live);
     }
 
-    // ---- First-scan baseline (Phase 3 item-dup fix) ------------------------
-    // Every non-gear ground item present at the FIRST publish pass after a load
-    // is a SHARED save-native: the peer loaded the same save (or the host's
-    // connect-pushed save) and already holds an identical copy. Streaming it
-    // would mint a proxy on top of the peer's own native - the "rejoin/reload
-    // duplicated all items" report, compounding one layer per reload. Seed them
-    // as baseline tracks (identity + liveness only, NEVER emitted). Only items
-    // that appear AFTER this baseline (session drops via the hook, host runtime
-    // spawns) stream. resetSession() clears worldSeeded_ so each reload re-
-    // baselines the (possibly newly-baked) save-natives instead of re-streaming.
-    if (!worldSeeded_) {
-        worldSeeded_ = true;
-        engine::WorldItemRaw raw[WORLD_ITEMS_MAX];
-        unsigned int n = engine::captureWorldItems(gw, raw, WORLD_ITEMS_MAX, RADIUS);
-        unsigned int seeded = 0;
-        for (unsigned int i = 0; i < n; ++i) {
-            if (isGearType(raw[i].itemType)) continue;
-            if (!proxyObjs.empty() &&
-                proxyObjs.count(engine::resolveObjectByHand(raw[i].hand)) != 0)
-                continue; // already our proxy (defensive; unlikely at first scan)
-            Key k; k.t = raw[i].hand[0]; k.c = raw[i].hand[1]; k.cs = raw[i].hand[2];
-            k.i = raw[i].hand[3]; k.s = raw[i].hand[4];
-            if (worldTrack_.find(k) != worldTrack_.end()) continue;
-            WorldTrack t; memset(&t, 0, sizeof(t));
-            t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
-            t.x = raw[i].x; t.y = raw[i].y; t.z = raw[i].z; t.seen = true;
-            t.baseline = true; // never emit
-            strncpy(t.stringID, raw[i].stringID, sizeof(t.stringID) - 1);
-            t.stringID[sizeof(t.stringID) - 1] = '\0';
-            t.itemType = raw[i].itemType; t.quantity = raw[i].quantity; t.quality = raw[i].quality;
-            worldTrack_[k] = t;
-            ++seeded;
-        }
-        char b[96]; _snprintf(b, sizeof(b) - 1,
-            "[wi] BASELINE seeded=%u (save-native, never-stream)", seeded);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-    }
+    // Save-natives (Phase 3 item-dup fix, structural since upstream #44/#63/#66):
+    // every client loaded the same save, so each holds its own copy of every
+    // pre-existing ground item and streaming one mints a proxy on top of the
+    // peer's native. That used to be decided ONCE, by the first scan after a
+    // load - but the scan is capped at WORLD_ITEMS_MAX rows and covers only the
+    // cells loaded at that moment, so every native past the 16th, and every one
+    // in a cell that loaded later (travel), streamed as a "new" item and was
+    // duplicated on the peer. Now a row only the scan found (no drop-hook edge)
+    // is a native whenever it is first seen, unless it is one of our own drops
+    // the hook could not key (pendingDrops_ / dormantDrops_, Discovery 2).
+    const float         PEND_TOL    = 2.5f;  // hook drop pos vs where it settled
+    const unsigned long PEND_MS     = 10000; // the scan reaches a town drop late
+    const float         DORMANT_TOL = 1.0f;  // an unloaded item reloads where it lay
+    const size_t        PEND_CAP    = 64;
+    const size_t        DORMANT_CAP = 256;
 
     // Gear (itemType WEAPON/ARMOUR) rides the W2 conservation drop/pickup channel
     // (the real shared-save object is relocated bag<->ground on each client), so the
@@ -472,6 +474,9 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                     "hand; spatial scan is the only remaining chance)",
                     de[i].stringID, de[i].quantity, de[i].x, de[i].y, de[i].z);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                // Still our drop: if the scan finds it, it must stream, not baseline.
+                rememberDrop(pendingDrops_, de[i].stringID, de[i].x, de[i].y, de[i].z,
+                             now, PEND_CAP);
                 continue;
             }
             // A drop from a PEER-owned squad copy is the peer's to author (it streams
@@ -526,6 +531,7 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     {
         engine::WorldItemRaw raw[WORLD_ITEMS_MAX];
         unsigned int n = engine::captureWorldItems(gw, raw, WORLD_ITEMS_MAX, RADIUS);
+        unsigned int natives = 0;
         for (unsigned int i = 0; i < n; ++i) {
             if (isGearType(raw[i].itemType)) continue;
             if (!proxyObjs.empty() &&
@@ -541,6 +547,15 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 strncpy(t.stringID, raw[i].stringID, sizeof(t.stringID) - 1);
                 t.stringID[sizeof(t.stringID) - 1] = '\0';
                 t.itemType = raw[i].itemType; t.quantity = raw[i].quantity; t.quality = raw[i].quality;
+                const bool ownDrop =
+                    takeRecentDrop(pendingDrops_, t.stringID, t.x, t.z, PEND_TOL, now, PEND_MS) ||
+                    takeRecentDrop(dormantDrops_, t.stringID, t.x, t.z, DORMANT_TOL, now, 0);
+                t.baseline = !ownDrop; // never emit a native
+                if (t.baseline) ++natives;
+                else if (dumpWi) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wi] SCAN-OWN netId=%u sid='%s' pos=%.2f,%.2f,%.2f (own unkeyed drop; streams)",
+                    t.netId, t.stringID, t.x, t.y, t.z);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
                 worldTrack_[k] = t;
             } else {
                 // Refresh the description (a re-stack can change qty/quality).
@@ -549,6 +564,12 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 tr.stringID[sizeof(tr.stringID) - 1] = '\0';
                 tr.itemType = raw[i].itemType; tr.quantity = raw[i].quantity; tr.quality = raw[i].quality;
             }
+        }
+        if (!worldSeeded_) {
+            worldSeeded_ = true;
+            char b[96]; _snprintf(b, sizeof(b) - 1,
+                "[wi] BASELINE seeded=%u (save-native, never-stream)", natives);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
 
@@ -571,11 +592,35 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned int ihand[5] = { it->first.t, it->first.c, it->first.cs, it->first.i, it->first.s };
         float pos[3] = { tr.x, tr.y, tr.z };
         // Query-free liveness: is the real item still on the ground (not gone/picked-up)?
-        if (!engine::groundItemLiveness(ihand, pos)) {
+        RootObject* tro = engine::resolveObjectByHand(ihand);
+        bool pickedUp = false;
+        if (!tro || !engine::groundObjectLiveness(tro, pos, &pickedUp)) {
             // Baseline (save-native) tracks were never streamed, so the peer has
             // no proxy to remove - just drop our track. Streamed tracks emit a
             // remove so the peer despawns its proxy.
-            if (!tr.baseline) { if (nr < 256) removed[nr++] = tr.netId; }
+            if (!tr.baseline) {
+                if (nr < 256) removed[nr++] = tr.netId;
+                // Gone without being taken (and not destroyed for a claim): its cell
+                // unloaded. Remember it so it streams again when it reloads.
+                if (!pickedUp && !tr.claimed)
+                    rememberDrop(dormantDrops_, tr.stringID, tr.x, tr.y, tr.z, now, DORMANT_CAP);
+            } else if (pickedUp) {
+                // Upstream #44: a save-native left our ground for a bag. Each peer
+                // holds its own copy of it, which nothing else would ever retire -
+                // both players could take the same item. Name it by template and
+                // its last ground position (hands do not cross clients). Gear never
+                // gets a baseline track (it rides W2), so this is non-gear only.
+                NativeTakenPacket nt; memset(&nt, 0, sizeof(nt));
+                nt.type = (u8)PKT_NATIVE_TAKEN; nt.ownerId = ownerId;
+                nt.takeId = nextNativeTakeId_++;
+                strncpy(nt.stringID, tr.stringID, sizeof(nt.stringID) - 1);
+                nt.x = tr.x; nt.y = tr.y; nt.z = tr.z;
+                net.queueNativeTaken(nt);
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wi] NATIVE-TAKEN take=%u sid='%s' pos=%.2f,%.2f,%.2f",
+                    nt.takeId, nt.stringID, nt.x, nt.y, nt.z);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
             if (dumpWi) { char b[112]; _snprintf(b, sizeof(b) - 1,
                 "[wi] CULL netId=%u (gone/picked-up) baseline=%d", tr.netId, tr.baseline ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
@@ -811,6 +856,68 @@ void Replicator::applyWorldClaims(GameWorld* gw, Inbound& in, u32 localId) {
             if (!destroyed) worldTrack_.erase(tit);
             else            tit->second.claimed = true;
         }
+    }
+}
+
+void Replicator::applyNativeTakes(GameWorld* gw, Inbound& in, u32 localId) {
+    std::deque<InboundNativeTaken> got;
+    in.drainNativeTaken(got);
+    if (got.empty() || !gw) return;
+    // The sender read the position off ITS copy; ours lies at the same save
+    // position. 4u absorbs settle/float noise without reaching a neighbour stack.
+    const float TAKE_TOL = 4.0f;
+    // Never destroy a STREAMED item for a native notice: a peer's proxy and our own
+    // streamed drop have their own pickup mirror (CLAIM / REMOVE), and one of the
+    // same template can lie inside the tolerance of the native that was taken.
+    std::vector<RootObject*> excl;
+    for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
+         pi != worldProxies_.end(); ++pi) {
+        RootObject* live = liveWorldProxy(pi->second);
+        if (live) excl.push_back(live);
+    }
+    for (std::map<Key, WorldTrack>::iterator ti = worldTrack_.begin(); ti != worldTrack_.end(); ++ti) {
+        if (ti->second.baseline) continue;
+        unsigned int h[5] = { ti->first.t, ti->first.c, ti->first.cs, ti->first.i, ti->first.s };
+        RootObject* ro = engine::resolveObjectByHand(h);
+        if (ro) excl.push_back(ro);
+    }
+    for (std::deque<InboundNativeTaken>::iterator b = got.begin(); b != got.end(); ++b) {
+        if (b->ownerId == localId) continue; // our own notice echoed back (relay safety)
+        NativeTakenPacket& p = b->pkt;
+        p.stringID[sizeof(p.stringID) - 1] = '\0';
+        if (!p.stringID[0]) continue;
+        const float at[3] = { p.x, p.y, p.z };
+        // Our own copy is usually a baseline track: resolve it by HAND first - the
+        // sphere query is the town-unreliable path, the handle never is.
+        RootObject* victim = 0;
+        std::map<Key, WorldTrack>::iterator vt = worldTrack_.end();
+        float bestD2 = TAKE_TOL * TAKE_TOL;
+        for (std::map<Key, WorldTrack>::iterator ti = worldTrack_.begin(); ti != worldTrack_.end(); ++ti) {
+            if (!ti->second.baseline || strcmp(ti->second.stringID, p.stringID) != 0) continue;
+            unsigned int h[5] = { ti->first.t, ti->first.c, ti->first.cs, ti->first.i, ti->first.s };
+            RootObject* ro = engine::resolveObjectByHand(h);
+            float cur[3];
+            if (!ro || !engine::groundObjectLiveness(ro, cur, 0)) continue;
+            float dx = cur[0] - at[0], dy = cur[1] - at[1], dz = cur[2] - at[2];
+            float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 <= bestD2) { bestD2 = d2; victim = ro; vt = ti; }
+        }
+        const char* via = "track";
+        if (!victim) {
+            via = "query";
+            victim = engine::nearestFreeGroundItemAt(gw, at, p.stringID, TAKE_TOL,
+                                                     excl.empty() ? 0 : &excl[0],
+                                                     (unsigned int)excl.size());
+        }
+        bool destroyed = (victim != 0) && engine::removeWorldItemProxy(gw, victim);
+        // Our copy is gone, so its track would only read "destroyed" next pass;
+        // drop it now (a destroyed native emits nothing either way).
+        if (destroyed && vt != worldTrack_.end()) worldTrack_.erase(vt);
+        char b2[220]; _snprintf(b2, sizeof(b2) - 1,
+            "[wi] NATIVE-TAKE-APPLY from=%u take=%u sid='%s' pos=%.2f,%.2f,%.2f via=%s destroyed=%d",
+            b->ownerId, p.takeId, p.stringID, p.x, p.y, p.z,
+            victim ? via : "none", destroyed ? 1 : 0);
+        b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
     }
 }
 

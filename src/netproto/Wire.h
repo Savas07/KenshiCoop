@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 60;
+const u16 PROTOCOL_VERSION = 61;
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -91,7 +91,8 @@ enum PacketType {
     PKT_CHARGEN          = 50,// RELIABLE join character-creation result (join -> host -> joins, protocol 57); CharGenHeader + tail
     PKT_ROSTER           = 51,// RELIABLE who is player N (host -> joins, protocol 59); RosterPacket
     PKT_VENDOR_DELTA     = 52,// RELIABLE join shop-counter stock/cash change (join -> host, protocol 60); VendorDeltaPacket
-    PKT_VENDOR_CASH      = 53 // RELIABLE merchant cash at a mirrored counter (host -> joins, protocol 60); VendorCashPacket
+    PKT_VENDOR_CASH      = 53,// RELIABLE merchant cash at a mirrored counter (host -> joins, protocol 60); VendorCashPacket
+    PKT_NATIVE_TAKEN     = 54 // RELIABLE save-native ground item picked up (any -> all, protocol 61); NativeTakenPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -667,6 +668,25 @@ struct WorldItemClaimHeader {
     u32 ownerId;  // the CLAIMING sender (who consumed the proxy)
     u32 authorId; // the item's author (whose netId space the ids below belong to)
     u8  count;    // number of u32 netIds that follow
+};
+
+// ---- Protocol 61: save-native ground pickup notice --------------------------
+// Save-native ground items (loose loot and shop/town stock both clients loaded
+// from the same save) never stream - each client holds its own identical copy.
+// The CLAIM above only mirrors pickups of STREAMED items, so taking a native
+// left the peer's copy on its ground and both players could pick it up
+// (upstream #44). This notice names the taken native to every peer, which
+// destroys its own copy if one still lies on the ground there.
+// Identity is template + world position: an item's engine hand is assigned per
+// session and does not resolve on another client, but the save data both
+// loaded - the GameData stringID and where it lies - is shared. takeId is
+// monotonic per sender (dedupe under reliable resend and host relay).
+struct NativeTakenPacket {
+    u8   type;         // = PKT_NATIVE_TAKEN
+    u32  ownerId;      // network player id of the sender (whose side took it)
+    u32  takeId;       // monotonic per sender
+    char stringID[48]; // the native's template
+    f32  x, y, z;      // its last ground position on the sender
 };
 
 // 16 * sizeof(WorldItemEntry)=1168 + header(6) stays under a 1400 B datagram.

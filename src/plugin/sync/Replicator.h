@@ -301,6 +301,12 @@ public:
     // removal to any third peer, so everyone converges on the single surviving copy.
     void applyWorldClaims(GameWorld* gw, Inbound& in, u32 localId);
 
+    // Protocol 61 (upstream #44): a peer took a SAVE-NATIVE ground item (never
+    // streamed - every client holds its own copy), so destroy our copy if it still
+    // lies on our ground. Streamed items are excluded: their pickups ride the
+    // CLAIM/REMOVE pair above. The sender half lives in publishWorldItems' cull.
+    void applyNativeTakes(GameWorld* gw, Inbound& in, u32 localId);
+
     // BEFORE engine (Phase W2/W3, runs on EVERY client): diff each OWNED character's WEAPON
     // census. A sustained count DECREASE is a DROP (the weapon left the bag; we never mutate
     // owned inventories ourselves) - author a reliable DROP intent at the owner position (the
@@ -1685,13 +1691,16 @@ private:
     // row or a query-free drop-hook edge) so the item can be streamed and refreshed
     // by HANDLE resolution alone - no rescan needed. `seen` is retained only for the
     // legacy scan path; culling is now handle-based (engine::groundItemLiveness).
-    // `baseline` (Phase 3 item-dup fix): a ground item present at the FIRST
-    // post-load spatial scan is a SHARED save-native - both clients already hold
-    // it identically, so it must never be streamed (authoring it mints a proxy
-    // on top of the peer's own native = the rejoin/reload duplication). Baseline
-    // tracks are recorded for identity/liveness but skipped in the emit path;
-    // only items appearing AFTER the baseline (session drops, runtime spawns)
-    // stream. Re-seeded after every reload via worldSeeded_ in resetSession().
+    // `baseline` (Phase 3 item-dup fix, made STRUCTURAL for upstream #44/#63/#66):
+    // a ground item the spatial scan finds without a drop-hook edge is a SHARED
+    // save-native - every client loaded the same save and holds its own identical
+    // copy, so it must never be streamed (authoring it mints a proxy on top of the
+    // peer's own native = the duplication). This holds whenever the scan first
+    // sees it, not just on the first pass after a load: a native in a cell that
+    // loads later, or one past the scan's 16-row cap, is just as shared. Only our
+    // own drops stream (drop-hook edges, plus the pendingDrops_/dormantDrops_
+    // matches below). Baseline tracks are kept for liveness: one read picked up
+    // emits a protocol-61 native-taken notice so the peers drop their copies.
     struct WorldTrack {
         u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen;
         char stringID[48]; u32 itemType; u16 quantity; u16 quality; bool baseline;
@@ -1720,12 +1729,32 @@ private:
     // so netId spaces are per-sender and culls are scoped to their owner.
     std::map<std::pair<u32, u32>, WorldProxy> worldProxies_;
     u32                        nextWorldNetId_;
-    // First-scan-baseline latch (Phase 3): false after launch/reload; the first
-    // publishWorldItems pass seeds every in-range save-native as a baseline track
-    // (never-emit) and sets this true. resetSession() clears it so the reloaded
-    // world (which may now contain previously-dropped-then-baked items) re-baselines
-    // rather than re-streaming - closing the per-reload duplicate layering.
+    // First-pass latch: false after launch/reload. The first publishWorldItems pass
+    // logs the BASELINE census of the natives its scan found and sets this true;
+    // resetSession() clears it. Baselining itself no longer depends on it (every
+    // scan-only row is baseline, see WorldTrack::baseline).
     bool                       worldSeeded_;
+    // Our own drops the scan must still STREAM even though no hook edge keys them:
+    //   pendingDrops_  - a drop-hook edge whose item hand did not resolve
+    //                    (DROP-CAP-SKIP); the scan finding that template at that
+    //                    spot shortly after is the same item.
+    //   dormantDrops_  - a streamed drop of ours whose track was culled as gone but
+    //                    NOT picked up (its cell unloaded as we travelled; the peer's
+    //                    proxy was removed with it). When it reloads it is still our
+    //                    session drop, not a native, so it streams again.
+    // Both are bounded and cleared on resetSession (after a reload every ground item
+    // is in the shared save, i.e. native).
+    struct RecentDrop { char stringID[48]; float x, y, z; unsigned long ms; };
+    std::vector<RecentDrop>    pendingDrops_;
+    std::vector<RecentDrop>    dormantDrops_;
+    // Record one (bounded: the oldest record goes first) / consume the first record
+    // of `sid` within `tol` on the ground plane (a dropped item settles vertically)
+    // no older than maxAgeMs (0 = any age); expired records are pruned on the way.
+    static void rememberDrop(std::vector<RecentDrop>& v, const char* sid,
+                             float x, float y, float z, unsigned long now, size_t cap);
+    static bool takeRecentDrop(std::vector<RecentDrop>& v, const char* sid, float x, float z,
+                               float tol, unsigned long now, unsigned long maxAgeMs);
+    u32                        nextNativeTakeId_;
 
     // Phase W2 conservation-drop state.
     // weaponCensus_: per OWNED character hand, the last-tick set of WEAPON copies it held,

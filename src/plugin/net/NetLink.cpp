@@ -253,6 +253,7 @@ void NetLink::queueMoney(const MoneyPacket& pkt, u32 targetMask) {
 void NetLink::queueMoneyDelta(const MoneyDeltaPacket& pkt) { pushLocked(outCs_, outMoneyDelta_, pkt); }
 void NetLink::queueVendorDelta(const VendorDeltaPacket& pkt) { pushLocked(outCs_, outVendorDelta_, pkt); }
 void NetLink::queueVendorCash(const VendorCashPacket& pkt) { pushLocked(outCs_, outVendorCash_, pkt); }
+void NetLink::queueNativeTaken(const NativeTakenPacket& pkt) { pushLocked(outCs_, outNativeTaken_, pkt); }
 
 void NetLink::queueFaction(const FactionPacket& pkt) { pushLocked(outCs_, outFaction_, pkt); }
 
@@ -365,7 +366,7 @@ bool relayToJoins(u8 type) {
     case PKT_SPAWN_INFO:    case PKT_FACTION:       case PKT_DOOR:
     case PKT_BUILD_PLACE:   case PKT_BUILD_STATE:   case PKT_BUILD_DOOR:
     case PKT_BUILD_REMOVE:  case PKT_NPC_CENSUS:    case PKT_INV_XFER:
-    case PKT_CAM_HINT:      case PKT_WORLD_ITEM_CLAIM:
+    case PKT_CAM_HINT:      case PKT_WORLD_ITEM_CLAIM:  case PKT_NATIVE_TAKEN:
     case PKT_CELL_CLAIM:    case PKT_INV_XFER_ACK:  case PKT_DEED:
     case PKT_FIXTURE:       case PKT_CHARGEN:
         return true;
@@ -1032,6 +1033,14 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushVendorCash(vc.ownerId, vc);
                         }
+                    } else if (type == PKT_NATIVE_TAKEN) {
+                        // A peer took a save-native ground item (protocol 61);
+                        // drop our copy. Relayed by the host to the other joins.
+                        NativeTakenPacket nt;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &nt)
+                            && inbound_) {
+                            inbound_->pushNativeTaken(nt.ownerId, nt);
+                        }
                     } else if (type == PKT_FACTION) {
                         // Reliable player-faction relation row (protocol 24):
                         // host stream or join intent, disambiguated on apply.
@@ -1651,6 +1660,17 @@ void NetLink::threadLoop() {
             LeaveCriticalSection(&outCs_);
             for (size_t i = 0; i < vendorCashPkts.size(); ++i) {
                 ENetPacket* out = enet_packet_create(&vendorCashPkts[i], sizeof(VendorCashPacket),
+                                                     ENET_PACKET_FLAG_RELIABLE);
+                sendOut(out, CH_RELIABLE);
+            }
+        }
+        {
+            std::vector<NativeTakenPacket> nativeTakenPkts;
+            EnterCriticalSection(&outCs_);
+            nativeTakenPkts.swap(outNativeTaken_);
+            LeaveCriticalSection(&outCs_);
+            for (size_t i = 0; i < nativeTakenPkts.size(); ++i) {
+                ENetPacket* out = enet_packet_create(&nativeTakenPkts[i], sizeof(NativeTakenPacket),
                                                      ENET_PACKET_FLAG_RELIABLE);
                 sendOut(out, CH_RELIABLE);
             }

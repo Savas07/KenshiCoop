@@ -1088,6 +1088,32 @@ GameData* findCommonItemTemplate(GameWorld* gw, unsigned int* outType) {
 }
 } // namespace
 
+bool commonItemTemplate(GameWorld* gw, char* outSid, unsigned int outLen, unsigned int* outType,
+                        const char* prefer) {
+    if (!outSid || outLen == 0) return false;
+    outSid[0] = '\0';
+    __try {
+        unsigned int typeCat = (unsigned int)ITEM;
+        GameData* gd = 0;
+        if (prefer && prefer[0] && gw && g_getDataOfTypeFn) {
+            g_dataScratch.clear();
+            g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, ITEM);
+            unsigned int n = g_dataScratch.size();
+            for (unsigned int i = 0; i < n && !gd; ++i)
+                if (g_dataScratch[i] &&
+                    (strcmp(g_dataScratch[i]->stringID.c_str(), prefer) == 0 ||
+                     ciContains(g_dataScratch[i]->name.c_str(), prefer)))
+                    gd = g_dataScratch[i];
+        }
+        if (!gd) gd = findCommonItemTemplate(gw, &typeCat);
+        if (!gd) return false;
+        const char* s = gd->stringID.c_str();
+        strncpy(outSid, s ? s : "", outLen - 1); outSid[outLen - 1] = '\0';
+        if (outType) *outType = typeCat;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { outSid[0] = '\0'; return false; }
+    return outSid[0] != '\0';
+}
+
 bool pickInventoryContainer(GameWorld* gw, unsigned int out[5]) {
     if (out) { for (int i = 0; i < 5; ++i) out[i] = 0; }
     if (!gw || !gw->player) return false;
@@ -1920,6 +1946,82 @@ int groundItemLiveness(const unsigned int itemHand[5], float out[3]) {
     RootObject* ro = resolveObjectByHand(itemHand);
     if (!ro) return 0; // destroyed / no longer resolvable
     return groundObjectLiveness(ro, out, 0);
+}
+
+namespace {
+// Free ground items of template `sid` within `radius` of c (3D). Returns the
+// nearest one not listed in excl[] (0 if none) and, via outCount, how many
+// distinct matches lie in range in total (excluded ones included). The sphere
+// query lists one object under several category filters, so results are
+// deduped by pointer. Caller holds no lock; the query buffer is the shared
+// main-thread scratch, so this must run on the game thread like its siblings.
+RootObject* scanFreeGroundAt(GameWorld* gw, const float c[3], const char* sid, float radius,
+                             RootObject* const* excl, unsigned int nExcl, int* outCount) {
+    if (outCount) *outCount = 0;
+    if (!gw || !c || !sid || !sid[0] || !g_getObjsFn) return 0;
+    RootObject* seen[64]; unsigned int ns = 0;
+    RootObject* best = 0; float bestD2 = radius * radius;
+    int count = 0;
+    __try {
+        Ogre::Vector3 center(c[0], c[1], c[2]);
+        const itemType kinds[] = { ITEM, WEAPON, ARMOUR };
+        for (int k = 0; k < 3; ++k) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &center, radius, kinds[k], 256, 0);
+            unsigned int n = g_npcQuery.size();
+            for (unsigned int i = 0; i < n; ++i) {
+                RootObject* o = g_npcQuery[i]; if (!o) continue;
+                bool dup = false;
+                for (unsigned int j = 0; j < ns; ++j) if (seen[j] == o) { dup = true; break; }
+                if (dup) continue;
+                Item* it = reinterpret_cast<Item*>(o);
+                GameData* gd = it->getGameData(); if (!gd) continue;
+                if (strcmp(gd->stringID.c_str(), sid) != 0) continue;
+                if (it->isInInventory) continue;
+                if (ns < 64) seen[ns++] = o;
+                Ogre::Vector3 p = it->getPosition();
+                float dx = p.x - c[0], dy = p.y - c[1], dz = p.z - c[2];
+                float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 > radius * radius) continue;
+                ++count;
+                bool ex = false;
+                for (unsigned int j = 0; j < nExcl; ++j) if (excl[j] == o) { ex = true; break; }
+                if (ex) continue;
+                if (d2 <= bestD2) { bestD2 = d2; best = o; }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { best = 0; }
+    if (outCount) *outCount = count;
+    return best;
+}
+} // namespace
+
+RootObject* nearestFreeGroundItemAt(GameWorld* gw, const float pos[3], const char* sid,
+                                    float tol, RootObject* const* excl, unsigned int nExcl) {
+    return scanFreeGroundAt(gw, pos, sid, tol, excl, nExcl, 0);
+}
+
+int countFreeGroundItemsAt(GameWorld* gw, const float pos[3], const char* sid, float radius) {
+    int n = 0;
+    scanFreeGroundAt(gw, pos, sid, radius, 0, 0, &n);
+    return n;
+}
+
+int pickupGroundItemAt(GameWorld* gw, const unsigned int cHand[5], const float pos[3],
+                       const char* sid, float tol) {
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = invOf(ro);
+    if (!inv) return 0;
+    RootObject* o = scanFreeGroundAt(gw, pos, sid, tol, 0, 0, 0);
+    if (!o) return 0;
+    int picked = 0;
+    __try {
+        // The engine's own add path (what a UI pickup runs): it relocates the
+        // object, or merges it into a matching stack already in the bag.
+        if (inv->tryAddItem(reinterpret_cast<Item*>(o), 1)) picked = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { picked = 0; }
+    return picked;
 }
 
 // SEH-guarded (Phase W3): world position of a tracked Item* (as void*). The drop detector

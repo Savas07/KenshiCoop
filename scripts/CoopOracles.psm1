@@ -239,6 +239,7 @@ function Invoke-OneOracle {
         "armor_drop"    { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "armor_drop") }
         "backpack_drop" { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "backpack_drop") }
         "pickup_mirror" { return (Test-WorldPickupMirror -HostFile $HostLog -JoinFile $JoinLog) }
+        "native_pickup" { return (Test-NativePickup    -HostFile $HostLog -JoinFile $JoinLog) }
         "gear_repickup" { return (Test-GearRepickup    -HostFile $HostLog -JoinFile $JoinLog) }
         "gear_repickup_retry" { return (Test-GearRepickup -HostFile $HostLog -JoinFile $JoinLog `
                                             -GateName "gear_repickup_retry" -RequireRetry) }
@@ -507,7 +508,7 @@ Export-ModuleMember -Function @(
     "Test-InventoryOverflow", "Test-InventoryDropFull",
     "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
     "Test-WorldItemSync", "Test-RejoinItems", "Test-WpnRelocate", "Test-WeaponDrop",
-    "Test-WorldPickupMirror", "Test-GearRepickup", "Test-NoPhantomPickups", "Test-WorldItemBurst",
+    "Test-WorldPickupMirror", "Test-NativePickup", "Test-GearRepickup", "Test-NoPhantomPickups", "Test-WorldItemBurst",
     "Test-NestedBag", "Test-DumpAll",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",

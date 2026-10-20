@@ -679,6 +679,166 @@ private:
     char          sid_[48];
 };
 
+// world_native_pickup (protocol 61, upstream #44/#63/#66): SAVE-NATIVE ground items.
+// Both clients spawn the same two items of one common template, locally and outside
+// the drop hook, at the same world spots (the HOST leader's position, which the join
+// reads off its copy, +-7u on X). That is exactly what a save-native is: every client
+// holds its own identical copy, and only the spatial scan can find it - here AFTER
+// the first post-load scan, like natives in a cell that loads later or past the
+// scan's 16-row cap. The HOST (holding one of the template already, so a stacking
+// pickup is exercised too) then takes item A through the engine's tryAddItem.
+//   - native duplication (#63/#66): neither spot may ever hold more than one copy on
+//     either side (a native that streams lands as a proxy on top of the peer's own);
+//   - native pickup (#44): A must leave the JOIN's ground too, B must stay (one copy).
+// Both sides sample their spot counts every 500 ms (NATPICK rows); judged by
+// Test-NativePickup on the verdict rows.
+class WorldNativePickupScenario : public TimedScenario {
+public:
+    // prefer: stringID (or name fragment) of the template to use (0 = the common test
+    // template). The stack variant passes a STACKING template so the host's pickup
+    // lands on a stack it already holds - the merge case a UI pickup hits most.
+    WorldNativePickupScenario(const char* name, const char* prefer)
+        : TimedScenario(name, 0), prefer_(prefer), have_(false), haveHost_(false),
+          spawned_(false), picked_(-1), seeded_(0), type_(0), lastLogMs_(0),
+          peakA_(0), maxA_(0), maxB_(0), minB_(99), lastA_(-1), lastB_(-1), samples_(0) {
+        for (int i = 0; i < 5; ++i) { hand_[i] = 0; hostHand_[i] = 0; }
+        for (int i = 0; i < 3; ++i) { a_[i] = 0; b_[i] = 0; }
+        sid_[0] = '\0';
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        have_ = engine::pickInventoryContainer(ctx.gw, hand_) &&
+                engine::commonItemTemplate(ctx.gw, sid_, sizeof(sid_), &type_, prefer_);
+        char b[200]; _snprintf(b, sizeof(b) - 1,
+            "NATPICK start role=%s have=%d sid='%s' type=%u",
+            ctx.isHost ? "host" : "join", have_ ? 1 : 0, sid_, type_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (!have_) { if (ctx.elapsedMs >= 6000) { passed_ = false; return true; } return false; }
+        if (!haveHost_) latchHostLeader(ctx);
+
+        // Spawn once the peer streams (so both sides share the session) and the host
+        // leader resolves here; give up (fail) if that never happens.
+        if (!spawned_ && haveHost_ && ctx.elapsedMs >= SPAWN_MS && (ctx.peerReady || ctx.isHost)) {
+            float p[3];
+            if (engine::objectWorldPos(hostHand_, p)) {
+                spawned_ = true;
+                a_[0] = p[0] + 7.0f; a_[1] = p[1]; a_[2] = p[2];
+                b_[0] = p[0] - 7.0f; b_[1] = p[1]; b_[2] = p[2];
+                RootObject* oa = engine::spawnWorldItemProxy(ctx.gw, sid_, type_, 1, a_[0], a_[1], a_[2], 0);
+                RootObject* ob = engine::spawnWorldItemProxy(ctx.gw, sid_, type_, 1, b_[0], b_[1], b_[2], 0);
+                // (The host seeds its own copy of the template at pickup time - see below.)
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "NATPICK spawn role=%s okA=%d okB=%d seeded=%d A=%.2f,%.2f,%.2f B=%.2f,%.2f,%.2f",
+                    ctx.isHost ? "host" : "join", oa ? 1 : 0, ob ? 1 : 0, seeded_,
+                    a_[0], a_[1], a_[2], b_[0], b_[1], b_[2]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!spawned_ && ctx.elapsedMs >= SPAWN_DEADLINE_MS) {
+            logVerdict(ctx, "no-spawn");
+            return true;
+        }
+
+        if (ctx.isHost && spawned_ && picked_ < 0 && ctx.elapsedMs >= PICKUP_MS) {
+            // Seed a copy of the template into the bag IN THE SAME TICK, so the pickup
+            // meets a matching stack (other inventory paths may move a copy seeded
+            // earlier). Census the bag on both sides of the pickup: rows unchanged and
+            // qty +1 means the engine merged the ground object into the stack.
+            seeded_ = prefer_ ? engine::addItemsToContainerBySid(ctx.gw, hand_, sid_, type_, 1, 0, 0, 0)
+                              : engine::addTestItemsToContainer(ctx.gw, hand_, 1, 0, 0);
+            unsigned int r0 = 0, q0 = 0, r1 = 0, q1 = 0;
+            bagCount(ctx, &r0, &q0);
+            picked_ = engine::pickupGroundItemAt(ctx.gw, hand_, a_, sid_, SPOT_R);
+            bagCount(ctx, &r1, &q1);
+            char b[220]; _snprintf(b, sizeof(b) - 1,
+                "NATPICK pickup got=%d sid='%s' seeded=%d bag rows=%u->%u qty=%u->%u",
+                picked_, sid_, seeded_, r0, r1, q0, q1);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (spawned_ && ctx.elapsedMs - lastLogMs_ >= 500) {
+            lastLogMs_ = ctx.elapsedMs;
+            int ca = engine::countFreeGroundItemsAt(ctx.gw, a_, sid_, SPOT_R);
+            int cb = engine::countFreeGroundItemsAt(ctx.gw, b_, sid_, SPOT_R);
+            if (ca > peakA_) peakA_ = ca;
+            if (ca > maxA_)  maxA_ = ca;
+            if (cb > maxB_)  maxB_ = cb;
+            if (cb < minB_)  minB_ = cb;
+            lastA_ = ca; lastB_ = cb; ++samples_;
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "NATPICK %s t=%lu A=%d B=%d", ctx.isHost ? "host" : "join",
+                (unsigned long)ctx.elapsedMs, ca, cb);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.elapsedMs >= dur) { logVerdict(ctx, "done"); return true; }
+        return false;
+    }
+
+private:
+    void latchHostLeader(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, 0u);
+        if (idx < 0) return;
+        handFromEntity(sq[idx], hostHand_);
+        haveHost_ = true;
+        char b[128]; _snprintf(b, sizeof(b) - 1,
+            "NATPICK host-leader hand=%u,%u", hostHand_[3], hostHand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Rows and total quantity of the template in the picker's own bag.
+    void bagCount(const ScenarioContext& ctx, unsigned int* rows, unsigned int* qty) {
+        *rows = 0; *qty = 0;
+        InvItemEntry items[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(ctx.gw, hand_, items, INV_ITEMS_MAX, 0);
+        for (unsigned int i = 0; i < n; ++i)
+            if (strcmp(items[i].stringID, sid_) == 0) { ++*rows; *qty += items[i].quantity; }
+    }
+
+    void logVerdict(const ScenarioContext& ctx, const char* why) {
+        // One copy per spot, never two; A gone at the end (taken here, or mirrored
+        // there); B still there. The host must also have actually taken A.
+        const bool counts = spawned_ && samples_ > 0 && peakA_ >= 1 && maxA_ <= 1 &&
+                            lastA_ == 0 && maxB_ == 1 && lastB_ == 1;
+        passed_ = counts && (!ctx.isHost || picked_ > 0);
+        char b[260]; _snprintf(b, sizeof(b) - 1,
+            "NATPICK verdict role=%s pass=%d why=%s sid='%s' picked=%d peakA=%d maxA=%d "
+            "finalA=%d maxB=%d minB=%d finalB=%d samples=%u",
+            ctx.isHost ? "host" : "join", passed_ ? 1 : 0, why, sid_, picked_,
+            peakA_, maxA_, lastA_, maxB_, minB_ == 99 ? -1 : minB_, lastB_, samples_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    static const unsigned long SPAWN_MS          = 8000;
+    static const unsigned long SPAWN_DEADLINE_MS = 20000;
+    static const unsigned long PICKUP_MS         = 20000; // host; margin for join spawn skew
+    static const unsigned long JOIN_DURATION_MS  = 34000;
+    static const unsigned long HOST_DURATION_MS  = 36000;
+    static const unsigned int  MAX_SQUAD         = 32;
+    static const float         SPOT_R;
+    const char*   prefer_;
+    bool          have_;
+    bool          haveHost_;
+    bool          spawned_;
+    int           picked_;
+    int           seeded_;
+    unsigned int  type_;
+    unsigned long lastLogMs_;
+    int           peakA_, maxA_, maxB_, minB_, lastA_, lastB_;
+    unsigned int  samples_;
+    unsigned int  hand_[5];
+    unsigned int  hostHand_[5];
+    float         a_[3], b_[3];
+    char          sid_[48];
+};
+const float WorldNativePickupScenario::SPOT_R = 3.0f;
+
 // rejoin_items (Phase 3 item-dup fix): a reload must NOT duplicate save-native
 // ground items. The HOST drops K test items (both clients reach n0+K), issues a
 // coordinated saveGameAs (the saveSync half streams the join a byte-identical
@@ -1146,6 +1306,10 @@ Scenario* makeWorldItemScenario(const std::string& name) {
     // to explain it), which is precisely the grndMax==0 failure this asserts against.
     if (name == "inv_backpack_drop") return new WorldGearDropScenario("inv_backpack_drop", 46);
     if (name == "world_pickup_mirror") return new WorldPickupMirrorScenario();
+    if (name == "world_native_pickup")
+        return new WorldNativePickupScenario("world_native_pickup", 0);
+    if (name == "world_native_pickup_stack") // 95781-rebirth.mod: a stacking ITEM
+        return new WorldNativePickupScenario("world_native_pickup_stack", "95781-rebirth.mod");
     if (name == "weapon_loot")  return new WeaponLootScenario();
     if (name == "rejoin_items") return new RejoinItemsScenario();
     return 0;

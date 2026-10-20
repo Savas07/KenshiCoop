@@ -72,6 +72,13 @@ struct InboundWorldClaim {
     std::vector<u32> netIds;
 };
 
+// One received save-native pickup notice (protocol 61): a peer took a native
+// ground item; WE destroy our own copy of it if it still lies on our ground.
+struct InboundNativeTaken {
+    u32               ownerId; // the sender (whose side took it)
+    NativeTakenPacket pkt;
+};
+
 // One received NPC existence census (protocol 36, join side): the hands of
 // every world NPC within the host's census radius, flat 5xu32 per NPC. The
 // join culls local NPCs absent from this list at long range (existence
@@ -459,6 +466,7 @@ public:
         // are ~1 Hz refreshes. Every other queue is reliable and stays unbounded.
         ent_(worldReset_, 4096 * (MAX_PLAYERS - 1)),  evt_(worldReset_),        inv_(worldReset_),
         wi_(worldReset_),         wir_(worldReset_),        wic_(worldReset_),
+        nativeTaken_(worldReset_),
         npcCensus_(worldReset_),
         wd_(worldReset_),         invXfer_(worldReset_),    invXferAck_(worldReset_),
         wp_(worldReset_),
@@ -545,6 +553,11 @@ public:
         wc.ownerId = ownerId; wc.authorId = authorId;
         if (netIds && count > 0) wc.netIds.assign(netIds, netIds + count);
         EnterCriticalSection(&cs_); wic_.push_back(wc); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received save-native pickup notice (protocol 61).
+    void pushNativeTaken(u32 ownerId, const NativeTakenPacket& pkt) {
+        InboundNativeTaken nt; nt.ownerId = ownerId; nt.pkt = pkt;
+        EnterCriticalSection(&cs_); nativeTaken_.push_back(nt); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received NPC existence census (protocol 36), owner-tagged.
     void pushNpcCensus(u32 ownerId, const u32* hands, const float* pos,
@@ -781,6 +794,9 @@ public:
     void drainWorldClaim(std::deque<InboundWorldClaim>& out) {
         EnterCriticalSection(&cs_); out.swap(wic_); LeaveCriticalSection(&cs_);
     }
+    void drainNativeTaken(std::deque<InboundNativeTaken>& out) {
+        EnterCriticalSection(&cs_); out.swap(nativeTaken_); LeaveCriticalSection(&cs_);
+    }
     void drainNpcCensus(std::deque<InboundNpcCensus>& out) {
         EnterCriticalSection(&cs_); out.swap(npcCensus_); LeaveCriticalSection(&cs_);
     }
@@ -955,6 +971,7 @@ private:
     WorldQ<InboundWorldItems>      wi_;
     WorldQ<InboundWorldRemove>     wir_;
     WorldQ<InboundWorldClaim>      wic_;
+    WorldQ<InboundNativeTaken>     nativeTaken_;
     WorldQ<InboundNpcCensus>       npcCensus_;
     WorldQ<InboundWorldDrop>       wd_;
     WorldQ<InboundInvXfer>         invXfer_;

@@ -954,6 +954,53 @@ function Test-WorldPickupMirror {
                             claimed = $claimed; applied = $applied })
 }
 
+# world_native_pickup (protocol 61, upstream #44/#63/#66): save-native ground items. Both
+# clients spawn their OWN copy of two same-template items at the same spots (A, B); the
+# host takes A. Per side the scenario's verdict row already gates the counts; this oracle
+# re-derives them so a failure says which half broke:
+#   maxA/maxB > 1          - a native streamed and landed as a proxy on the peer's own copy
+#                            (the duplication of #63/#66);
+#   join finalA > 0        - the host's pickup never reached the join (#44, both can loot it);
+#   finalB != 1            - the notice over-destroyed (or B vanished for another reason).
+# The trace line shows the mechanism (host NATIVE-TAKEN, join NATIVE-TAKE-APPLY destroyed=1).
+function Test-NativePickup {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'NATPICK verdict role=(host|join) pass=(\d+) why=(\S+) sid=''([^'']*)'' picked=(-?\d+) peakA=(-?\d+) maxA=(-?\d+) finalA=(-?\d+) maxB=(-?\d+) minB=(-?\d+) finalB=(-?\d+) samples=(\d+)'
+    $res = @{}
+    foreach ($side in @(@{ role = 'host'; file = $HostFile }, @{ role = 'join'; file = $JoinFile })) {
+        $ok = $false; $m = $null
+        if (Test-Path $side.file) {
+            $l = Select-String -Path $side.file -Pattern $rx -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Matches[0].Groups[1].Value -eq $side.role } | Select-Object -Last 1
+            if ($null -ne $l) {
+                $g = $l.Matches[0].Groups
+                $m = @{ why = $g[3].Value; picked = [int]$g[5].Value; peakA = [int]$g[6].Value
+                        maxA = [int]$g[7].Value; finalA = [int]$g[8].Value; maxB = [int]$g[9].Value
+                        finalB = [int]$g[11].Value; samples = [int]$g[12].Value }
+                $ok = ($m.why -eq 'done') -and ($m.samples -gt 0) -and ($m.peakA -ge 1) -and
+                      ($m.maxA -le 1) -and ($m.finalA -eq 0) -and ($m.maxB -eq 1) -and ($m.finalB -eq 1)
+                if ($side.role -eq 'host') { $ok = $ok -and ($m.picked -ge 1) }
+                Write-Host ("  NATIVE-PICKUP [$($side.role)] " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                    " - why=$($m.why) picked=$($m.picked) peakA=$($m.peakA) maxA=$($m.maxA) finalA=$($m.finalA) maxB=$($m.maxB) finalB=$($m.finalB)")
+                if ($m.maxA -gt 1 -or $m.maxB -gt 1) {
+                    Write-Host "    NOTE: two copies on one spot => a save-native streamed onto the peer's own copy (#63/#66)"
+                }
+                if ($side.role -eq 'join' -and $m.peakA -ge 1 -and $m.finalA -gt 0) {
+                    Write-Host "    NOTE: the host took A but the join's copy stayed => native pickup not mirrored (#44)"
+                }
+            } else { Write-Host "  NATIVE-PICKUP [$($side.role)] FAIL - no NATPICK verdict" }
+        } else { Write-Host "  NATIVE-PICKUP [$($side.role)] FAIL - no log" }
+        $res[$side.role] = @{ ok = $ok; m = $m }
+    }
+    $sent    = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wi\] NATIVE-TAKEN take=' -Quiet)
+    $applied = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[wi\] NATIVE-TAKE-APPLY .* destroyed=1' -Quiet)
+    Write-Host ("  NATIVE-PICKUP trace: host NATIVE-TAKEN=$sent, join NATIVE-TAKE-APPLY destroyed=1=$applied")
+    $ok = $res['host'].ok -and $res['join'].ok
+    Write-Host ("  NATIVE-PICKUP " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "native_pickup" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $res['host'].ok; joinOk = $res['join'].ok; sent = $sent; applied = $applied })
+}
+
 # world_item_stale: the join's proxy is freed by the ENGINE (KENSHICOOP_WI_TEST_STALE
 # injects it at the exact moment a zone teardown would) and the cull about to run on
 # it must notice through the proxy's HAND rather than by touching the object.
