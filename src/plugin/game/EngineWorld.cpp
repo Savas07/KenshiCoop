@@ -2224,8 +2224,10 @@ int placeOnce(Inventory* inv, Item* got, int q, int* secRet) {
 
 namespace {
 // ONE purchase out of vinv into buyer: Inventory::buyItem, then the returned
-// stack placed in the buyer's inventory exactly once. Caller holds SEH.
-int buyOutOf(Inventory* vinv, RootObject* buyer, bool pickLast,
+// stack placed in the buyer's inventory exactly once. singleOnly: only a
+// one-unit stack (buyItem moves the whole object; a split leaves a stale shop
+// entry that vanishes at the next window open - run tl4). Caller holds SEH.
+int buyOutOf(Inventory* vinv, RootObject* buyer, bool pickLast, bool singleOnly,
              char* outSid, unsigned int sidLen, int* outQty) {
     Inventory* binv = invOf(buyer);
     if (!vinv || !binv) return -1;
@@ -2235,6 +2237,7 @@ int buyOutOf(Inventory* vinv, RootObject* buyer, bool pickLast,
     int pick = -1;
     for (unsigned int i = 0; i < ne; ++i) {
         if (!items[i] || ent[i].equipped) continue;
+        if (singleOnly && ent[i].quantity > 1) continue;
         pick = (int)i;
         if (!pickLast) break;
     }
@@ -2270,7 +2273,7 @@ int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
     RootObject* buyer = resolveObjectByHand(buyerHand);
     if (!src || !buyer) return -1;
     __try {
-        return buyOutOf(invOf(src), buyer, pickLast, outSid, sidLen, outQty);
+        return buyOutOf(invOf(src), buyer, pickLast, /*singleOnly=*/false, outSid, sidLen, outQty);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
@@ -2286,7 +2289,7 @@ int traderBuyOne(GameWorld* gw, const unsigned int traderHand[5],
         Inventory* vinv = 0;
         shopByTraderHand(gw, traderHand, 0, &vinv);
         if (!vinv) return -1;
-        return buyOutOf(vinv, buyer, /*pickLast=*/false, outSid, sidLen, outQty);
+        return buyOutOf(vinv, buyer, /*pickLast=*/false, /*singleOnly=*/true, outSid, sidLen, outQty);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
