@@ -2042,6 +2042,131 @@ void closeTradeWindow() {
 }
 
 namespace {
+void handArr(const hand& h, unsigned int out[5]) {
+    out[0] = (unsigned int)h.type; out[1] = h.container; out[2] = h.containerSerial;
+    out[3] = h.index; out[4] = h.serial;
+}
+} // namespace
+
+unsigned int readInventoryWindows(InvWindowRead* out, unsigned int maxOut,
+                                  unsigned int traderOut[5]) {
+    if (traderOut) memset(traderOut, 0, 5 * sizeof(unsigned int));
+    ForgottenGUI* g = ::gui;
+    if (!g || !out || maxOut == 0) return 0;
+    unsigned int n = 0;
+    __try {
+        if (traderOut) handArr(g->inventoryWindowTrader, traderOut);
+        for (ogre_unordered_map<hand, InventoryGUI*>::type::iterator it =
+                 g->inventoryWindowsOpen.begin();
+             it != g->inventoryWindowsOpen.end() && n < maxOut; ++it) {
+            InvWindowRead& r = out[n];
+            memset(&r, 0, sizeof(r));
+            handArr(it->first, r.key);
+            r.items = -1;
+            Inventory* inv = it->second ? it->second->getInventory() : 0;
+            if (inv) {
+                r.items = (int)inv->_allItems.size();
+                if (inv->owner) readObjectHand(inv->owner, r.owner);
+            }
+            ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+namespace {
+// The ShopTrader whose trader is `c` and the stock Inventory it shows. The open
+// trade window first: a ShopTrader is non-physical and run tl_after1 found no
+// match for it in the world-object query (kept as the fallback). Caller holds SEH.
+ShopTrader* shopOfTrader(GameWorld* gw, Character* c, Inventory** outInv) {
+    *outInv = 0;
+    if (!c) return 0;
+    ForgottenGUI* g = ::gui;
+    if (g) {
+        for (ogre_unordered_map<hand, InventoryGUI*>::type::iterator it =
+                 g->inventoryWindowsOpen.begin();
+             it != g->inventoryWindowsOpen.end(); ++it) {
+            if (it->first.type != SHOP_TRADER_CLASS || !it->second) continue;
+            Inventory* inv = it->second->getInventory();
+            ShopTrader* st = inv ? static_cast<ShopTrader*>(inv->owner) : 0;
+            if (st && traderOf(st) == c) { *outInv = inv; return st; }
+        }
+    }
+    if (!gw || !g_getObjsFn) return 0;
+    Ogre::Vector3 p = c->getPosition();
+    g_npcQuery.clear();
+    g_getObjsFn(gw, &g_npcQuery, &p, 300.0f, SHOP_TRADER_CLASS, 64, 0);
+    unsigned int total = g_npcQuery.size();
+    for (unsigned int i = 0; i < total; ++i) {
+        ShopTrader* st = static_cast<ShopTrader*>(g_npcQuery[i]);
+        if (st && traderOf(st) == c) { *outInv = invOf(st); return st; }
+    }
+    return 0;
+}
+
+// The ShopTrader + its stock Inventory for a trader character hand. Caller holds SEH.
+ShopTrader* shopByTraderHand(GameWorld* gw, const unsigned int traderHand[5],
+                             Character** outChar, Inventory** outInv) {
+    *outInv = 0;
+    RootObject* ro = resolveObjectByHand(traderHand);
+    if (!ro) return 0;
+    Character* c = static_cast<Character*>(ro);
+    if (outChar) *outChar = c;
+    return shopOfTrader(gw, c, outInv);
+}
+} // namespace
+
+bool localTradeTarget(unsigned int traderHand[5]) {
+    memset(traderHand, 0, 5 * sizeof(unsigned int));
+    ForgottenGUI* g = ::gui;
+    if (!g) return false;
+    __try {
+        for (ogre_unordered_map<hand, InventoryGUI*>::type::iterator it =
+                 g->inventoryWindowsOpen.begin();
+             it != g->inventoryWindowsOpen.end(); ++it) {
+            if (it->first.type != SHOP_TRADER_CLASS || !it->second) continue;
+            Inventory* inv = it->second->getInventory();
+            RootObject* owner = inv ? inv->owner : 0;
+            if (!owner) continue;
+            Character* t = traderOf(static_cast<ShopTrader*>(owner));
+            if (t && readObjectHand(static_cast<RootObject*>(t), traderHand)) return true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
+int captureTraderStock(GameWorld* gw, const unsigned int traderHand[5], InvItemEntry* out,
+                       unsigned int maxOut, int* outMoney, bool* outTruncated) {
+    if (outMoney) *outMoney = -1;
+    if (outTruncated) *outTruncated = false;
+    if (!gw || !traderHand || !out) return -1;
+    __try {
+        Inventory* inv = 0;
+        ShopTrader* st = shopByTraderHand(gw, traderHand, 0, &inv);
+        if (!st || !inv) return -1;
+        int n = (int)readInvItems(inv, out, 0, maxOut, outTruncated);
+        if (outMoney) *outMoney = st->getMoney();
+        return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int applyTraderStock(GameWorld* gw, const unsigned int traderHand[5], const InvItemEntry* items,
+                     unsigned int count, bool truncated, int money) {
+    if (!gw || !traderHand) return -1;
+    __try {
+        Character* c = 0;
+        Inventory* inv = 0;
+        shopByTraderHand(gw, traderHand, &c, &inv);
+        // Money is the trader platoon's - settable whether or not the shop exists.
+        Ownerships* ow = c ? walletOf(c) : 0;
+        if (ow && g_ownSetMoneyFn && money >= 0) g_ownSetMoneyFn(ow, money);
+        if (!inv) return 0;
+        applyInventoryItems(gw, inv, items, count, truncated);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+namespace {
 // Occurrences of `it` in inv: its item list (*all) and its sections' grids
 // (*sec). Caller holds SEH.
 void heldCounts(Inventory* inv, Item* it, int* all, int* sec) {
@@ -2097,6 +2222,44 @@ int placeOnce(Inventory* inv, Item* got, int q, int* secRet) {
 
 } // namespace
 
+namespace {
+// ONE purchase out of vinv into buyer: Inventory::buyItem, then the returned
+// stack placed in the buyer's inventory exactly once. Caller holds SEH.
+int buyOutOf(Inventory* vinv, RootObject* buyer, bool pickLast,
+             char* outSid, unsigned int sidLen, int* outQty) {
+    Inventory* binv = invOf(buyer);
+    if (!vinv || !binv) return -1;
+    InvItemEntry ent[96];
+    Item* items[96];
+    unsigned int ne = readInvItems(vinv, ent, items, 96);
+    int pick = -1;
+    for (unsigned int i = 0; i < ne; ++i) {
+        if (!items[i] || ent[i].equipped) continue;
+        pick = (int)i;
+        if (!pickLast) break;
+    }
+    if (pick < 0) return 0;
+    if (outSid && sidLen) {
+        strncpy(outSid, ent[pick].stringID, sidLen - 1);
+        outSid[sidLen - 1] = '\0';
+    }
+    Item* got = g_buyItemFn(vinv, items[pick], buyer);
+    if (!got) return 0;
+    int q = got->quantity; if (q < 1) q = 1;
+    if (outQty) *outQty = q;
+    int secRet = -1;
+    int how = placeOnce(binv, got, q, &secRet);
+    int occAll = 0, occSec = 0;
+    heldCounts(binv, got, &occAll, &occSec);
+    char b[224];
+    _snprintf(b, sizeof(b) - 1,
+              "[vendor] TRADE-PLACE sid='%s' q=%d same=%d how=%d secRet=%d occAll=%d occSec=%d",
+              ent[pick].stringID, q, got == items[pick] ? 1 : 0, how, secRet, occAll, occSec);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return 1;
+}
+} // namespace
+
 int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
                   const unsigned int buyerHand[5], bool pickLast,
                   char* outSid, unsigned int sidLen, int* outQty) {
@@ -2107,37 +2270,23 @@ int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
     RootObject* buyer = resolveObjectByHand(buyerHand);
     if (!src || !buyer) return -1;
     __try {
-        Inventory* vinv = invOf(src);
-        Inventory* binv = invOf(buyer);
-        if (!vinv || !binv) return -1;
-        InvItemEntry ent[96];
-        Item* items[96];
-        unsigned int ne = readInvItems(vinv, ent, items, 96);
-        int pick = -1;
-        for (unsigned int i = 0; i < ne; ++i) {
-            if (!items[i] || ent[i].equipped) continue;
-            pick = (int)i;
-            if (!pickLast) break;
-        }
-        if (pick < 0) return 0;
-        if (outSid && sidLen) {
-            strncpy(outSid, ent[pick].stringID, sidLen - 1);
-            outSid[sidLen - 1] = '\0';
-        }
-        Item* got = g_buyItemFn(vinv, items[pick], buyer);
-        if (!got) return 0;
-        int q = got->quantity; if (q < 1) q = 1;
-        if (outQty) *outQty = q;
-        int secRet = -1;
-        int how = placeOnce(binv, got, q, &secRet);
-        int occAll = 0, occSec = 0;
-        heldCounts(binv, got, &occAll, &occSec);
-        char b[224];
-        _snprintf(b, sizeof(b) - 1,
-                  "[vendor] TRADE-PLACE sid='%s' q=%d same=%d how=%d secRet=%d occAll=%d occSec=%d",
-                  ent[pick].stringID, q, got == items[pick] ? 1 : 0, how, secRet, occAll, occSec);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        return 1;
+        return buyOutOf(invOf(src), buyer, pickLast, outSid, sidLen, outQty);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int traderBuyOne(GameWorld* gw, const unsigned int traderHand[5],
+                 const unsigned int buyerHand[5], char* outSid, unsigned int sidLen,
+                 int* outQty) {
+    if (outSid && sidLen) outSid[0] = '\0';
+    if (outQty) *outQty = 0;
+    if (!gw || !traderHand || !buyerHand || !g_buyItemFn) return -1;
+    RootObject* buyer = resolveObjectByHand(buyerHand);
+    if (!buyer) return -1;
+    __try {
+        Inventory* vinv = 0;
+        shopByTraderHand(gw, traderHand, 0, &vinv);
+        if (!vinv) return -1;
+        return buyOutOf(vinv, buyer, /*pickLast=*/false, outSid, sidLen, outQty);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 

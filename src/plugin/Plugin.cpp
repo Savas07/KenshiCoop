@@ -2203,6 +2203,10 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
             // Protocol 60 (join): the host's merchant cash.
             g_repl.applyVendorCash(gw, g_inbound);
         }
+        // Protocol 65: one player trades with a merchant at a time; the holder's
+        // closing shop (stock + money) is handed to everyone. Always called so
+        // its inbound queue drains; it is a no-op without vendor sync.
+        g_repl.tickTradeLock(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
         // Phase 4a: reconcile any peer-owned container we received a fresh snapshot
         // for (the join applies the host's container; the host skips its own).
         g_repl.applyInventories(gw);

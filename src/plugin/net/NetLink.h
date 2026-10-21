@@ -133,6 +133,9 @@ public:
     // MAIN thread: queue the merchant cash of a mirrored counter (protocol 60,
     // host -> joins).
     void queueVendorCash(const VendorCashPacket& pkt);
+    // MAIN thread: queue a trader lock / shop hand-over op (protocol 65); items
+    // (the shop stock) are sent only when hdr.flags has TRADE_FLAG_STOCK.
+    void queueTrade(const TradeHeader& hdr, const InvItemEntry* items, unsigned int count);
     // MAIN thread: queue a save-native pickup notice (protocol 61, any -> all;
     // the host relays a join's to the other joins).
     void queueNativeTaken(const NativeTakenPacket& pkt);
@@ -311,6 +314,12 @@ private:
         std::vector<InvItemEntry> items;
     };
     std::vector<OutInv>      outInv_;
+    // Trader lock / shop hand-over ops (protocol 65): header + optional stock tail.
+    struct OutTrade {
+        TradeHeader               hdr;
+        std::vector<InvItemEntry> items;
+    };
+    std::vector<OutTrade>    outTrade_;
     // Reliable world-item snapshots / culls queued by the main thread (Phase W1),
     // drained + serialized by the net thread. Guarded by outCs_.
     struct OutWorldItems { u32 ownerId; std::vector<WorldItemEntry> items; };

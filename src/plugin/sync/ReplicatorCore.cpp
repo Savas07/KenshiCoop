@@ -96,6 +96,7 @@ Replicator::Replicator()
       fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true),
       storeSync_(false), contCensusMs_(0), corpseSync_(false),
       vendorSync_(false), vendorScanMs_(0), nextVendorDeltaId_(1), vendorCashMs_(0),
+      tradeOpen_(false),
       timeSync_(true), timeBrake_(true),
       timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),

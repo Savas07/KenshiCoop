@@ -932,6 +932,11 @@ int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const cha
     return total;
 }
 
+bool applyInventoryItems(GameWorld* gw, Inventory* inv, const InvItemEntry* items,
+                         unsigned int count, bool truncated) {
+    return applyToInventory(gw, inv, items, count, truncated);
+}
+
 bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
                             const InvItemEntry* items, unsigned int count,
                             bool truncated) {

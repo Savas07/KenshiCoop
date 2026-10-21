@@ -2568,5 +2568,213 @@ void Replicator::applyVendorCash(GameWorld* gw, Inbound& in) {
     }
 }
 
+// ---- Protocol 65: trader lock + shop hand-over (manual T1) --------------------
+namespace {
+const char* tradeOpName(u8 op) {
+    switch (op) {
+    case TRADE_REQUEST: return "REQUEST";
+    case TRADE_GRANT:   return "GRANT";
+    case TRADE_DENY:    return "DENY";
+    case TRADE_HELD:    return "HELD";
+    case TRADE_RELEASE: return "RELEASE";
+    default:            return "?";
+    }
+}
+} // namespace
+
+void Replicator::sendTradeOp(NetLink& net, u8 op, u32 me, const Key& k, u32 holder,
+                             u32 target, const TradeShop* shop) {
+    TradeHeader h;
+    memset(&h, 0, sizeof(h));
+    h.type = PKT_TRADE; h.op = op; h.ownerId = me; h.holder = holder; h.target = target;
+    h.tType = k.t; h.tContainer = k.c; h.tContainerSerial = k.cs; h.tIndex = k.i; h.tSerial = k.s;
+    h.money = -1;
+    unsigned int n = 0;
+    if (shop) {
+        h.flags |= TRADE_FLAG_STOCK;
+        if (shop->truncated) h.flags |= TRADE_FLAG_TRUNCATED;
+        h.money = shop->money;
+        n = (unsigned int)shop->items.size();
+    }
+    net.queueTrade(h, n > 0 ? &shop->items[0] : 0, n);
+    char b[200];
+    _snprintf(b, sizeof(b) - 1,
+              "[trade] SEND op=%s trader=%u,%u,%u,%u,%u holder=%d target=%d stock=%d money=%d",
+              tradeOpName(op), k.t, k.c, k.cs, k.i, k.s, (int)holder, (int)target,
+              shop ? (int)n : -1, h.money);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+void Replicator::applyShop(GameWorld* gw, const Key& k, const InvItemEntry* items,
+                           unsigned int n, bool truncated, int money, const char* why) {
+    unsigned int th[5] = { k.t, k.c, k.cs, k.i, k.s };
+    int r = engine::applyTraderStock(gw, th, items, n, truncated, money);
+    TradeShop& s = tradeShop_[k];
+    if (items && n > 0) s.items.assign(items, items + n); else s.items.clear();
+    s.truncated = truncated;
+    s.money = money;
+    s.applied = (r == 1);
+    char b[200];
+    _snprintf(b, sizeof(b) - 1,
+              "[trade] APPLY why=%s trader=%u,%u,%u,%u,%u items=%u money=%d res=%d%s",
+              why, k.t, k.c, k.cs, k.i, k.s, n, money, r,
+              r == 0 ? " (stock kept: applied at the next open)" : "");
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me, bool isHost) {
+    std::deque<InboundTrade> q;
+    in.drainTrade(q);
+    if (!vendorSync_ || !gw) return;
+
+    // 1. Received ops.
+    for (size_t qi = 0; qi < q.size(); ++qi) {
+        const TradeHeader& h = q[qi].hdr;
+        const InvItemEntry* items = q[qi].items.empty() ? 0 : &q[qi].items[0];
+        unsigned int n = (unsigned int)q[qi].items.size();
+        bool stock = (h.flags & TRADE_FLAG_STOCK) != 0;
+        bool trunc = (h.flags & TRADE_FLAG_TRUNCATED) != 0;
+        Key k; k.t = h.tType; k.c = h.tContainer; k.cs = h.tContainerSerial;
+        k.i = h.tIndex; k.s = h.tSerial;
+        std::map<Key, u32>::iterator hit = tradeHolder_.find(k);
+        u32 holder = hit != tradeHolder_.end() ? hit->second : TRADE_NOBODY;
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+                  "[trade] RECV op=%s from=%u trader=%u,%u,%u,%u,%u holder=%d target=%d stock=%d money=%d",
+                  tradeOpName(h.op), h.ownerId, k.t, k.c, k.cs, k.i, k.s, (int)h.holder,
+                  (int)h.target, stock ? (int)n : -1, h.money);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        switch (h.op) {
+        case TRADE_REQUEST:
+            if (!isHost) break;
+            if (holder != TRADE_NOBODY && holder != h.ownerId) {
+                sendTradeOp(net, TRADE_DENY, me, k, holder, h.ownerId, 0);
+            } else {
+                tradeHolder_[k] = h.ownerId;
+                // The last authoritative shop (none before anyone traded with it).
+                std::map<Key, TradeShop>::const_iterator si = tradeShop_.find(k);
+                sendTradeOp(net, TRADE_GRANT, me, k, h.ownerId, h.ownerId,
+                            si != tradeShop_.end() ? &si->second : 0);
+            }
+            break;
+        case TRADE_GRANT:
+            if (isHost) break;
+            tradeHolder_[k] = h.target;
+            // The host's shop as it stands: the granted join trades on THAT.
+            if (h.target == me && stock) applyShop(gw, k, items, n, trunc, h.money, "grant");
+            break;
+        case TRADE_DENY:
+            if (isHost) break;
+            tradeHolder_[k] = h.holder;
+            if (h.target == me && tradeOpen_ && !(tradeOpenKey_ < k) && !(k < tradeOpenKey_)) {
+                engine::closeTradeWindow();
+                tradeOpen_ = false; // closed by us: no RELEASE for it
+                coop::logLine("[trade] BUSY - another player is trading with this merchant; window closed");
+            }
+            break;
+        case TRADE_HELD:
+            if (isHost) break;
+            tradeHolder_[k] = h.holder;
+            break;
+        case TRADE_RELEASE:
+            if (isHost) {
+                // Only the recorded holder's shop counts (a join that closed before
+                // its DENY arrived still sends one - its stock is stale).
+                if (holder != h.ownerId) {
+                    _snprintf(b, sizeof(b) - 1,
+                              "[trade] RELEASE-STALE from=%u holder=%d (ignored)", h.ownerId, (int)holder);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    break;
+                }
+                tradeHolder_.erase(k);
+                if (stock) applyShop(gw, k, items, n, trunc, h.money, "release");
+                // Re-send as the hub: every join gets the same shop, in host order.
+                TradeHeader fw = h;
+                fw.ownerId = me; fw.holder = TRADE_NOBODY; fw.target = h.ownerId;
+                net.queueTrade(fw, items, n);
+            } else {
+                tradeHolder_.erase(k);
+                if (stock && h.target != me) applyShop(gw, k, items, n, trunc, h.money, "release");
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
+    // 2. Host: a lock held by a player who left is free again.
+    if (isHost) {
+        for (std::map<Key, u32>::iterator it = tradeHolder_.begin(); it != tradeHolder_.end(); ) {
+            if (it->second != me && !net.peerConnected(it->second)) {
+                sendTradeOp(net, TRADE_RELEASE, me, it->first, TRADE_NOBODY, it->second, 0);
+                tradeHolder_.erase(it++);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // 3. The local trade window: snapshot while open, open / close edges.
+    unsigned int th[5];
+    bool open = engine::localTradeTarget(th);
+    Key k; k.t = th[0]; k.c = th[1]; k.cs = th[2]; k.i = th[3]; k.s = th[4];
+    bool same = open && tradeOpen_ && !(tradeOpenKey_ < k) && !(k < tradeOpenKey_);
+    if (same) {
+        // The shop is only reachable while its window is open: keep the latest,
+        // so the close edge (window already gone) hands over what the trade left.
+        InvItemEntry items[INV_ITEMS_MAX];
+        bool trunc = false;
+        int money = -1;
+        int n = engine::captureTraderStock(gw, th, items, INV_ITEMS_MAX, &money, &trunc);
+        if (n >= 0) {
+            TradeShop& s = tradeShop_[k];
+            s.items.assign(items, items + n);
+            s.truncated = trunc;
+            s.money = money;
+            s.applied = true;
+        }
+    }
+    if (tradeOpen_ && !same) {
+        // Closed (or switched merchant): hand the shop over.
+        Key k0 = tradeOpenKey_;
+        tradeOpen_ = false;
+        std::map<Key, u32>::iterator it = tradeHolder_.find(k0);
+        if (isHost || (it != tradeHolder_.end() && it->second == me)) {
+            if (it != tradeHolder_.end()) tradeHolder_.erase(it);
+        }
+        std::map<Key, TradeShop>::const_iterator si = tradeShop_.find(k0);
+        sendTradeOp(net, TRADE_RELEASE, me, k0, TRADE_NOBODY, me,
+                    si != tradeShop_.end() ? &si->second : 0);
+    }
+    if (open && !tradeOpen_) {
+        // A hand-over received while this window was closed lands now, before
+        // anyone trades on the engine's own (stale) stock.
+        std::map<Key, TradeShop>::iterator si = tradeShop_.find(k);
+        if (si != tradeShop_.end() && !si->second.applied) {
+            TradeShop s = si->second;
+            applyShop(gw, k, s.items.empty() ? 0 : &s.items[0], (unsigned int)s.items.size(),
+                      s.truncated, s.money, "open");
+        }
+        std::map<Key, u32>::iterator it = tradeHolder_.find(k);
+        if (it != tradeHolder_.end() && it->second != me) {
+            engine::closeTradeWindow();
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "[trade] BUSY - player %u is trading with this merchant; window closed",
+                      it->second);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else {
+            tradeOpen_ = true;
+            tradeOpenKey_ = k;
+            if (isHost) {
+                tradeHolder_[k] = me;
+                sendTradeOp(net, TRADE_HELD, me, k, me, me, 0);
+            } else {
+                sendTradeOp(net, TRADE_REQUEST, me, k, me, me, 0);
+            }
+        }
+    }
+}
+
 
 } // namespace coop

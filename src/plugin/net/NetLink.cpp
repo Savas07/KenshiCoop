@@ -254,6 +254,16 @@ void NetLink::queueMoneyDelta(const MoneyDeltaPacket& pkt) { pushLocked(outCs_, 
 void NetLink::queueVendorDelta(const VendorDeltaPacket& pkt) { pushLocked(outCs_, outVendorDelta_, pkt); }
 void NetLink::queueVendorCash(const VendorCashPacket& pkt) { pushLocked(outCs_, outVendorCash_, pkt); }
 void NetLink::queueNativeTaken(const NativeTakenPacket& pkt) { pushLocked(outCs_, outNativeTaken_, pkt); }
+void NetLink::queueTrade(const TradeHeader& hdr, const InvItemEntry* items, unsigned int count) {
+    OutTrade ot;
+    ot.hdr = hdr;
+    ot.hdr.type = PKT_TRADE;
+    if (!(hdr.flags & TRADE_FLAG_STOCK)) count = 0;
+    if (count > INV_ITEMS_MAX) { count = INV_ITEMS_MAX; ot.hdr.flags |= TRADE_FLAG_TRUNCATED; }
+    ot.hdr.count = (u8)count;
+    if (items && count > 0) ot.items.assign(items, items + count);
+    pushLocked(outCs_, outTrade_, ot);
+}
 
 void NetLink::queueFaction(const FactionPacket& pkt) { pushLocked(outCs_, outFaction_, pkt); }
 
@@ -1035,6 +1045,22 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushVendorCash(vc.ownerId, vc);
                         }
+                    } else if (type == PKT_TRADE) {
+                        // Trader lock / shop hand-over (protocol 65). NOT relayed:
+                        // the host is the hub - it arbitrates REQUESTs and re-sends
+                        // an accepted RELEASE itself, so every join sees one order.
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(TradeHeader) && inbound_) {
+                            TradeHeader th;
+                            std::memcpy(&th, ev.packet->data, sizeof(th));
+                            unsigned need = sizeof(TradeHeader) + (unsigned)th.count * sizeof(InvItemEntry);
+                            if (len >= need) {
+                                const InvItemEntry* items = th.count > 0
+                                    ? reinterpret_cast<const InvItemEntry*>(ev.packet->data + sizeof(TradeHeader))
+                                    : 0;
+                                inbound_->pushTrade(th, items, th.count);
+                            }
+                        }
                     } else if (type == PKT_NATIVE_TAKEN) {
                         // A peer took a save-native ground item (protocol 61);
                         // drop our copy. Relayed by the host to the other joins.
@@ -1683,6 +1709,23 @@ void NetLink::threadLoop() {
             for (size_t i = 0; i < nativeTakenPkts.size(); ++i) {
                 ENetPacket* out = enet_packet_create(&nativeTakenPkts[i], sizeof(NativeTakenPacket),
                                                      ENET_PACKET_FLAG_RELIABLE);
+                sendOut(out, CH_RELIABLE);
+            }
+        }
+        {
+            // Trader lock / shop hand-over (protocol 65): header + stock tail.
+            std::vector<OutTrade> tradePkts;
+            EnterCriticalSection(&outCs_);
+            tradePkts.swap(outTrade_);
+            LeaveCriticalSection(&outCs_);
+            for (size_t i = 0; i < tradePkts.size(); ++i) {
+                const OutTrade& ot = tradePkts[i];
+                size_t n = ot.items.size();
+                size_t bytes = sizeof(TradeHeader) + n * sizeof(InvItemEntry);
+                ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+                if (!out) continue;
+                std::memcpy(out->data, &ot.hdr, sizeof(TradeHeader));
+                if (n) std::memcpy(out->data + sizeof(TradeHeader), &ot.items[0], n * sizeof(InvItemEntry));
                 sendOut(out, CH_RELIABLE);
             }
         }

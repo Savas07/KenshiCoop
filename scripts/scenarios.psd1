@@ -1158,6 +1158,45 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # vendor_away (manual T1): vendor_stock with the host's tab leader
+        # walking 400 u off the bar (4x the host census radius) right after
+        # the pick; only the join trades. The host's copy of the shop must
+        # still follow every join trade (stock, cash).
+        vendor_away = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'vendor_away'
+            Gating   = @('vendor_away', 'clock_sync')
+            Advisory = @()
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # vendor_ui (manual T1, operator-driven): no scripted trade; the join
+        # opens the bar's trade window at 8 s and the operator buys/sells
+        # through the real UI. Both sides log VSTOCK at 1 Hz for 900 s; the
+        # same vendor_away gates judge the shared stock and cash.
+        vendor_ui = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'vendor_ui'
+            Gating   = @('vendor_ui', 'clock_sync')
+            Advisory = @()
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # trade_lock (protocol 65): one player trades with a merchant at a time.
+        # Join opens the bar's trader (8 s), the host tries it too (12 s, must be
+        # refused), join buys from the shop stock and closes; host then opens,
+        # buys and closes. Both shops (trade window stock + money) must match.
+        trade_lock = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'trade_lock'
+            Gating   = @('trade_lock', 'clock_sync')
+            Advisory = @()
+            Tier = 'full'; WanVariant = $false
+        }
+
         # recruit_probe: mid-session recruitment phase-0 diagnostic (protocol
         # 23 - no recruit sync exists, nothing is forced off). Each side
         # recruits the nearest BAKED world NPC and then a RUNTIME spawn via

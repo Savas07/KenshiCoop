@@ -868,10 +868,26 @@ private:
 // The C++ gate only asserts the script ran; Test-VendorStock judges the sync.
 class VendorStockScenario : public TimedScenario {
 public:
-    VendorStockScenario()
-        : TimedScenario("vendor_stock", /*evidenceMs=*/1000),
+    // MODE_AWAY is vendor_away (manual T1): the host's tab leader walks AWAY_DIST
+    // from the bar right after the pick, and only the join trades. Evidence and
+    // trades read the picked shop's counters by hand (the leader-centered
+    // enumeration would lose them with the host leader gone).
+    // MODE_UI is vendor_ui (manual T1, operator-driven): nobody trades by
+    // script; the join only opens the trade window at UI_OPEN_MS so a person
+    // (or desktop automation) buys through the real UI, and both sides log the
+    // stock + cash for UI_DURATION_MS.
+    // MODE_LOCK is trade_lock (protocol 65): the join opens the trader, the host
+    // tries the same trader while the join holds it (must be refused), the join
+    // buys from the SHOP stock and closes, then the host opens, buys and closes.
+    // Both sides log the shop (VSHOP) at 1 Hz; Test-TradeLock judges.
+    enum Mode { MODE_STOCK, MODE_AWAY, MODE_UI, MODE_LOCK };
+    explicit VendorStockScenario(Mode mode = MODE_STOCK)
+        : TimedScenario(mode == MODE_AWAY ? "vendor_away" : mode == MODE_UI ? "vendor_ui"
+                        : mode == MODE_LOCK ? "trade_lock" : "vendor_stock",
+                        /*evidenceMs=*/1000),
           picked_(false), seeded_(false), step_(0), buys_(0), sells_(0),
-          sawCounter_(false) {
+          sawCounter_(false), away_(mode == MODE_AWAY), ui_(mode == MODE_UI),
+          lock_(mode == MODE_LOCK), nShop_(0) {
         memset(thand_, 0, sizeof(thand_));
         memset(trader_, 0, sizeof(trader_));
     }
@@ -885,7 +901,10 @@ public:
     virtual bool onTick(const ScenarioContext& ctx) {
         if (evidenceDue(ctx.elapsedMs)) {
             logEvidence(ctx);
+            if (ui_) logInvWindows(ctx);
+            if (lock_ && picked_) logShop(ctx);
             if (!picked_) pickTrader(ctx);
+            if (away_ && picked_) stepAway(ctx);
         }
         if (ctx.isHost && !seeded_ && ctx.elapsedMs >= SEED_AT_MS) {
             seeded_ = true;
@@ -895,9 +914,46 @@ public:
                       SEED, ok, ctx.elapsedMs);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
+        if (lock_) {
+            // { at, action }: 0 open, 1 buy from the shop stock, 2 close.
+            // The join reopens at 38 s: a shop is readable only while its window is
+            // open, and that open applies the host's hand-over (Test-TradeLock).
+            static const unsigned long JOIN_T[5][2] = { { 8000, 0 }, { 14000, 1 }, { 20000, 2 },
+                                                        { 38000, 0 }, { 42000, 2 } };
+            static const unsigned long HOST_T[4][2] = { { 12000, 0 }, { 26000, 0 },
+                                                        { 30000, 1 }, { 34000, 2 } };
+            const unsigned long (*tl)[2] = ctx.isHost ? HOST_T : JOIN_T;
+            unsigned int nt = ctx.isHost ? 4u : 5u;
+            if (picked_ && step_ < nt && ctx.elapsedMs >= tl[step_][0]) {
+                unsigned long act = tl[step_][1];
+                if (act == 0) doOpen(ctx);
+                else if (act == 1) doShopBuy(ctx);
+                else doClose(ctx);
+                ++step_;
+            }
+            if (ctx.elapsedMs >= LOCK_DURATION_MS) {
+                passed_ = picked_ && buys_ > 0;
+                return true;
+            }
+            return false;
+        }
+        if (ui_) {
+            // Join: open at UI_OPEN_MS, close at UI_CLOSE_MS, reopen at UI_REOPEN_MS
+            // (the window probe sees both states), then the operator trades.
+            static const unsigned long at[3] = { UI_OPEN_MS, UI_CLOSE_MS, UI_REOPEN_MS };
+            if (!ctx.isHost && picked_ && step_ < 3 && ctx.elapsedMs >= at[step_]) {
+                if (step_ == 1) doClose(ctx); else doOpen(ctx);
+                ++step_;
+            }
+            if (ctx.elapsedMs >= UI_DURATION_MS) {
+                passed_ = sawCounter_ && picked_;
+                return true;
+            }
+            return false;
+        }
         // Each side walks its own session list: open -> buy -> close.
         const Session* ss = ctx.isHost ? HOST_SESSIONS : JOIN_SESSIONS;
-        unsigned int ns = ctx.isHost ? N_HOST_SESSIONS : N_JOIN_SESSIONS;
+        unsigned int ns = ctx.isHost ? (away_ ? 0u : N_HOST_SESSIONS) : N_JOIN_SESSIONS;
         if (picked_ && step_ < ns * 3) {
             const Session& s = ss[step_ / 3];
             unsigned int phase = step_ % 3;
@@ -910,7 +966,8 @@ public:
             }
         }
         if (ctx.elapsedMs >= DURATION_MS) {
-            passed_ = sawCounter_ && picked_ && buys_ > 0 && sells_ > 0;
+            bool traded = (away_ && ctx.isHost) || (buys_ > 0 && sells_ > 0);
+            passed_ = sawCounter_ && picked_ && traded;
             return true;
         }
         return false;
@@ -964,7 +1021,7 @@ private:
 
     void logEvidence(const ScenarioContext& ctx) {
         engine::ShopCounterRead rows[MAX_COUNTERS];
-        unsigned int n = engine::enumShopCountersNear(ctx.gw, RADIUS, rows, MAX_COUNTERS);
+        unsigned int n = shopRows(ctx, rows);
         if (n > 0) sawCounter_ = true;
         // Per counter, then per owning trader (the aggregated stock).
         unsigned int owners[MAX_COUNTERS][5]; unsigned int no = 0;
@@ -1094,6 +1151,9 @@ private:
         memcpy(thand_, rows[pick].owner, sizeof(thand_));
         memcpy(trader_, trs[tp].hand, sizeof(trader_));
         picked_ = true;
+        nShop_ = 0;
+        for (unsigned int i = 0; i < n && nShop_ < MAX_COUNTERS; ++i)
+            if (sameHand(rows[i].owner, thand_)) shop_[nShop_++] = rows[i];
         char b[224];
         _snprintf(b, sizeof(b) - 1,
                   "SCENARIO VPICK thand=%u,%u,%u,%u,%u trader=%u,%u,%u,%u,%u counter=%u,%u "
@@ -1103,6 +1163,100 @@ private:
                   rows[pick].hand[3], rows[pick].hand[4], sqrt(best), trs[tp].name,
                   ctx.elapsedMs);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The counters this run trades at: leader-centered enumeration, or in away
+    // mode the picked shop's counters re-read by hand (contents refreshed).
+    unsigned int shopRows(const ScenarioContext& ctx, engine::ShopCounterRead* rows) {
+        if (!away_ || nShop_ == 0)
+            return engine::enumShopCountersNear(ctx.gw, RADIUS, rows, MAX_COUNTERS);
+        for (unsigned int i = 0; i < nShop_; ++i) {
+            rows[i] = shop_[i];
+            InvItemEntry items[INV_ITEMS_MAX];
+            unsigned int ne = engine::captureContainerContents(ctx.gw, rows[i].hand, items,
+                                                               INV_ITEMS_MAX, 0);
+            int q = 0;
+            for (unsigned int k = 0; k < ne; ++k) q += items[k].quantity < 1 ? 1 : (int)items[k].quantity;
+            rows[i].nEntries = (int)ne; rows[i].qtyTotal = q;
+        }
+        return nShop_;
+    }
+
+    // Away mode, host only: walk the rank-0 tab leader AWAY_DIST past the
+    // picked counter (re-ordered each tick until AWAY_UNTIL_MS) and log its
+    // distance to the counter - the host census radius is 100 u.
+    void stepAway(const ScenarioContext& ctx) {
+        if (!ctx.isHost || nShop_ == 0) return;
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int li = tabLeaderIdx(sq, n, 0u);
+        if (li < 0) return;
+        float dx = sq[li].x - shop_[0].x, dz = sq[li].z - shop_[0].z;
+        float d = sqrtf(dx * dx + dz * dz);
+        if (ctx.elapsedMs < AWAY_UNTIL_MS) {
+            unsigned int h[5];
+            handFromEntity(sq[li], h);
+            Character* c = reinterpret_cast<Character*>(engine::resolveObjectByHand(h));
+            if (c) engine::orderMoveTo(c, shop_[0].x + AWAY_DIST, sq[li].y, shop_[0].z);
+        }
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO VAWAY d=%.1f t=%lu", d, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // trade_lock: the trader's SHOP (the trade window's stock) on this side.
+    // n=-1 while this side's shop stock does not exist (never opened here).
+    void logShop(const ScenarioContext& ctx) {
+        InvItemEntry items[INV_ITEMS_MAX];
+        int money = -1;
+        bool trunc = false;
+        int n = engine::captureTraderStock(ctx.gw, trader_, items, INV_ITEMS_MAX, &money, &trunc);
+        Multiset m;
+        if (n > 0) addEntries(m, items, (unsigned int)n);
+        int qty = 0;
+        std::string s = render(m, &qty);
+        unsigned int th[5];
+        int open = engine::localTradeTarget(th) ? 1 : 0;
+        char b[2048];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO VSHOP who=%s n=%d qty=%d money=%d open=%d trunc=%d t=%lu items=%s",
+                  ctx.isHost ? "host" : "join", n, qty, money, open, trunc ? 1 : 0,
+                  ctx.elapsedMs, s.c_str());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // trade_lock: one stack out of the shop stock, as a trade-window purchase.
+    void doShopBuy(const ScenarioContext& ctx) {
+        unsigned int bh[5];
+        char sid[48]; sid[0] = '\0';
+        int qty = 0;
+        int res = ownLeaderHand(ctx, bh)
+                      ? engine::traderBuyOne(ctx.gw, trader_, bh, sid, sizeof(sid), &qty) : -2;
+        if (res == 1) ++buys_;
+        char b[160];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO VTBUY who=%s res=%d qty=%d sid='%s' t=%lu",
+                  ctx.isHost ? "host" : "join", res, qty, sid, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // vendor_ui: what the open inventory windows show (the trade stock's owner)
+    // and the GUI's trade target - open vs closed states.
+    void logInvWindows(const ScenarioContext& ctx) {
+        engine::InvWindowRead w[8];
+        unsigned int tr[5];
+        unsigned int n = engine::readInventoryWindows(w, 8, tr);
+        char b[256];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO VUIWINS n=%u trader=%u,%u,%u,%u,%u t=%lu",
+                  n, tr[0], tr[1], tr[2], tr[3], tr[4], ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        for (unsigned int i = 0; i < n; ++i) {
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO VUIWIN key=%u,%u,%u,%u,%u owner=%u,%u,%u,%u,%u items=%d t=%lu",
+                      w[i].key[0], w[i].key[1], w[i].key[2], w[i].key[3], w[i].key[4],
+                      w[i].owner[0], w[i].owner[1], w[i].owner[2], w[i].owner[3], w[i].owner[4],
+                      w[i].items, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
     }
 
     bool ownLeaderHand(const ScenarioContext& ctx, unsigned int h[5]) {
@@ -1140,7 +1294,7 @@ private:
         if (!ownLeaderHand(ctx, bh)) { logBuy(ctx, -2, 0, 0, ""); return; }
         for (unsigned int guard = 0; guard < MAX_BUYS; ++guard) {
             engine::ShopCounterRead rows[MAX_COUNTERS];
-            unsigned int n = engine::enumShopCountersNear(ctx.gw, RADIUS, rows, MAX_COUNTERS);
+            unsigned int n = shopRows(ctx, rows);
             int best = 0; int pick = -1;
             for (unsigned int i = 0; i < n; ++i) {
                 if (!sameHand(rows[i].owner, thand_)) continue;
@@ -1179,7 +1333,7 @@ private:
         unsigned int sh[5];
         unsigned int dst[5] = { 0, 0, 0, 0, 0 };
         engine::ShopCounterRead rows[MAX_COUNTERS];
-        unsigned int n = engine::enumShopCountersNear(ctx.gw, RADIUS, rows, MAX_COUNTERS);
+        unsigned int n = shopRows(ctx, rows);
         for (unsigned int i = 0; i < n; ++i)
             if (sameHand(rows[i].owner, thand_)) { memcpy(dst, rows[i].hand, sizeof(dst)); break; }
         char sid[48]; sid[0] = '\0';
@@ -1208,6 +1362,13 @@ private:
     static const unsigned int  MAX_TRADERS     = 16;
     static const unsigned int  MAX_BUYS        = 64;
     static const int           SEED            = 50000;
+    static const unsigned long AWAY_UNTIL_MS   = 20000; // host leader re-ordered away until
+    static const unsigned long UI_OPEN_MS      = 8000;   // vendor_ui: join opens the window
+    static const unsigned long UI_CLOSE_MS     = 20000;  // vendor_ui: ... closes it
+    static const unsigned long UI_REOPEN_MS    = 30000;  // vendor_ui: ... and reopens it
+    static const unsigned long UI_DURATION_MS  = 900000; // vendor_ui: operator trade window
+    static const unsigned long LOCK_DURATION_MS = 46000; // trade_lock
+    static const float         AWAY_DIST;
     static const float         RADIUS;
 
     bool          picked_, seeded_;
@@ -1217,8 +1378,14 @@ private:
     bool          sawCounter_;
     unsigned int  thand_[5];   // the shop owner (trader PLATOON hand) - the stock key
     unsigned int  trader_[5];  // the shopkeeper character
+    bool          away_;       // vendor_away: host leader leaves, only the join trades
+    bool          ui_;         // vendor_ui: the trades are made through the real UI
+    bool          lock_;       // trade_lock: the protocol-65 lock + hand-over script
+    unsigned int  nShop_;      // the picked shop's counters (cached at the pick)
+    engine::ShopCounterRead shop_[MAX_COUNTERS];
 };
 const float VendorStockScenario::RADIUS = 100.0f;
+const float VendorStockScenario::AWAY_DIST = 400.0f; // 4x the host census radius
 const VendorStockScenario::Session VendorStockScenario::HOST_SESSIONS[] = {
     { 24000, 28000, 32000, VendorStockScenario::BUY_LAST },
     { 60000, 63000, 66000, VendorStockScenario::SELL }
@@ -3154,6 +3321,9 @@ Scenario* makeProbeScenario(const std::string& name) {
     if (name == "money_sync")   return new MoneyPoolScenario(/*probe=*/false);
     if (name == "vendor_trade") return new VendorTradeScenario();
     if (name == "vendor_stock") return new VendorStockScenario();
+    if (name == "vendor_away")  return new VendorStockScenario(VendorStockScenario::MODE_AWAY);
+    if (name == "vendor_ui")    return new VendorStockScenario(VendorStockScenario::MODE_UI);
+    if (name == "trade_lock")   return new VendorStockScenario(VendorStockScenario::MODE_LOCK);
     if (name == "recruit_probe") return new RecruitProbeScenario(true);
     if (name == "recruit_sync")  return new RecruitProbeScenario(false);
     if (name == "recruit_ctl")   return new RecruitCtlScenario();

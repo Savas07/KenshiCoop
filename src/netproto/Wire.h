@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 64;
+const u16 PROTOCOL_VERSION = 65;
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -93,7 +93,8 @@ enum PacketType {
     PKT_VENDOR_DELTA     = 52,// RELIABLE join shop-counter stock/cash change (join -> host, protocol 60); VendorDeltaPacket
     PKT_VENDOR_CASH      = 53,// RELIABLE merchant cash at a mirrored counter (host -> joins, protocol 60); VendorCashPacket
     PKT_NATIVE_TAKEN     = 54,// RELIABLE save-native ground item picked up (any -> all, protocol 61); NativeTakenPacket
-    PKT_JOIN_STATE       = 55 // RELIABLE squad name / faction name / permanent-job row (protocol 64); JoinStatePacket
+    PKT_JOIN_STATE       = 55,// RELIABLE squad name / faction name / permanent-job row (protocol 64); JoinStatePacket
+    PKT_TRADE            = 56 // RELIABLE trader lock + shop hand-over (protocol 65); TradeHeader + InvItemEntry tail
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -890,6 +891,49 @@ struct VendorCashPacket {
     u32  cIndex;
     u32  cSerial;
     i32  cash;
+};
+
+// ---- Trader lock + shop hand-over (protocol 65, manual T1) -------------------
+// The trade window shows the ShopTrader's OWN aggregated inventory and money, not
+// the shop counters, and the UI moves items without Inventory::buyItem - so no
+// per-trade observation exists. Instead ONE player trades with a merchant at a
+// time (host-arbitrated lock) and, when that player's window closes, the whole
+// shop (stock + money) is handed to everyone else. Path-independent: whatever the
+// UI did, the closing snapshot carries the result.
+//   TRADE_REQUEST  join -> host   a join opened the merchant
+//   TRADE_GRANT    host -> all    `target` holds it now; tail = host's current shop
+//   TRADE_DENY     host -> all    `target` was refused; `holder` keeps it
+//   TRADE_HELD     host -> all    the host itself holds it (`holder` = 0)
+//   TRADE_RELEASE  holder -> host the window closed; tail = the shop as left. The
+//                  host applies it and re-sends its own RELEASE (target = the
+//                  releaser, same tail) to all joins - the host is the hub, so
+//                  PKT_TRADE is never relayed verbatim.
+// Keyed by the trader CHARACTER's raw hand (save-stable; the ShopTrader wrapper's
+// serial is runtime-minted).
+enum TradeOp {
+    TRADE_REQUEST = 1,
+    TRADE_GRANT   = 2,
+    TRADE_DENY    = 3,
+    TRADE_HELD    = 4,
+    TRADE_RELEASE = 5
+};
+const u8  TRADE_FLAG_STOCK     = 0x01; // the InvItemEntry tail + money are valid
+const u8  TRADE_FLAG_TRUNCATED = 0x02; // the stock did not fit INV_ITEMS_MAX (additive apply)
+const u32 TRADE_NOBODY         = 0xFFFFFFFFu;
+struct TradeHeader {
+    u8   type;       // = PKT_TRADE
+    u8   op;         // TradeOp
+    u8   flags;      // TRADE_FLAG_*
+    u8   count;      // InvItemEntry entries following the header
+    u32  ownerId;    // sender's network player id
+    u32  holder;     // lock holder after this op (TRADE_NOBODY when free)
+    u32  target;     // GRANT/DENY: the requesting player
+    u32  tType;      // trader character hand (raw, save-stable)
+    u32  tContainer;
+    u32  tContainerSerial;
+    u32  tIndex;
+    u32  tSerial;
+    i32  money;      // the shop's money (valid with TRADE_FLAG_STOCK)
 };
 
 // Reserved netId meaning "no/invalid world item".
