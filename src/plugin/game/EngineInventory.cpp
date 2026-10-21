@@ -1476,7 +1476,7 @@ void dumpInventory(GameWorld* gw, const unsigned int cHand[5]) {
 // removes it from the bag and places it as a world object. Returns the number dropped.
 int dropItemFromInventory(GameWorld* gw, const unsigned int cHand[5],
                           const char* sid, unsigned int typeCat, int qty,
-                          void** outLastDropped, bool allowEquipped) {
+                          void** outLastDropped, bool allowEquipped, bool pickLast) {
     if (outLastDropped) *outLastDropped = 0;
     if (!gw || !sid || !sid[0] || qty <= 0) return 0;
     RootObject* ro = resolveObjectByHand(cHand);
@@ -1501,6 +1501,17 @@ int dropItemFromInventory(GameWorld* gw, const unsigned int cHand[5],
                     if (cur[i].itemType != typeCat) continue;
                     if (strcmp(cur[i].stringID, sid) != 0) continue;
                     victim = curItems[i]; break;
+                }
+            }
+            // pickLast: the LAST matching copy in the inventory's own listing order instead
+            // (worn copies count when allowEquipped) - the player dragging out a copy that is
+            // not the first one listed while another stays.
+            if (pickLast) {
+                for (unsigned int i = 0; i < ncur; ++i) {
+                    if (!allowEquipped && cur[i].equipped) continue;
+                    if (cur[i].itemType != typeCat) continue;
+                    if (strcmp(cur[i].stringID, sid) != 0) continue;
+                    victim = curItems[i];
                 }
             }
             if (!victim) break;

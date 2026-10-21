@@ -2014,6 +2014,257 @@ private:
 };
 const float InventoryRegearScenario::RADIUS = 60.0f;
 
+// gear_redrop (manual T8): the JOIN's own gear drops, as a player makes them.
+//   re-drop - tab 1 picks up the gear G the host dropped (it may already hold a copy of the same
+//             template - the two-copies case seen by hand), walks ~80 units and drops ONE copy.
+//             Its DROP must land where the object settles, and must name the object that LEFT
+//             the bag: the host then picks that piece up, and the join must hand over exactly
+//             that ground object - keeping the copy still in its bag and leaving nothing behind.
+//             By hand the drop named the copy still held (stillHeld=1) and appeared at that
+//             object's old ground spot.
+//   strip   - tab 1 then drops EVERYTHING it carries, worn pieces included, so it ends with an
+//             empty inventory. Every gear piece must be mirrored. By hand the worn pants were
+//             the last item, every later read was zero rows, and the drop was never seen.
+// WRDP log contract; judged by Test-GearRedrop.
+class GearRedropScenario : public Scenario {
+public:
+    GearRedropScenario()
+        : passed_(false), have_(false), isHost_(false), gearType_(0), bagBase_(-1),
+          dropped_(0), pickedUp_(0), moved_(false), reDropped_(0), settled_(false),
+          hostPicked_(0), hostTries_(0), checkedA_(false), heldA_(-1), groundA_(-1),
+          stripped_(false), stripRows_(-1), tries_(0), lastTryMs_(0), redropItem_(0) {
+        for (int i = 0; i < 5; ++i) { r0_[i] = 0; r1_[i] = 0; }
+        for (int i = 0; i < 3; ++i) { pickPos_[i] = 0; dropAt_[i] = 0; }
+        gearSid_[0] = '\0';
+    }
+    virtual const char* name() const { return "gear_redrop"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        have_ = ovlRankContainer(ctx.gw, 0u, r0_) && ovlRankContainer(ctx.gw, 1u, r1_);
+        if (have_) have_ = pickGear(ctx.gw);
+        if (have_) bagBase_ = gearCount(ctx.gw, r1_);
+        char b[260]; _snprintf(b, sizeof(b) - 1,
+            "WRDP start role=%s have=%d sid='%s' type=%u bagBase=%d r1=%u,%u,%u,%u,%u",
+            isHost_ ? "host" : "join", have_ ? 1 : 0, gearSid_[0] ? gearSid_ : "(none)",
+            gearType_, bagBase_, r1_[0], r1_[1], r1_[2], r1_[3], r1_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!have_ || !gearSid_[0]) {
+            if (ctx.elapsedMs >= 6000) { passed_ = false; return true; }
+            return false;
+        }
+        if (isHost_) {
+            if (dropped_ == 0 && ctx.elapsedMs >= DROP_MS) {
+                dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, gearSid_, gearType_, 1);
+                if (dropped_ == 0) {
+                    int un = engine::unequipItemToLoose(ctx.gw, r0_, gearSid_, gearType_, 1);
+                    if (un > 0) dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, gearSid_,
+                                                                        gearType_, 1);
+                    if (dropped_ == 0)
+                        dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, gearSid_, gearType_,
+                                                                 1, 0, /*allowEquipped*/ true);
+                }
+                if (dropped_ == 0) dropped_ = -1; // tried once
+                char b[120]; _snprintf(b, sizeof(b) - 1, "WRDP host-dropped n=%d", dropped_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            // Pick up the piece the join re-dropped (the only free G left near the squad).
+            if (hostPicked_ == 0 && ctx.elapsedMs >= HOST_PICK_MS && hostTries_ < MAX_TRIES &&
+                ctx.elapsedMs - lastTryMs_ >= TRY_EVERY_MS) {
+                lastTryMs_ = ctx.elapsedMs; ++hostTries_;
+                hostPicked_ = engine::pickupWorldItemIntoInventory(ctx.gw, r0_, gearSid_, gearType_,
+                                                                   FAR_RADIUS);
+                char b[120]; _snprintf(b, sizeof(b) - 1, "WRDP host-pick try=%u got=%d",
+                                       hostTries_, hostPicked_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (ctx.elapsedMs >= HOST_DURATION_MS) {
+                passed_ = dropped_ > 0 && hostPicked_ > 0;
+                char b[140]; _snprintf(b, sizeof(b) - 1,
+                    "WRDP verdict role=host pass=%d dropped=%d picked=%d", passed_ ? 1 : 0,
+                    dropped_, hostPicked_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                return true;
+            }
+            return false;
+        }
+
+        // ---- JOIN ----
+        if (pickedUp_ == 0 && ctx.elapsedMs >= PICKUP_MS && tries_ < MAX_TRIES &&
+            ctx.elapsedMs - lastTryMs_ >= TRY_EVERY_MS) {
+            lastTryMs_ = ctx.elapsedMs; ++tries_;
+            pickedUp_ = engine::pickupWorldItemIntoInventory(ctx.gw, r1_, gearSid_, gearType_,
+                                                             RADIUS);
+            if (pickedUp_ > 0) readR1(pickPos_);
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "WRDP join-pickup try=%u got=%d held=%d at=%.2f,%.2f,%.2f", tries_, pickedUp_,
+                gearCount(ctx.gw, r1_), pickPos_[0], pickPos_[1], pickPos_[2]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (pickedUp_ > 0 && !moved_ && ctx.elapsedMs >= MOVE_MS) {
+            moved_ = true;
+            Character* c = engine::resolveCharByHand(r1_[3], r1_[4], r1_[0], r1_[1], r1_[2]);
+            bool ok = c && engine::orderMoveTo(c, pickPos_[0] + MOVE_DX, pickPos_[1], pickPos_[2]);
+            char b[120]; _snprintf(b, sizeof(b) - 1, "WRDP join-move ok=%d dx=%.0f",
+                                   ok ? 1 : 0, MOVE_DX);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (moved_ && reDropped_ == 0 && ctx.elapsedMs >= REDROP_MS) {
+            // Drop the LAST copy this bag lists while another stays: the copy that leaves is
+            // then not the first one listed (manual T8: the drop named a copy still held).
+            void* it = 0;
+            int listed = 0;
+            {
+                InvItemEntry rows[INV_ITEMS_MAX];
+                unsigned int n = engine::captureContainerContents(ctx.gw, r1_, rows, INV_ITEMS_MAX, 0);
+                for (unsigned int i = 0; i < n; ++i)
+                    if (rows[i].itemType == gearType_ && strcmp(rows[i].stringID, gearSid_) == 0)
+                        ++listed;
+            }
+            reDropped_ = engine::dropItemFromInventory(ctx.gw, r1_, gearSid_, gearType_, 1, &it,
+                                                       /*allowEquipped*/ true, /*pickLast*/ true);
+            redropItem_ = it;
+            readR1(dropAt_);
+            float dx = dropAt_[0] - pickPos_[0], dz = dropAt_[2] - pickPos_[2];
+            if (reDropped_ == 0) reDropped_ = -1;
+            char b[220]; _snprintf(b, sizeof(b) - 1,
+                "WRDP join-redrop n=%d of=%d held=%d owner=%.2f,%.2f,%.2f walked=%.1f", reDropped_,
+                listed, gearCount(ctx.gw, r1_), dropAt_[0], dropAt_[1], dropAt_[2],
+                sqrtf(dx * dx + dz * dz));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (reDropped_ > 0 && !settled_ && redropItem_ && ctx.elapsedMs >= REDROP_MS + SETTLE_MS) {
+            settled_ = true;
+            float p[3] = { 0, 0, 0 };
+            int ok = engine::itemWorldPos(redropItem_, p);
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "WRDP join-settled ok=%d pos=%.2f,%.2f,%.2f", ok, p[0], p[1], p[2]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // A: after the host picked the re-dropped piece up, the join must still hold the copy it
+        // kept (base: what tab 1 carried before the pickup) and have no copy left on its ground.
+        if (!checkedA_ && ctx.elapsedMs >= CHECK_A_MS) {
+            checkedA_ = true;
+            heldA_   = gearCount(ctx.gw, r1_);
+            groundA_ = engine::countFreeGroundItemsNear(ctx.gw, r1_, gearSid_, gearType_, FAR_RADIUS);
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "WRDP join-checkA held=%d base=%d ground=%d", heldA_, bagBase_, groundA_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // B: strip tab 1 bare - every row, worn ones included - so it ends with zero rows.
+        if (!stripped_ && ctx.elapsedMs >= STRIP_MS) {
+            stripped_ = true;
+            for (int pass = 0; pass < 8; ++pass) {
+                InvItemEntry rows[INV_ITEMS_MAX];
+                unsigned int n = engine::captureContainerContents(ctx.gw, r1_, rows, INV_ITEMS_MAX, 0);
+                if (n == 0) break;
+                int any = 0;
+                for (unsigned int i = 0; i < n; ++i) {
+                    int q = rows[i].quantity < 1 ? 1 : (int)rows[i].quantity;
+                    int d = engine::dropItemFromInventory(ctx.gw, r1_, rows[i].stringID,
+                                                          rows[i].itemType, q, 0,
+                                                          /*allowEquipped*/ true);
+                    any += d;
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "WRDP join-strip sid='%s' type=%u gear=%d n=%d", rows[i].stringID,
+                        rows[i].itemType, engine::isConservedItemType(rows[i].itemType) ? 1 : 0, d);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                if (any == 0) break;
+            }
+            InvItemEntry rest[INV_ITEMS_MAX];
+            stripRows_ = (int)engine::captureContainerContents(ctx.gw, r1_, rest, INV_ITEMS_MAX, 0);
+            char b[100]; _snprintf(b, sizeof(b) - 1, "WRDP join-stripped rows=%d", stripRows_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (ctx.elapsedMs >= JOIN_DURATION_MS) {
+            // Local mechanics only; the mirror and the conservation verdict are the oracle's.
+            passed_ = pickedUp_ > 0 && reDropped_ > 0 && settled_ && checkedA_ && stripped_;
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "WRDP verdict role=join pass=%d pickedUp=%d reDropped=%d settled=%d strippedRows=%d",
+                passed_ ? 1 : 0, pickedUp_, reDropped_, settled_ ? 1 : 0, stripRows_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long DROP_MS          = 8000;
+    static const unsigned long PICKUP_MS        = 16000;
+    static const unsigned long TRY_EVERY_MS     = 1500;
+    static const unsigned int  MAX_TRIES        = 5;
+    static const unsigned long MOVE_MS          = 24000;
+    static const unsigned long REDROP_MS        = 34000;
+    static const unsigned long SETTLE_MS        = 4000;
+    static const unsigned long HOST_PICK_MS     = 42000;
+    static const unsigned long CHECK_A_MS       = 54000;
+    static const unsigned long STRIP_MS         = 56000;
+    static const unsigned long JOIN_DURATION_MS = 70000;
+    static const unsigned long HOST_DURATION_MS = 74000;
+    static const float         RADIUS;
+    static const float         FAR_RADIUS;
+    static const float         MOVE_DX;
+
+    void readR1(float out[3]) {
+        Character* c = engine::resolveCharByHand(r1_[3], r1_[4], r1_[0], r1_[1], r1_[2]);
+        if (c) engine::readPos(c, &out[0], &out[1], &out[2]);
+    }
+    int gearCount(GameWorld* gw, const unsigned int cHand[5]) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, cHand, it, INV_ITEMS_MAX, 0);
+        int c = 0;
+        for (unsigned int i = 0; i < n; ++i)
+            if (it[i].itemType == gearType_ && strcmp(it[i].stringID, gearSid_) == 0)
+                c += it[i].quantity < 1 ? 1 : (int)it[i].quantity;
+        return c;
+    }
+    // Tab 0's first WEAPON or ARMOUR piece, equipped preferred (as inv_regear).
+    bool pickGear(GameWorld* gw) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, r0_, it, INV_ITEMS_MAX, 0);
+        const unsigned int cats[2] = { 2u, 3u };
+        for (unsigned int pass = 0; pass < 2; ++pass)
+            for (unsigned int c = 0; c < 2; ++c)
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (it[i].itemType != cats[c]) continue;
+                    if (pass == 0 && !it[i].equipped) continue;
+                    strncpy(gearSid_, it[i].stringID, sizeof(gearSid_) - 1);
+                    gearSid_[sizeof(gearSid_) - 1] = '\0';
+                    gearType_ = it[i].itemType;
+                    return true;
+                }
+        return false;
+    }
+
+    bool          passed_, have_, isHost_;
+    unsigned int  r0_[5], r1_[5];
+    char          gearSid_[48];
+    unsigned int  gearType_;
+    int           bagBase_;
+    int           dropped_, pickedUp_;
+    bool          moved_;
+    int           reDropped_;
+    bool          settled_;
+    int           hostPicked_;
+    unsigned int  hostTries_;
+    bool          checkedA_;
+    int           heldA_, groundA_;
+    bool          stripped_;
+    int           stripRows_;
+    unsigned int  tries_;
+    unsigned long lastTryMs_;
+    void*         redropItem_;
+    float         pickPos_[3], dropAt_[3];
+};
+const float GearRedropScenario::RADIUS     = 60.0f;
+const float GearRedropScenario::FAR_RADIUS = 200.0f;
+const float GearRedropScenario::MOVE_DX    = 80.0f;
+
 // inv_nested_bag (protocol 48): items placed INSIDE worn containers must land inside the PEER's
 // copy of the RIGHT container. A worn bag owns a private Inventory that no section of the
 // wearer's own inventory mentions, so a bagged item used to be described by no snapshot at all:
@@ -2753,6 +3004,9 @@ Scenario* makeInventoryScenario(const std::string& name) {
     // picked-up item stayed on the other side's ground, and the only exit is the site-anchored
     // recovery (re-home a same-sid free ground item at the pickup location).
     if (name == "inv_regear_forget")      return new InventoryRegearScenario("inv_regear_forget");
+    // The join re-drops picked-up gear after walking away, then drops worn armour from its slot
+    // (manual T8: stale old-spot position, worn drop never mirrored).
+    if (name == "gear_redrop")            return new GearRedropScenario();
     if (name == "inv_nested_bag") return new InvNestedBagScenario();
     // The burst the one-item gates above cannot express: a whole kit dumped at once and hoovered
     // up by a single character, which is how the player drives it and where the tick-denominated

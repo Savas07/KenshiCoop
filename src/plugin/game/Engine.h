@@ -836,9 +836,12 @@ int probeAddAnyToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
 // a worn CONTAINER (backpack): unequip-to-loose cannot stage it first, because no loose
 // section has room for a bag that large, and the fallback add re-equips it - yet the UI
 // drags a worn backpack to the ground just fine, so dropItem accepts a worn item directly.
+// pickLast: drop the LAST matching copy in the inventory's listing order (worn copies count
+// when allowEquipped) - a player dragging out a copy other than the first one listed.
 int dropItemFromInventory(GameWorld* gw, const unsigned int cHand[5],
                           const char* sid, unsigned int typeCat, int qty,
-                          void** outLastDropped = 0, bool allowEquipped = false);
+                          void** outLastDropped = 0, bool allowEquipped = false,
+                          bool pickLast = false);
 
 // SEH-guarded DIAGNOSTIC: enumerate WEAPON/ARMOUR/ITEM/CONTAINER world objects near the
 // local leader and log each (itemType / sid / hand / pos), so we can characterize what a
