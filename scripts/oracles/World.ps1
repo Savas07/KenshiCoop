@@ -590,15 +590,19 @@ function Test-RecruitCtl {
 #      [inv] SEND) and authors no squad move for it.
 function Test-RecruitJoin {
     param([string]$HostFile, [string]$JoinFile, [ValidateSet('J', 'H')][string]$Leg = 'J',
-          [switch]$Seated)
+          [switch]$Seated, [switch]$Run)
     $gate     = if ($Leg -eq 'J') { 'recruit_join' } else { 'recruit_join_host' }
     if ($Seated) { $gate = $gate -replace '^recruit_join', 'recruit_seated' }
+    if ($Run)    { $gate = $gate -replace '^recruit_join', 'recruit_run' }
     $recFile  = if ($Leg -eq 'J') { $JoinFile } else { $HostFile }
     $peerFile = if ($Leg -eq 'J') { $HostFile } else { $JoinFile }
     $recWho   = if ($Leg -eq 'J') { 'join' } else { 'host' }
     $peerWho  = if ($Leg -eq 'J') { 'host' } else { 'join' }
-    $legStart = if ($Leg -eq 'J') { 22000 } else { 6000 }   # scenario recruit times
+    $legStart = if ($Leg -eq 'J') { if ($Run) { 34000 } else { 22000 } } else { 6000 }   # scenario recruit times
     $LEG_MS = 15000; $SETTLE_MS = 1500; $WALK_FROM = 3000; $WALK_MS = 9000
+    # recruit_run: one sustained run; the driver must hold the owner's running gait.
+    $RUN_TRAVEL_MIN = 400.0; $RUN_GAIT_RATIO = 0.8; $RUN_SNAP_MAX = 1
+    if ($Run) { $LEG_MS = 25000; $WALK_MS = 20000 }
     $RUN_MIN = 1.0; $GAIT_RATIO = 0.5; $FOLLOW_MIN = 20.0; $PAIR_MS = 300
     # The driver's snap budget from its config line (snapSec=0.75 default).
     $snapSec = 0.75
@@ -739,6 +743,36 @@ function Test-RecruitJoin {
     if ($gaps.Count -lt 5) { $why += "too few time-paired walk samples ($($gaps.Count)) to judge the follow" }
     elseif ($gapMed -gt $followMax) { $why += "$peerWho's copy does not follow (median gap $([math]::Round($gapMed,1)) u > $([math]::Round($followMax,1)) = ${snapSec}s of owner travel)" }
     Write-Host ("    FINDING: gait owner n={0} med={1} driver n={2} med={3}; follow pairs={4} medGap={5} max={6}" -f $own.Count, [math]::Round($ownMed, 2), $drv.Count, [math]::Round($drvMed, 2), $gaps.Count, [math]::Round($gapMed, 1), [math]::Round($followMax, 1))
+    $gapP90 = 0.0; $snaps = 0; $travel = 0.0
+    if ($Run) {
+        # The owner really ran far in one direction (else the run was not exercised).
+        $runRec = @($recAll | Where-Object { $_.ok -eq 1 -and $_.t -ge $walkLo -and $_.t -lt $walkHi })
+        if ($runRec.Count -ge 2) {
+            $travel = [math]::Sqrt([math]::Pow($runRec[-1].x - $runRec[0].x, 2) + [math]::Pow($runRec[-1].z - $runRec[0].z, 2))
+        }
+        if ($travel -lt $RUN_TRAVEL_MIN) { $why += "run not exercised: $recWho's recruit covered only $([math]::Round($travel,1)) u (< $RUN_TRAVEL_MIN)" }
+        if ($own.Count -ge 5 -and $drvMed -lt ($RUN_GAIT_RATIO * $ownMed)) {
+            $why += "$peerWho's copy does not keep the running gait (med=$([math]::Round($drvMed,2)) < $RUN_GAIT_RATIO x owner $([math]::Round($ownMed,2)))"
+        }
+        if ($gaps.Count -ge 5) {
+            $sg = @($gaps | Sort-Object)
+            $gapP90 = [double]$sg[[int]([math]::Floor(0.9 * ($sg.Count - 1)))]
+            if ($gapP90 -gt $followMax) { $why += "$peerWho's copy falls behind the run (p90 gap $([math]::Round($gapP90,1)) u > $([math]::Round($followMax,1)))" }
+        }
+        # Peer hard-snaps of the recruit inside the run window (+ throttled ones).
+        if ($runRec.Count -ge 2 -and $peerAll.Count -gt 0) {
+            $lo = $runRec[0].wall; $hi = $runRec[-1].wall
+            $ids = @($peerAll | ForEach-Object { $p5 = $_.hand -split ','; "$($p5[3]),$($p5[4])" } | Sort-Object -Unique)
+            foreach ($m in @(Select-String -Path $peerFile -Pattern "$stamp.*\[snap\] \S+ hand=(\d+,\d+) name=.* skipped=(\d+)" -ErrorAction SilentlyContinue)) {
+                $q = $m.Matches[0].Groups
+                if ($ids -notcontains $q[5].Value) { continue }
+                $w = Convert-StampToMs -Groups $q -OffsetMs $peerOff
+                if ($w -ge $lo -and $w -le $hi) { $snaps++ }
+            }
+        }
+        if ($snaps -gt $RUN_SNAP_MAX) { $why += "$peerWho hard-snapped the running recruit $snaps times (> $RUN_SNAP_MAX)" }
+        Write-Host ("    FINDING: run travel={0} gapP90={1} peerSnaps={2}" -f [math]::Round($travel, 1), [math]::Round($gapP90, 1), $snaps)
+    }
 
     # --- 5. squad membership + tab parity ---------------------------------------
     foreach ($pair in @(@($recWho, $recFile), @($peerWho, $peerFile))) {
@@ -790,7 +824,8 @@ function Test-RecruitJoin {
     return (Add-GateResult -Name $gate -Status $v `
                 -Metrics @{ rekeyOk = $rekey; fallback = $fallback; proxyBound = $bound
                             ownerMed = [math]::Round($ownMed, 2); driverMed = [math]::Round($drvMed, 2)
-                            followGap = [math]::Round($gapMed, 1); peerOwnedLines = $sent } -Detail $detail)
+                            followGap = [math]::Round($gapMed, 1); peerOwnedLines = $sent
+                            runTravel = [math]::Round($travel, 1); gapP90 = [math]::Round($gapP90, 1); peerSnaps = $snaps } -Detail $detail)
 }
 
 # Test-CampApproach (Phase 2 crash-hardening SOAK): validate the fix MECHANISMS

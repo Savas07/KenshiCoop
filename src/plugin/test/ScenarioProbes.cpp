@@ -1633,13 +1633,24 @@ private:
 // so one run shows the asymmetry.
 class RecruitJoinScenario : public TimedScenario {
 public:
-    // seated=true is recruit_seated: both legs recruit a POSED (seated/working)
+    // MODE_SEATED is recruit_seated: both legs recruit a POSED (seated/working)
     // NPC - the bar recruit - instead of preferring a free-standing one.
-    explicit RecruitJoinScenario(bool seated)
-        : TimedScenario(seated ? "recruit_seated" : "recruit_join", /*evidenceMs=*/0),
-          seated_(seated) {
+    // MODE_RUN is recruit_run (manual: the host's copy of a join recruit walked
+    // and snapped while the join ran it): each recruiter sends its recruit on one
+    // sustained RUN_MS run toward a far fixed point instead of short alternating
+    // hops, and roles are sampled at 4 Hz for a time-paired follow gap.
+    enum Mode { MODE_JOIN = 0, MODE_SEATED = 1, MODE_RUN = 2 };
+    explicit RecruitJoinScenario(Mode mode)
+        : TimedScenario(mode == MODE_SEATED ? "recruit_seated"
+                        : mode == MODE_RUN  ? "recruit_run" : "recruit_join", /*evidenceMs=*/0),
+          seated_(mode == MODE_SEATED), run_(mode == MODE_RUN),
+          legMs_(mode == MODE_RUN ? RUN_LEG_MS : LEG_MS),
+          walkMs_(mode == MODE_RUN ? RUN_MS : WALK_MS),
+          orderMs_(mode == MODE_RUN ? RUN_ORDER_MS : WALK_ORDER_MS),
+          roleMs_(mode == MODE_RUN ? RUN_ROLE_MS : ROLE_MS),
+          durationMs_(mode == MODE_RUN ? RUN_DURATION_MS : DURATION_MS) {
         initLeg(legs_[0], 'H', true,  H_RECRUIT_AT_MS);
-        initLeg(legs_[1], 'J', false, J_RECRUIT_AT_MS);
+        initLeg(legs_[1], 'J', false, mode == MODE_RUN ? RUN_J_RECRUIT_AT_MS : J_RECRUIT_AT_MS);
     }
 
     virtual void onStart(const ScenarioContext& ctx) {
@@ -1664,25 +1675,25 @@ public:
             if (recruiter && !L.recruitDone && t >= L.recruitAt) {
                 L.recruitDone = true; doRecruit(ctx, L, li);
             }
-            if (!recruiter && !L.subj && t >= L.recruitAt && t < L.recruitAt + LEG_MS)
+            if (!recruiter && !L.subj && t >= L.recruitAt && t < L.recruitAt + legMs_)
                 findNew(ctx, L, li);
-            if (L.subj && (L.lastRoleMs == 0 || t - L.lastRoleMs >= ROLE_MS)) {
+            if (L.subj && (L.lastRoleMs == 0 || t - L.lastRoleMs >= roleMs_)) {
                 L.lastRoleMs = t; logRole(ctx, L, recruiter);
             }
             unsigned long wFrom = L.recruitAt + WALK_DELAY_MS;
-            if (L.subj && t >= wFrom && t < wFrom + WALK_MS) {
+            if (L.subj && t >= wFrom && t < wFrom + walkMs_) {
                 if (L.lastGaitMs == 0 || t - L.lastGaitMs >= GAIT_MS) {
                     L.lastGaitMs = t; logGait(ctx, L, recruiter);
                 }
-                if (recruiter && (L.lastWalkMs == 0 || t - L.lastWalkMs >= WALK_ORDER_MS)) {
+                if (recruiter && (L.lastWalkMs == 0 || t - L.lastWalkMs >= orderMs_)) {
                     L.lastWalkMs = t; orderWalk(L);
                 }
             }
-            if (!L.postLogged && t >= L.recruitAt + LEG_MS) {
+            if (!L.postLogged && t >= L.recruitAt + legMs_) {
                 L.postLogged = true; logSquad(ctx, L, "post");
             }
         }
-        if (t >= DURATION_MS) {
+        if (t >= durationMs_) {
             // Each client: its own recruit landed, and it found the peer's.
             // The cross-machine ownership/drive verdict is Test-RecruitJoin's.
             const Leg& own  = legs_[ctx.isHost ? 0 : 1];
@@ -1703,6 +1714,8 @@ private:
         Character*    subj;
         unsigned long lastRoleMs, lastGaitMs, lastWalkMs;
         unsigned int  altDir;
+        bool          haveTarget;          // MODE_RUN: the fixed far run target
+        float         tx, ty, tz;
     };
 
     static void initLeg(Leg& L, char id, bool hostRecruits, unsigned long at) {
@@ -1710,6 +1723,7 @@ private:
         L.preLogged = L.recruitDone = L.postLogged = false;
         L.res = -9; L.subj = 0;
         L.lastRoleMs = L.lastGaitMs = L.lastWalkMs = 0; L.altDir = 0;
+        L.haveTarget = false; L.tx = L.ty = L.tz = 0.0f;
     }
 
     static bool sameHand(const unsigned int a[5], const unsigned int b[5]) {
@@ -1874,9 +1888,23 @@ private:
 
     // The recruiter's player move order (the dashboard 'move' lever): a far
     // destination, alternating sides so the body runs in-region all window.
+    // MODE_RUN: one fixed point RUN_DIST away, re-ordered each RUN_ORDER_MS so the
+    // recruit keeps running in one direction the whole window.
     void orderWalk(Leg& L) {
         float x, y, z;
         if (!engine::readPos(L.subj, &x, &y, &z)) return;
+        if (run_) {
+            if (!L.haveTarget) {
+                L.haveTarget = true; L.tx = x + RUN_DIST; L.ty = y; L.tz = z;
+                char b[160];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO RJ run leg=%c from=%.1f,%.1f,%.1f to=%.1f,%.1f,%.1f",
+                          L.id, x, y, z, L.tx, L.ty, L.tz);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            engine::orderMoveTo(L.subj, L.tx, L.ty, L.tz);
+            return;
+        }
         float d = (L.altDir & 1) ? -180.0f : 180.0f;
         ++L.altDir;
         engine::orderMoveTo(L.subj, x + d, y, z);
@@ -1901,15 +1929,27 @@ private:
     static const unsigned long GAIT_MS         = 250;
     static const unsigned long SQUAD_LEAD_MS   = 500;
     static const unsigned long DURATION_MS     = 39000;
+    // MODE_RUN timeline: leg H recruits at 6 s and runs 9-29 s; leg J recruits at
+    // 34 s and runs 37-57 s; 'post' census 25 s after each recruit.
+    static const unsigned long RUN_J_RECRUIT_AT_MS = 34000;
+    static const unsigned long RUN_LEG_MS      = 25000;
+    static const unsigned long RUN_MS          = 20000;
+    static const unsigned long RUN_ORDER_MS    = 3000;
+    static const unsigned long RUN_ROLE_MS     = 250;
+    static const unsigned long RUN_DURATION_MS = 62000;
     static const unsigned int  MAX_SQUAD       = 48;
     static const unsigned int  MAX_NPC         = 128;
     static const float         PICK_RADIUS;
+    static const float         RUN_DIST;
 
     bool                    seated_;
+    bool                    run_;
+    unsigned long           legMs_, walkMs_, orderMs_, roleMs_, durationMs_;
     std::vector<Character*> base_;
     Leg                     legs_[2];
 };
 const float RecruitJoinScenario::PICK_RADIUS = 200.0f; // the listNpcs query reach
+const float RecruitJoinScenario::RUN_DIST    = 1200.0f; // ~17 s of running in one direction
 
 // squad_probe (protocol 35 phase 0, probe tier; squadSync forced OFF) /
 // squad_sync (probe=false, full tier; squadSync ON). Moving a unit between
@@ -3117,8 +3157,9 @@ Scenario* makeProbeScenario(const std::string& name) {
     if (name == "recruit_probe") return new RecruitProbeScenario(true);
     if (name == "recruit_sync")  return new RecruitProbeScenario(false);
     if (name == "recruit_ctl")   return new RecruitCtlScenario();
-    if (name == "recruit_join")  return new RecruitJoinScenario(false);
-    if (name == "recruit_seated") return new RecruitJoinScenario(true);
+    if (name == "recruit_join")  return new RecruitJoinScenario(RecruitJoinScenario::MODE_JOIN);
+    if (name == "recruit_seated") return new RecruitJoinScenario(RecruitJoinScenario::MODE_SEATED);
+    if (name == "recruit_run")   return new RecruitJoinScenario(RecruitJoinScenario::MODE_RUN);
     if (name == "squad_probe")   return new SquadProbeScenario(true);
     if (name == "squad_sync")    return new SquadProbeScenario(false);
     if (name == "faction_probe") return new FactionProbeScenario(true);

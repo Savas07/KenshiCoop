@@ -1273,6 +1273,21 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # recruit_run: recruit_join's two legs, but each recruiter sends its recruit
+        # on one sustained 20 s run toward a fixed far point (manual: the host's
+        # copy of a JOIN recruit walked while the join ran it, falling ~150 u behind
+        # and hard-snapping). Same Test-RecruitJoin gates plus, over the run window:
+        # the owner really ran far, the driver's gait keeps up, the 90th-percentile
+        # time-paired gap stays inside the drive's own trailing budget and the
+        # peer hard-snaps the recruit at most once. Save 'sync'.
+        recruit_run = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'recruit_run'
+            Gating   = @('recruit_run', 'recruit_run_host', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # faction_probe: faction-relation phase-0 diagnostic (protocol 24 -
         # factionSync forced OFF; the affectRelations detours stay on for
         # cause-attribution evidence). Both sides log a 1 Hz FACREL series

@@ -597,6 +597,8 @@ bool isMachineWorkTask(int taskKey) {
     return taskKey == (int)OPERATE_MACHINERY || taskKey == (int)OPERATE_AUTOMATIC_MACHINERY;
 }
 
+bool isFreeWillMoveTask(int taskKey) { return taskKey == (int)MOVE_ON_FREE_WILL; }
+
 bool recruitNpc(GameWorld* gw, Character* c) {
     if (!gw || !c || !g_recruitFn) return false;
     __try {
