@@ -633,6 +633,31 @@ public:
     // Research tech-tree sync master enable (KENSHICOOP_RESEARCH_SYNC).
     void setResearchSync(bool v) { researchSync_ = v; }
 
+    // BEFORE engine (protocol 64, upstream #74.1, BOTH roles): sample ~1 Hz the
+    // state a player sets on their own squad that the engine keeps only locally,
+    // and stream it as PKT_JOIN_STATE rows. Each value is seeded silently from the
+    // loaded save (every client already holds it) and sent on change + a safety
+    // resend:
+    //   * squad names - for the squad tabs WE own (tabOwned_), to everyone;
+    //   * the player faction name - a join sends its rename to the host, the host
+    //     broadcasts its own renames and every join rename it applied (so
+    //     concurrent renames converge on the host's last-applied value);
+    //   * permanent job lists - JOIN only, for the squad bodies it owns, keyed by
+    //     the wire key it streams them under; job targets translated to building
+    //     wire keys (buildKeyForLocalHand).
+    void publishJoinState(const SyncContext& ctx);
+
+    // BEFORE engine (protocol 64, BOTH roles): drain PKT_JOIN_STATE rows. Squad
+    // names land on any tab we do not own; faction names on the host from a join
+    // (then re-broadcast) and on a join from the host only; job lists on the HOST
+    // only (its world is the one every coordinated save serializes): the body via
+    // bodyForKey, targets via localHandForBuildKey, the list rewritten only when
+    // it differs. Per (sender, row) seq guard drops stale rows.
+    void applyJoinState(const SyncContext& ctx);
+
+    // Join-state sync master enable (KENSHICOOP_JOINSTATE_SYNC).
+    void setJoinStateSync(bool v) { joinStateSync_ = v; }
+
     // BEFORE engine (protocol 54, BOTH clients - either may buy): sample the
     // player faction's owned-BUILDING set ~1 Hz and stream one PKT_DEED row per
     // owned hand - first sight sends (the loaded save's owned set IS the shared
@@ -2455,6 +2480,29 @@ private:
     u32           researchSeqOut_;
     unsigned long researchSampleMs_;
     bool          researchSync_;
+    // Protocol 64 join-state rows. value = the last value we sent OR applied for
+    // that row (the change gate AND the echo guard: an applied value is not a
+    // local change); seeded = the first sample took the loaded save's value as
+    // the baseline (silent); sent = we published a change, so it is resent;
+    // force = send at the next sample (the host re-broadcasting a join's faction
+    // rename it just applied).
+    struct JsRow {
+        std::string value;
+        unsigned long lastSendMs;
+        sync::SenderSeq seqSeen;
+        bool seeded, sent, force;
+        JsRow() : lastSendMs(0), seeded(false), sent(false), force(false) {}
+    };
+    // The row's publish gate: true = send `cur` now (*changed = a new value, not a
+    // resend). Seeds silently on first sight.
+    static bool jsDue(JsRow& r, const std::string& cur, unsigned long now,
+                      unsigned long resendMs, bool* changed);
+    std::map<std::pair<u32, u32>, JsRow> jsSquads_; // by squad container pair
+    JsRow                                jsFaction_;
+    std::map<Key, JsRow>                 jsJobs_;   // by the body's wire key
+    u32           jsSeqOut_;
+    unsigned long jsSampleMs_;
+    bool          joinStateSync_;
     // Protocol 54 property-deed rows, keyed by the building's save-stable hand
     // (both clients loaded the same save, so the key resolves on both - the
     // door/furniture precedent, not the protocol-27 runtime-mint one).

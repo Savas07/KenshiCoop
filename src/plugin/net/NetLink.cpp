@@ -265,6 +265,8 @@ void NetLink::queueProd(const ProdPacket& pkt) { pushLocked(outCs_, outProd_, pk
 
 void NetLink::queueResearch(const ResearchPacket& pkt) { pushLocked(outCs_, outResearch_, pkt); }
 
+void NetLink::queueJoinState(const JoinStatePacket& pkt) { pushLocked(outCs_, outJoinState_, pkt); }
+
 void NetLink::queueDeed(const DeedPacket& pkt) { pushLocked(outCs_, outDeed_, pkt); }
 
 void NetLink::queueFixture(const FixturePacket& pkt) { pushLocked(outCs_, outFixture_, pkt); }
@@ -368,7 +370,7 @@ bool relayToJoins(u8 type) {
     case PKT_BUILD_REMOVE:  case PKT_NPC_CENSUS:    case PKT_INV_XFER:
     case PKT_CAM_HINT:      case PKT_WORLD_ITEM_CLAIM:  case PKT_NATIVE_TAKEN:
     case PKT_CELL_CLAIM:    case PKT_INV_XFER_ACK:  case PKT_DEED:
-    case PKT_FIXTURE:       case PKT_CHARGEN:
+    case PKT_FIXTURE:       case PKT_CHARGEN:       case PKT_JOIN_STATE:
         return true;
     default:
         return false;
@@ -1081,6 +1083,15 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushResearch(rp.ownerId, rp);
                         }
+                    } else if (type == PKT_JOIN_STATE) {
+                        // Reliable squad-name / faction-name / permanent-job row
+                        // (protocol 64). The host also relays it to the other joins
+                        // (relayToJoins); receivers scope it by kind and role.
+                        JoinStatePacket jp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &jp)
+                            && inbound_) {
+                            inbound_->pushJoinState(jp.ownerId, jp);
+                        }
                     } else if (type == PKT_DEED) {
                         // Reliable property-deed ownership row (protocol 54):
                         // symmetric, applied as a pure state write.
@@ -1732,15 +1743,27 @@ void NetLink::threadLoop() {
         }
 
         // Drain + send any queued known-research rows on CH_RELIABLE
-        // (protocol 38). Host -> joins only (the Replicator only publishes on
-        // the host); first-sight + safety-resent by the caller, so a settled
-        // tech tree is near-silent.
+        // (protocol 38; protocol 63: both roles - a join sends its own research,
+        // the host every row); first-sight + safety-resent by the caller, so a
+        // settled tech tree is near-silent.
         std::vector<ResearchPacket> researchPkts;
         EnterCriticalSection(&outCs_);
         researchPkts.swap(outResearch_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < researchPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&researchPkts[i], sizeof(ResearchPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued join-state rows on CH_RELIABLE (protocol 64):
+        // both roles; change-gated + safety-resent by the caller.
+        std::vector<JoinStatePacket> joinStatePkts;
+        EnterCriticalSection(&outCs_);
+        joinStatePkts.swap(outJoinState_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < joinStatePkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&joinStatePkts[i], sizeof(JoinStatePacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             sendOut(out, CH_RELIABLE);
         }

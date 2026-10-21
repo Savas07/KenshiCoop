@@ -1503,6 +1503,33 @@ unsigned int buffAllPlayerStats(GameWorld* gw, float value);
 // recognise the "Multiplayer+ (Wanderer x2)" start (see WPX2_MARKER_SID in Plugin.cpp).
 bool playerSquadHasTemplate(GameWorld* gw, const char* sid);
 
+// ---- Upstream #74: join-authored state the host-authored save must carry ----
+// A player squad (tab) is keyed by its members' handle CONTAINER pair - the same
+// key the squad-tab ownership uses; save tabs carry identical keys on every client.
+struct SquadNameRow { unsigned int cont[2]; char name[64]; };
+// SEH-guarded: one row per distinct player squad (Platoon::getName). Returns rows.
+unsigned int readPlayerSquadNames(GameWorld* gw, SquadNameRow* out, unsigned int max);
+// Platoon::setName on the player squad keyed `cont`: 1 set / 2 already equal /
+// 0 no such player squad / -1 fault or unbound.
+int setPlayerSquadName(GameWorld* gw, const unsigned int cont[2], const char* name);
+// The player faction (PlayerInterface::participant) name. false if unavailable.
+bool readPlayerFactionName(GameWorld* gw, char* out, unsigned int len);
+// Faction::setName on the player faction: 1 set / 2 already equal / 0 none / -1 fault.
+int setPlayerFactionName(GameWorld* gw, const char* name);
+// One permanent job: TaskType, target hand (null for location-only jobs), location.
+struct PermajobRow { int task; ObjectHand subj; float loc[3]; };
+// Character::getPermajobCount/getPermajobData for character `ch`: rows stored (<= max),
+// -1 unresolved/fault.
+int readPermajobs(const ObjectHand& ch, PermajobRow* out, int max);
+// Character::addJob(task, target, shift=true, addDontClear=true, loc): append one
+// PERMANENT job (shift=false is a one-off order). Returns the permajob count after,
+// -2 target not loaded here, -1 fault.
+int addPermajob(const ObjectHand& ch, int task, const ObjectHand& subj, const float loc[3]);
+// Character::clearPermajobs: 1 ok / -1 unresolved or fault.
+int clearPermajobs(const ObjectHand& ch);
+// TaskType OPERATE_MACHINERY (the job a worker assigned to a machine/bench runs).
+int taskOperateMachinery();
+
 // ---- Protocol 18: carried-body sync --------------------------------------
 // Snapshot of a body's LOCAL carry relationship: is it carrying someone
 // (Character::isCarryingSomething + the carryingObject hand), and is it

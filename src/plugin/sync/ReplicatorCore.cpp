@@ -91,6 +91,7 @@ Replicator::Replicator()
       hungerSync_(true),
       prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
+      jsSeqOut_(1), jsSampleMs_(0), joinStateSync_(true),
       deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
       fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true),
       storeSync_(false), contCensusMs_(0), corpseSync_(false),
@@ -254,6 +255,9 @@ void Replicator::resetSession() {
     doorRows_.clear();
     prodRows_.clear();
     researchRows_.clear(); // protocol 38: re-baselined from the new world's store
+    jsSquads_.clear();     // protocol 64: re-baselined from the new world's names/jobs
+    jsFaction_ = JsRow();
+    jsJobs_.clear();
     deedRows_.clear();     // protocol 54: re-baselined from the new world's owned set
     facRows_.clear();
     invPub_.clear();
@@ -343,6 +347,7 @@ void Replicator::resetSession() {
     facSampleMs_ = doorSampleMs_ = buildSampleMs_ = bdoorSampleMs_ = 0;
     prodSampleMs_ = 0;
     researchSampleMs_ = 0;
+    jsSampleMs_ = 0;
     deedSampleMs_ = 0;
     deedAuditMs_ = 0;
     // A coordinated load re-instantiates every runtime fixture, so both halves

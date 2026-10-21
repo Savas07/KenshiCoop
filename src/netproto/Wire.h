@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 63;
+const u16 PROTOCOL_VERSION = 64;
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -92,7 +92,8 @@ enum PacketType {
     PKT_ROSTER           = 51,// RELIABLE who is player N (host -> joins, protocol 59); RosterPacket
     PKT_VENDOR_DELTA     = 52,// RELIABLE join shop-counter stock/cash change (join -> host, protocol 60); VendorDeltaPacket
     PKT_VENDOR_CASH      = 53,// RELIABLE merchant cash at a mirrored counter (host -> joins, protocol 60); VendorCashPacket
-    PKT_NATIVE_TAKEN     = 54 // RELIABLE save-native ground item picked up (any -> all, protocol 61); NativeTakenPacket
+    PKT_NATIVE_TAKEN     = 54,// RELIABLE save-native ground item picked up (any -> all, protocol 61); NativeTakenPacket
+    PKT_JOIN_STATE       = 55 // RELIABLE squad name / faction name / permanent-job row (protocol 64); JoinStatePacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1638,6 +1639,42 @@ struct ResearchPacket {
     u32 ownerId;   // network player id of the sender (the host)
     u32 seq;       // per-sender monotonic (stale-row guard)
     char sid[48];  // RESEARCH GameData stringID (the wire key)
+};
+
+// Protocol 64 (upstream #74.1): state a player sets on THEIR OWN squad that the
+// engine keeps only on that player's machine - the squad's display name, the
+// player faction's name, a character's permanent job list. The host authors the
+// one save every coordinated save hands back to the joins, so without these rows
+// a join's renames and job assignments are wiped on every save cycle.
+//   JS_SQUAD_NAME : key[1..2] = the squad's member-handle container pair (save
+//                   tabs carry the same pair on every client); name.
+//   JS_FACTION    : the player faction's name (one shared faction); name.
+//   JS_PERMAJOBS  : key = the sender's wire key of the character (what it streams
+//                   it under); the complete permanent job list, in order. Job
+//                   targets are building WIRE keys (a session-placed building's
+//                   placer key) or a save-native hand; an all-zero hand = a
+//                   location-only job.
+// Names: owners/renamers -> everyone (applied as state). Jobs: join -> host only
+// (only the host's world is saved). Rows are last-writer state, change-gated +
+// safety resent; seq guards stale rows per (sender, kind, key).
+enum { JS_SQUAD_NAME = 1, JS_FACTION = 2, JS_PERMAJOBS = 3 };
+// A body with more jobs than this is not sent (never truncated: the host's apply
+// rewrites the whole list). 32 rows keep the packet one datagram (1183 B).
+const unsigned int JS_JOBS_MAX = 32;
+struct JoinStateJob {
+    u16 task;    // TaskType
+    u32 subj[5]; // target hand [t,c,cs,i,s] (wire key); all-zero = none
+    f32 loc[3];  // job location
+};
+struct JoinStatePacket {
+    u8   type;     // = PKT_JOIN_STATE
+    u32  ownerId;  // network player id of the sender
+    u32  seq;      // per-sender monotonic
+    u8   kind;     // JS_*
+    u32  key[5];   // see above
+    char name[64]; // JS_SQUAD_NAME / JS_FACTION
+    u8   nJobs;    // JS_PERMAJOBS: rows used in jobs[]
+    JoinStateJob jobs[JS_JOBS_MAX];
 };
 
 // NPC existence census (protocol 36): the host's 1 Hz wide-radius hand list.

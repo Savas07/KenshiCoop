@@ -827,6 +827,165 @@ int readSpeedButtons(char* out, int n) {
     }
 }
 
+// ---- Upstream #74: squad names / player faction name / permanent jobs ------
+// Each walk is its own SEH frame; std::string arguments are built by the
+// non-SEH wrappers (C2712) and passed in by pointer.
+namespace {
+ActivePlatoon* platoonOfCont(GameWorld* gw, const unsigned int cont[2]) {
+    __try {
+        if (!gw || !gw->player) return 0;
+        unsigned int size = (unsigned int)gw->player->playerCharacters.size();
+        for (unsigned int i = 0; i < size; ++i) {
+            Character* c = gw->player->playerCharacters[i];
+            if (!c || c->handle.container != cont[0] ||
+                c->handle.containerSerial != cont[1]) continue;
+            if (c->platoon) return c->platoon;
+        }
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+int setSquadNameSeh(GameWorld* gw, const unsigned int cont[2], const std::string* s) {
+    if (!g_platoonSetNameFn || !g_platoonGetNameFn) return -1;
+    ActivePlatoon* p = platoonOfCont(gw, cont);
+    if (!p) return 0;
+    __try {
+        const std::string* cur = g_platoonGetNameFn(p);
+        if (cur && strcmp(cur->c_str(), s->c_str()) == 0) return 2;
+        g_platoonSetNameFn(p, s);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+int setFactionNameSeh(GameWorld* gw, const std::string* s) {
+    if (!g_factionSetNameFn) return -1;
+    __try {
+        if (!gw || !gw->player || !gw->player->participant) return 0;
+        Faction* f = gw->player->participant;
+        if (strcmp(f->name.c_str(), s->c_str()) == 0) return 2;
+        g_factionSetNameFn(f, s);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+} // namespace
+
+unsigned int readPlayerSquadNames(GameWorld* gw, SquadNameRow* out, unsigned int max) {
+    if (!gw || !out || max == 0 || !g_platoonGetNameFn) return 0;
+    unsigned int n = 0;
+    __try {
+        if (!gw->player) return 0;
+        unsigned int size = (unsigned int)gw->player->playerCharacters.size();
+        for (unsigned int i = 0; i < size && n < max; ++i) {
+            Character* c = gw->player->playerCharacters[i];
+            if (!c) continue;
+            unsigned int k0 = c->handle.container, k1 = c->handle.containerSerial;
+            bool dup = false;
+            for (unsigned int j = 0; j < n && !dup; ++j)
+                dup = out[j].cont[0] == k0 && out[j].cont[1] == k1;
+            if (dup) continue;
+            ActivePlatoon* ap = c->platoon;
+            if (!ap) continue;
+            const std::string* nm = g_platoonGetNameFn(ap);
+            out[n].cont[0] = k0; out[n].cont[1] = k1;
+            strncpy(out[n].name, nm ? nm->c_str() : "", sizeof(out[n].name) - 1);
+            out[n].name[sizeof(out[n].name) - 1] = '\0';
+            ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return n;
+    }
+    return n;
+}
+
+int setPlayerSquadName(GameWorld* gw, const unsigned int cont[2], const char* name) {
+    if (!gw || !cont || !name) return -1;
+    std::string s(name);
+    return setSquadNameSeh(gw, cont, &s);
+}
+
+bool readPlayerFactionName(GameWorld* gw, char* out, unsigned int len) {
+    if (!out || len == 0) return false;
+    out[0] = '\0';
+    __try {
+        if (!gw || !gw->player || !gw->player->participant) return false;
+        strncpy(out, gw->player->participant->name.c_str(), len - 1);
+        out[len - 1] = '\0';
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = '\0';
+        return false;
+    }
+}
+
+int setPlayerFactionName(GameWorld* gw, const char* name) {
+    if (!gw || !name) return -1;
+    std::string s(name);
+    return setFactionNameSeh(gw, &s);
+}
+
+int readPermajobs(const ObjectHand& ch, PermajobRow* out, int max) {
+    if (!g_permajobCountFn || !g_permajobDataFn || !g_taskerKeyFn) return -1;
+    Character* c = resolveChar(ch);
+    if (!c) return -1;
+    __try {
+        int n = g_permajobCountFn(c);
+        int got = 0;
+        for (int i = 0; i < n && got < max; ++i) {
+            const Tasker* t = g_permajobDataFn(c, i);
+            if (!t) continue;
+            PermajobRow& r = out[got++];
+            r.task = g_taskerKeyFn(const_cast<Tasker*>(t));
+            r.subj.type = (u32)t->subject.type;
+            r.subj.container = t->subject.container;
+            r.subj.containerSerial = t->subject.containerSerial;
+            r.subj.index = t->subject.index;
+            r.subj.serial = t->subject.serial;
+            r.loc[0] = t->location.x; r.loc[1] = t->location.y; r.loc[2] = t->location.z;
+        }
+        return got;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// shift=true is what makes the job PERMANENT (the player's Shift-queue): measured
+// in joinstate_sync (js_after1) - shift=false + addDontClear=true issues a one-off
+// order and leaves getPermajobCount at 0; shift=true + addDontClear=true appends.
+int addPermajob(const ObjectHand& ch, int task, const ObjectHand& subj, const float loc[3]) {
+    if (!g_addJobFn || !g_permajobCountFn) return -1;
+    Character* c = resolveChar(ch);
+    if (!c) return -1;
+    RootObject* s = subj.resolvable() ? resolveObject(subj) : 0;
+    if (subj.resolvable() && !s) return -2; // the job's target is not loaded here
+    __try {
+        Ogre::Vector3 l(loc[0], loc[1], loc[2]);
+        g_addJobFn(c, task, s, /*shift*/true, /*addDontClear*/true, &l);
+        return g_permajobCountFn(c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+int clearPermajobs(const ObjectHand& ch) {
+    if (!g_clearPermajobsFn) return -1;
+    Character* c = resolveChar(ch);
+    if (!c) return -1;
+    __try {
+        g_clearPermajobsFn(c);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+int taskOperateMachinery() { return (int)OPERATE_MACHINERY; }
+
 
 } // namespace engine
 } // namespace coop

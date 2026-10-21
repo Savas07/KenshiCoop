@@ -1196,6 +1196,215 @@ void Replicator::applyResearch(const SyncContext& ctx) {
     }
 }
 
+namespace {
+// Protocol 64 job-list signature: task + target hand + location (whole units)
+// per job, in order - the publish change gate and the apply "already equal" test.
+std::string jobSig(const int* task, const unsigned int (*subj)[5], const float (*loc)[3], int n) {
+    std::string s;
+    char b[112];
+    for (int i = 0; i < n; ++i) {
+        _snprintf(b, sizeof(b) - 1, "%d:%u.%u.%u.%u.%u@%d,%d,%d;", task[i], subj[i][0],
+                  subj[i][1], subj[i][2], subj[i][3], subj[i][4], (int)loc[i][0],
+                  (int)loc[i][1], (int)loc[i][2]);
+        b[sizeof(b) - 1] = '\0';
+        s += b;
+    }
+    return s;
+}
+
+void jsLog(const char* verb, const JoinStatePacket& p, u32 from, int a, int b2, int c) {
+    char b[240];
+    if (p.kind == JS_PERMAJOBS)
+        _snprintf(b, sizeof(b) - 1, "[jstate] %s kind=jobs from=%u body=%u,%u,%u,%u,%u n=%u "
+                  "had=%d after=%d miss=%d seq=%u", verb, from, p.key[0], p.key[1], p.key[2],
+                  p.key[3], p.key[4], (unsigned)p.nJobs, a, b2, c, p.seq);
+    else
+        _snprintf(b, sizeof(b) - 1, "[jstate] %s kind=%s from=%u cont=%u,%u name='%s' rc=%d seq=%u",
+                  verb, p.kind == JS_FACTION ? "faction" : "squad", from, p.key[1], p.key[2],
+                  p.name, a, p.seq);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+} // namespace
+
+bool Replicator::jsDue(JsRow& r, const std::string& cur, unsigned long now,
+                       unsigned long resendMs, bool* changed) {
+    *changed = false;
+    if (!r.seeded) { r.seeded = true; r.value = cur; return false; } // the loaded save's value
+    if (cur != r.value) {
+        r.value = cur; r.sent = true; r.force = false; r.lastSendMs = now;
+        *changed = true;
+        return true;
+    }
+    if (r.force || (r.sent && now - r.lastSendMs >= resendMs)) {
+        r.force = false; r.sent = true; r.lastSendMs = now;
+        return true;
+    }
+    return false;
+}
+
+void Replicator::publishJoinState(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
+    if (!joinStateSync_) return;
+    const unsigned long SAMPLE_MS = tuning_.joinStateSampleMs;
+    const unsigned long RESEND_MS = tuning_.joinStateResendMs;
+    unsigned long now = nowMs();
+    if (!sync::gateSampleDue(now, jsSampleMs_, SAMPLE_MS)) return;
+    jsSampleMs_ = now;
+
+    // 1. Display names of the squad tabs WE own (one owner per tab: no conflict).
+    engine::SquadNameRow sq[32];
+    unsigned int nSq = engine::readPlayerSquadNames(gw, sq, 32);
+    for (unsigned int i = 0; i < nSq; ++i) {
+        std::pair<u32, u32> tab(sq[i].cont[0], sq[i].cont[1]);
+        std::map<std::pair<u32, u32>, TabOwner>::const_iterator to = tabOwned_.find(tab);
+        if (to == tabOwned_.end() || !to->second.mine) continue;
+        bool changed = false;
+        if (!jsDue(jsSquads_[tab], std::string(sq[i].name), now, RESEND_MS, &changed)) continue;
+        JoinStatePacket pkt; memset(&pkt, 0, sizeof(pkt));
+        pkt.type = (u8)PKT_JOIN_STATE; pkt.ownerId = ownerId; pkt.seq = jsSeqOut_++;
+        pkt.kind = (u8)JS_SQUAD_NAME; pkt.key[1] = tab.first; pkt.key[2] = tab.second;
+        strncpy(pkt.name, sq[i].name, sizeof(pkt.name) - 1);
+        net.queueJoinState(pkt);
+        if (changed) jsLog("SEND", pkt, ownerId, 0, 0, 0);
+    }
+
+    // 2. The player faction's name: a join reports its rename to the host, the
+    // host broadcasts its own and every join rename it applied (force).
+    char fac[64];
+    if (engine::readPlayerFactionName(gw, fac, sizeof(fac)) && fac[0]) {
+        bool changed = false;
+        if (jsDue(jsFaction_, std::string(fac), now, RESEND_MS, &changed)) {
+            JoinStatePacket pkt; memset(&pkt, 0, sizeof(pkt));
+            pkt.type = (u8)PKT_JOIN_STATE; pkt.ownerId = ownerId; pkt.seq = jsSeqOut_++;
+            pkt.kind = (u8)JS_FACTION;
+            strncpy(pkt.name, fac, sizeof(pkt.name) - 1);
+            net.queueJoinState(pkt);
+            if (changed) jsLog("SEND", pkt, ownerId, 0, 0, 0);
+        }
+    }
+
+    // 3. Permanent job lists - JOIN only: the host's own bodies are in the host's
+    // world already, and only the host's world is ever saved.
+    if (ctx.isHost) return;
+    for (std::set<Key>::const_iterator k = ownHands_.begin(); k != ownHands_.end(); ++k) {
+        if (!allSquad_.count(*k)) continue;
+        ObjectHand oh;
+        oh.type = k->t; oh.container = k->c; oh.containerSerial = k->cs;
+        oh.index = k->i; oh.serial = k->s;
+        engine::PermajobRow rows[JS_JOBS_MAX + 1];
+        int n = engine::readPermajobs(oh, rows, (int)JS_JOBS_MAX + 1);
+        if (n < 0) continue;
+        JsRow& r = jsJobs_[*k];
+        if (n > (int)JS_JOBS_MAX) { // too long to ship whole; never send a truncated list
+            if (!r.force) {
+                r.force = true; // reused here as the logged-once latch (never sent)
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[jstate] SKIP jobs body=%u,%u,%u,%u,%u n>%u", k->t, k->c, k->cs, k->i, k->s,
+                    JS_JOBS_MAX);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            continue;
+        }
+        int task[JS_JOBS_MAX]; unsigned int subj[JS_JOBS_MAX][5]; float loc[JS_JOBS_MAX][3];
+        for (int j = 0; j < n; ++j) {
+            task[j] = rows[j].task;
+            Key local; local.t = rows[j].subj.type; local.c = rows[j].subj.container;
+            local.cs = rows[j].subj.containerSerial; local.i = rows[j].subj.index;
+            local.s = rows[j].subj.serial;
+            Key wire = local;
+            if (rows[j].subj.resolvable()) buildKeyForLocalHand(local, wire); // else save-native
+            subj[j][0] = wire.t; subj[j][1] = wire.c; subj[j][2] = wire.cs;
+            subj[j][3] = wire.i; subj[j][4] = wire.s;
+            loc[j][0] = rows[j].loc[0]; loc[j][1] = rows[j].loc[1]; loc[j][2] = rows[j].loc[2];
+        }
+        bool changed = false;
+        if (!jsDue(r, jobSig(task, subj, loc, n), now, RESEND_MS, &changed)) continue;
+        JoinStatePacket pkt; memset(&pkt, 0, sizeof(pkt));
+        pkt.type = (u8)PKT_JOIN_STATE; pkt.ownerId = ownerId; pkt.seq = jsSeqOut_++;
+        pkt.kind = (u8)JS_PERMAJOBS;
+        pkt.key[0] = k->t; pkt.key[1] = k->c; pkt.key[2] = k->cs; pkt.key[3] = k->i; pkt.key[4] = k->s;
+        pkt.nJobs = (u8)n;
+        for (int j = 0; j < n; ++j) {
+            pkt.jobs[j].task = (u16)task[j];
+            for (int q = 0; q < 5; ++q) pkt.jobs[j].subj[q] = subj[j][q];
+            for (int q = 0; q < 3; ++q) pkt.jobs[j].loc[q] = loc[j][q];
+        }
+        net.queueJoinState(pkt);
+        if (changed) jsLog("SEND", pkt, ownerId, n, n, 0);
+    }
+}
+
+void Replicator::applyJoinState(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
+    std::deque<InboundJoinState> got;
+    in.drainJoinState(got);
+    if (got.empty()) return;
+    if (!joinStateSync_) return;
+    for (std::deque<InboundJoinState>::iterator it = got.begin(); it != got.end(); ++it) {
+        JoinStatePacket& p = it->pkt;
+        u32 from = it->ownerId;
+        if (from == ctx.localId) continue; // our own row echoed back (relay safety)
+        p.name[sizeof(p.name) - 1] = '\0';
+        if (p.kind == JS_SQUAD_NAME) {
+            std::pair<u32, u32> tab(p.key[1], p.key[2]);
+            std::map<std::pair<u32, u32>, TabOwner>::const_iterator to = tabOwned_.find(tab);
+            if (to != tabOwned_.end() && to->second.mine) continue; // ours: we are its author
+            JsRow& r = jsSquads_[tab];
+            if (!r.seqSeen.accept(from, p.seq)) continue;
+            const unsigned int cont[2] = { p.key[1], p.key[2] };
+            int rc = engine::setPlayerSquadName(gw, cont, p.name);
+            if (rc == 1 || rc == 2) { r.value = p.name; r.seeded = true; }
+            if (rc != 2) jsLog("APPLY", p, from, rc, 0, 0);
+        } else if (p.kind == JS_FACTION) {
+            // One shared faction: the host's word is final. A join takes only host
+            // rows (a relayed join rename reaches it again as the host's broadcast).
+            if (!ctx.isHost && from != 0) continue;
+            if (!jsFaction_.seqSeen.accept(from, p.seq)) continue;
+            if (!p.name[0]) continue;
+            int rc = engine::setPlayerFactionName(gw, p.name);
+            if (rc == 1 || rc == 2) { jsFaction_.value = p.name; jsFaction_.seeded = true; }
+            if (ctx.isHost && rc == 1) jsFaction_.force = true; // broadcast the join's rename
+            if (rc != 2) jsLog("APPLY", p, from, rc, 0, 0);
+        } else if (p.kind == JS_PERMAJOBS) {
+            if (!ctx.isHost) continue; // only the host's world is saved
+            if (p.nJobs > JS_JOBS_MAX) continue;
+            Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2]; k.i = p.key[3]; k.s = p.key[4];
+            JsRow& r = jsJobs_[k];
+            if (!r.seqSeen.accept(from, p.seq)) continue;
+            Character* c = bodyForKey(k, 0, 0);
+            ObjectHand oh;
+            if (!c || !engine::charHandOf(c, oh)) continue; // not here yet; the resend retries
+            const int n = (int)p.nJobs;
+            int task[JS_JOBS_MAX]; unsigned int subj[JS_JOBS_MAX][5]; float loc[JS_JOBS_MAX][3];
+            for (int j = 0; j < n; ++j) {
+                task[j] = (int)p.jobs[j].task;
+                Key w; w.t = p.jobs[j].subj[0]; w.c = p.jobs[j].subj[1]; w.cs = p.jobs[j].subj[2];
+                w.i = p.jobs[j].subj[3]; w.s = p.jobs[j].subj[4];
+                if (!localHandForBuildKey(w, subj[j]))
+                    for (int q = 0; q < 5; ++q) subj[j][q] = p.jobs[j].subj[q]; // save-native
+                for (int q = 0; q < 3; ++q) loc[j][q] = p.jobs[j].loc[q];
+            }
+            engine::PermajobRow cur[JS_JOBS_MAX + 1];
+            int had = engine::readPermajobs(oh, cur, (int)JS_JOBS_MAX + 1);
+            if (had >= 0 && had <= (int)JS_JOBS_MAX) {
+                int ct[JS_JOBS_MAX]; unsigned int cs[JS_JOBS_MAX][5]; float cl[JS_JOBS_MAX][3];
+                for (int j = 0; j < had; ++j) {
+                    ct[j] = cur[j].task; cur[j].subj.toObjOrder(cs[j]);
+                    for (int q = 0; q < 3; ++q) cl[j][q] = cur[j].loc[q];
+                }
+                if (jobSig(ct, cs, cl, had) == jobSig(task, subj, loc, n)) continue; // equal
+            }
+            engine::clearPermajobs(oh);
+            int miss = 0, after = 0;
+            for (int j = 0; j < n; ++j) {
+                int rc = engine::addPermajob(oh, task[j], ObjectHand::fromObjOrder(subj[j]), loc[j]);
+                if (rc < 0) ++miss; else after = rc;
+            }
+            jsLog("APPLY", p, from, had, after, miss);
+        }
+    }
+}
+
 void Replicator::publishDeeds(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!deedSync_) return;
@@ -1852,6 +2061,10 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         // #21) - a join's research reaches the host, whose save is the one that
         // persists. applyResearch skips known sids, so an echo dies in one hop.
         { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   false },
+        // Protocol 64 (upstream #74.1): join-authored squad/faction names and
+        // permanent job lists reach the host's world - the one every coordinated
+        // save serializes. Direction is per kind inside the pair.
+        { &Replicator::joinStateSync_, 0,                    &Replicator::publishJoinState,  &Replicator::applyJoinState,  false },
         { &Replicator::deedSync_,     0,                     &Replicator::publishDeeds,      &Replicator::applyDeeds,      false }
     };
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
@@ -2444,6 +2657,9 @@ void Replicator::forgetPeerChannels(u32 id) {
     forgetRowSeq(bdoorRows_, id);
     forgetRowSeq(prodRows_, id);
     forgetRowSeq(researchRows_, id);
+    forgetRowSeq(jsSquads_, id);
+    forgetRowSeq(jsJobs_, id);
+    if (all) jsFaction_.seqSeen.seen.clear(); else jsFaction_.seqSeen.forget(id);
     forgetRowSeq(deedRows_, id);
 
     // Fixture pairings live in the sender's hand space; a returning client

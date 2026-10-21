@@ -6,6 +6,7 @@
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
 #include "ScenarioSupport.h"
+#include <io.h> // _findfirst: joinstate_sync scans the written save folder
 
 namespace coop {
 namespace {
@@ -1277,6 +1278,220 @@ private:
     unsigned int bench_[5]; char rsid_[48], cost_[48];
 };
 
+// joinstate_sync (upstream #74.1): what a JOIN sets on its own squad - the
+// squad's display name, the player faction's name, a character's permanent job
+// - must reach the HOST's world, because the host authors the one save every
+// coordinated save hands back to the join. Script: host places + completes a
+// research bench (t=4/7 s; the job target, session-placed so its hand differs
+// per client); the join latches it, then at t=12 s renames its own squad and the
+// faction and gives one of its own characters an OPERATE_MACHINERY job at the
+// bench (Character::addJob, the job-mode order). Both sample 1 Hz. The host
+// saves at t=30 s and scans the written save folder for the two names.
+// Pass: join's three local levers took; host's copy of the join's squad and the
+// faction carry the names, the join's character on the host holds the bench job,
+// and the host's save file contains both names. JSTATE log contract
+// (Test-JoinState).
+class JoinStateScenario : public TimedScenario {
+public:
+    JoinStateScenario() : TimedScenario("joinstate_sync", 0), haveBench_(false), placeRc_(-9),
+                          benchComplete_(-9),
+                          ramped_(false), haveChar_(false), acted_(false), rcSquad_(-9),
+                          rcFaction_(-9), pjBefore_(-9), pjAfter_(-9), memSquad_(0),
+                          memFaction_(0), memJob_(0), saveOk_(-1), fileSquad_(0),
+                          fileFaction_(0), files_(0), lastSampleMs_(0), lastScanMs_(0),
+                          lastFileMs_(0) {
+        memset(bench_, 0, sizeof(bench_)); memset(&char_, 0, sizeof(char_));
+        cont_[0] = cont_[1] = 0; benchPos_[0] = benchPos_[1] = benchPos_[2] = 0.0f;
+    }
+    virtual void onStart(const ScenarioContext& ctx) {
+        char b[64]; _snprintf(b, sizeof(b) - 1, "JSTATE start role=%s",
+                              ctx.isHost ? "host" : "join");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    virtual bool onTick(const ScenarioContext& ctx) {
+        unsigned long t = ctx.elapsedMs;
+        if (ctx.isHost && placeRc_ == -9 && t >= 4000) {
+            char bsid[48]; bsid[0] = '\0';
+            placeRc_ = engine::probePlaceMachine(ctx.gw, 8.0f, 0.0f, 3, bench_, bsid, sizeof(bsid));
+            haveBench_ = placeRc_ == 1;
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "JSTATE bench role=host place=%d hand=%u,%u,%u,%u,%u", placeRc_,
+                bench_[0], bench_[1], bench_[2], bench_[3], bench_[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (ctx.isHost && haveBench_ && !ramped_ && t >= 7000) {
+            ramped_ = true;
+            engine::BuildRead post;
+            engine::writeBuildProgressByHand(bench_, 1.0f, true, &post);
+        }
+        if (!ctx.isHost && !haveBench_ && t >= 8000 && t - lastScanMs_ >= 1000) {
+            lastScanMs_ = t;
+            engine::ProdRead rows[48];
+            unsigned int n = engine::enumMachinesNear(ctx.gw, 200.0f, rows, 48);
+            for (unsigned int i = 0; i < n && !haveBench_; ++i)
+                if (rows[i].classType == 5 /*BCTYPE_RESEARCH*/) {
+                    memcpy(bench_, rows[i].hand, sizeof(bench_)); haveBench_ = true;
+                    benchPos_[0] = rows[i].x; benchPos_[1] = rows[i].y; benchPos_[2] = rows[i].z;
+                    benchComplete_ = rows[i].complete;
+                }
+            if (haveBench_) {
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "JSTATE bench role=join hand=%u,%u,%u,%u,%u complete=%d",
+                    bench_[0], bench_[1], bench_[2], bench_[3], bench_[4], benchComplete_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!haveChar_ && t >= 8000) pickJoinChar(ctx);
+        if (!ctx.isHost && !acted_ && haveBench_ && haveChar_ && t >= 12000) {
+            acted_ = true;
+            rcSquad_   = engine::setPlayerSquadName(ctx.gw, cont_, SQUAD_NAME);
+            rcFaction_ = engine::setPlayerFactionName(ctx.gw, FACTION_NAME);
+            engine::PermajobRow pj[16];
+            pjBefore_ = engine::readPermajobs(char_, pj, 16);
+            pjAfter_  = engine::addPermajob(char_, engine::taskOperateMachinery(),
+                                            ObjectHand::fromObjOrder(bench_), benchPos_);
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "JSTATE act squad=%d faction=%d pj=%d->%d", rcSquad_, rcFaction_, pjBefore_,
+                pjAfter_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (haveChar_ && haveBench_ && t - lastSampleMs_ >= 1000) {
+            lastSampleMs_ = t;
+            sample(ctx);
+        }
+        if (ctx.isHost && saveOk_ < 0 && haveChar_ && t >= SAVE_MS) {
+            saveOk_ = engine::saveGameAs(SAVE_NAME) ? 1 : 0;
+            char b[80]; _snprintf(b, sizeof(b) - 1, "JSTATE save name='%s' ok=%d", SAVE_NAME,
+                                  saveOk_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (ctx.isHost && saveOk_ == 1 && t >= SAVE_MS + 6000 && !(fileSquad_ && fileFaction_) &&
+            t - lastFileMs_ >= 2000) {
+            lastFileMs_ = t;
+            scanSave();
+        }
+        if (t >= DURATION_MS) { verdict(ctx); return true; }
+        if (t >= 20000 && !(haveBench_ && haveChar_)) { verdict(ctx); return true; }
+        return false;
+    }
+private:
+    // The join's squad member: on the host a squad body whose tab is NOT ours, on
+    // the join a squad body whose tab IS ours (squad-tab ownership, both sides).
+    void pickJoinChar(const ScenarioContext& ctx) {
+        if (!ctx.bodyRole) return;
+        EntityState sq[64];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, 64);
+        for (unsigned int i = 0; i < n && !haveChar_; ++i) {
+            Character* c = engine::resolve(sq[i]);
+            BodyRoleView v;
+            if (!c || !ctx.bodyRole(c, &v) || !v.squad) continue;
+            if ((v.tabOwn != 0) != !ctx.isHost) continue;
+            char_.type = sq[i].hType; char_.container = sq[i].hContainer;
+            char_.containerSerial = sq[i].hContainerSerial;
+            char_.index = sq[i].hIndex; char_.serial = sq[i].hSerial;
+            cont_[0] = sq[i].hContainer; cont_[1] = sq[i].hContainerSerial;
+            haveChar_ = true;
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "JSTATE char role=%s hand=%u,%u,%u,%u,%u", ctx.isHost ? "host" : "join",
+                char_.type, char_.container, char_.containerSerial, char_.index, char_.serial);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    void sample(const ScenarioContext& ctx) {
+        engine::SquadNameRow rows[16];
+        unsigned int n = engine::readPlayerSquadNames(ctx.gw, rows, 16);
+        const char* sq = "(none)";
+        for (unsigned int i = 0; i < n; ++i)
+            if (rows[i].cont[0] == cont_[0] && rows[i].cont[1] == cont_[1]) sq = rows[i].name;
+        char fac[64]; fac[0] = '\0';
+        engine::readPlayerFactionName(ctx.gw, fac, sizeof(fac));
+        engine::PermajobRow pj[16];
+        int np = engine::readPermajobs(char_, pj, 16);
+        int job = 0;
+        for (int i = 0; i < np; ++i)
+            if (pj[i].task == engine::taskOperateMachinery() && pj[i].subj.index == bench_[3] &&
+                pj[i].subj.serial == bench_[4]) job = 1;
+        memSquad_ = strcmp(sq, SQUAD_NAME) == 0;
+        memFaction_ = strcmp(fac, FACTION_NAME) == 0;
+        memJob_ = job;
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "JSTATE %s t=%lu squad='%s' faction='%s' pj=%d job=%d", ctx.isHost ? "host" : "join",
+            ctx.elapsedMs, sq, fac, np, job);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    static bool fileHas(const std::string& path, const char* a, const char* b2, int* hitA,
+                        int* hitB) {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) return false;
+        std::string buf;
+        char chunk[65536];
+        size_t r;
+        while ((r = fread(chunk, 1, sizeof(chunk), f)) > 0) buf.append(chunk, r);
+        fclose(f);
+        if (buf.find(a) != std::string::npos) *hitA = 1;
+        if (buf.find(b2) != std::string::npos) *hitB = 1;
+        return true;
+    }
+    void scanDir(const std::string& dir, int depth) {
+        struct _finddata_t fd;
+        intptr_t h = _findfirst((dir + "\\*").c_str(), &fd);
+        if (h == -1) return;
+        do {
+            std::string nm(fd.name);
+            if (nm == "." || nm == "..") continue;
+            std::string p = dir + "\\" + nm;
+            if (fd.attrib & _A_SUBDIR) { if (depth < 2) scanDir(p, depth + 1); }
+            else if (fileHas(p, SQUAD_NAME, FACTION_NAME, &fileSquad_, &fileFaction_)) ++files_;
+        } while (_findnext(h, &fd) == 0);
+        _findclose(h);
+    }
+    void scanSave() {
+        files_ = 0;
+        std::string dir = savexfer::saveFolderFor(SAVE_NAME);
+        scanDir(dir, 0);
+        char b[256]; _snprintf(b, sizeof(b) - 1,
+            "JSTATE file dir='%s' files=%d squad=%d faction=%d", dir.c_str(), files_, fileSquad_,
+            fileFaction_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    void verdict(const ScenarioContext& ctx) {
+        const char* why = "ok";
+        if (!haveBench_) why = "no-bench";
+        else if (!haveChar_) why = "no-char";
+        else if (!ctx.isHost) {
+            if (rcSquad_ != 1 || rcFaction_ != 1 || pjBefore_ < 0 || pjAfter_ != pjBefore_ + 1)
+                why = "act";
+            else if (!memSquad_ || !memFaction_ || !memJob_) why = "join-lost";
+        } else {
+            if (!memSquad_) why = "host-squad";
+            else if (!memFaction_) why = "host-faction";
+            else if (!memJob_) why = "host-job";
+            else if (saveOk_ != 1) why = "save";
+            else if (!fileSquad_ || !fileFaction_) why = "save-file";
+        }
+        passed_ = strcmp(why, "ok") == 0;
+        char b[256]; _snprintf(b, sizeof(b) - 1,
+            "JSTATE verdict role=%s pass=%d why=%s squad=%d faction=%d job=%d act=%d,%d,%d->%d "
+            "save=%d fileSquad=%d fileFaction=%d", ctx.isHost ? "host" : "join", passed_ ? 1 : 0,
+            why, memSquad_, memFaction_, memJob_, rcSquad_, rcFaction_, pjBefore_, pjAfter_,
+            saveOk_, fileSquad_, fileFaction_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    static const unsigned long SAVE_MS = 30000, DURATION_MS = 56000;
+    static const char* const SQUAD_NAME;
+    static const char* const FACTION_NAME;
+    static const char* const SAVE_NAME;
+    bool haveBench_; int placeRc_; bool ramped_; bool haveChar_; bool acted_;
+    int benchComplete_;
+    int rcSquad_, rcFaction_, pjBefore_, pjAfter_;
+    int memSquad_, memFaction_, memJob_, saveOk_, fileSquad_, fileFaction_, files_;
+    unsigned long lastSampleMs_, lastScanMs_, lastFileMs_;
+    unsigned int bench_[5]; float benchPos_[3]; ObjectHand char_; unsigned int cont_[2];
+};
+const char* const JoinStateScenario::SQUAD_NAME   = "KC74 Squad J";
+const char* const JoinStateScenario::FACTION_NAME = "KC74 Faction J";
+const char* const JoinStateScenario::SAVE_NAME    = "kc74_joinstate";
+
 // store_probe (protocol 34 phase 0, probe tier; storeSync forced OFF, the
 // protocol-27 mint channel deliberately ON so host-placed buildings exist on
 // both sides) / store_sync (probe=false, full tier; storeSync ON). Storage
@@ -1660,6 +1875,7 @@ Scenario* makeBuildingScenario(const std::string& name) {
     if (name == "research_probe") return new ResearchProbeScenario(true);
     if (name == "research_sync")  return new ResearchProbeScenario(false);
     if (name == "research_cost")  return new ResearchCostScenario();
+    if (name == "joinstate_sync") return new JoinStateScenario();
     if (name == "store_probe")    return new StoreProbeScenario(true);
     if (name == "store_sync")     return new StoreProbeScenario(false);
     return 0;

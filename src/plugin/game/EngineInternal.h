@@ -144,6 +144,14 @@ typedef void      (__fastcall* AddJobFn)(Character* self, int t, RootObject* sub
 typedef Platoon*  (__fastcall* SeparateSquadFn)(Character* self, bool permanent);
 typedef void      (__fastcall* EndActionFn)(void* charBody);
 typedef void      (__fastcall* RagdollModeFn)(Character* self, bool on, int part);
+// Upstream #74: the join-authored state the host-authored save must carry -
+// squad display names, the player faction name and permanent job lists.
+typedef const std::string* (__fastcall* PlatoonGetNameFn)(const ActivePlatoon* self);
+typedef void      (__fastcall* PlatoonSetNameFn)(ActivePlatoon* self, const std::string* name);
+typedef void      (__fastcall* FactionSetNameFn)(Faction* self, const std::string* name);
+typedef int       (__fastcall* PermajobCountFn)(const Character* self);
+typedef const Tasker* (__fastcall* PermajobDataFn)(const Character* self, int slot);
+typedef void      (__fastcall* ClearPermajobsFn)(Character* self);
 // CharMovement::restore - the counterpart to destroy(), which re-creates the
 // movement controller's physics side (the HavokCharacter + collision hull).
 typedef void      (__fastcall* MoveRestoreFn)(CharMovement* self);
@@ -414,6 +422,12 @@ extern AddJobFn        g_addJobFn;
 extern SeparateSquadFn g_separateSquadFn;
 extern EndActionFn     g_endActionFn;
 extern RagdollModeFn   g_ragdollModeFn;
+extern PlatoonGetNameFn g_platoonGetNameFn;
+extern PlatoonSetNameFn g_platoonSetNameFn;
+extern FactionSetNameFn g_factionSetNameFn;
+extern PermajobCountFn  g_permajobCountFn;
+extern PermajobDataFn   g_permajobDataFn;
+extern ClearPermajobsFn g_clearPermajobsFn;
 extern MoveRestoreFn   g_moveRestoreFn;
 extern MedFloatFn      g_knockoutFn;
 extern MedFloatFn      g_knockoutForceFn;

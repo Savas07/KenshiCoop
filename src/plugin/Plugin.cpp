@@ -3181,6 +3181,7 @@ void installEngineDetours() {
     g_repl.setHungerSync(g_cfg.hungerSync);
     g_repl.setProdSync(g_cfg.prodSync);
     g_repl.setResearchSync(g_cfg.researchSync);
+    g_repl.setJoinStateSync(g_cfg.joinStateSync);
     g_repl.setDeedSync(g_cfg.deedSync);
     g_repl.setFixtureSync(g_cfg.fixtureSync);
     // Machine work detours (the operate() entry a body's OPERATE_MACHINERY

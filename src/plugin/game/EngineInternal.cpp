@@ -380,6 +380,12 @@ AddJobFn        g_addJobFn        = 0;
 SeparateSquadFn g_separateSquadFn = 0;
 EndActionFn     g_endActionFn     = 0;
 RagdollModeFn   g_ragdollModeFn   = 0;
+PlatoonGetNameFn g_platoonGetNameFn = 0;
+PlatoonSetNameFn g_platoonSetNameFn = 0;
+FactionSetNameFn g_factionSetNameFn = 0;
+PermajobCountFn  g_permajobCountFn  = 0;
+PermajobDataFn   g_permajobDataFn   = 0;
+ClearPermajobsFn g_clearPermajobsFn = 0;
 MoveRestoreFn   g_moveRestoreFn   = 0;
 MedFloatFn      g_knockoutFn      = 0;
 MedFloatFn      g_knockoutForceFn = 0;
@@ -1756,6 +1762,16 @@ void resolve() {
         &Character::separateIntoMyOwnSquad);
     g_endActionFn = (EndActionFn)KenshiLib::GetRealAddress(&CharBody::endAction);
     g_ragdollModeFn = (RagdollModeFn)KenshiLib::GetRealAddress(&Character::ragdollMode);
+    // Upstream #74: squad/faction names + permanent job lists. Non-fatal: if
+    // unresolved, the join-state channel reads/writes nothing. The squad name
+    // lives on ActivePlatoon (KenshiLib exports no Platoon::getName/setName -
+    // binding those asserted inside GetRealAddress and hung startup).
+    g_platoonGetNameFn = (PlatoonGetNameFn)KenshiLib::GetRealAddress(&ActivePlatoon::getName);
+    g_platoonSetNameFn = (PlatoonSetNameFn)KenshiLib::GetRealAddress(&ActivePlatoon::setName);
+    g_factionSetNameFn = (FactionSetNameFn)KenshiLib::GetRealAddress(&Faction::setName);
+    g_permajobCountFn  = (PermajobCountFn)KenshiLib::GetRealAddress(&Character::getPermajobCount);
+    g_permajobDataFn   = (PermajobDataFn)KenshiLib::GetRealAddress(&Character::getPermajobData);
+    g_clearPermajobsFn = (ClearPermajobsFn)KenshiLib::GetRealAddress(&Character::clearPermajobs);
     // Protocol 53: re-create a driven crawler's physics side. The engine DESTROYS
     // the movement controller's HavokCharacter when a body collapses and re-creates
     // it when the body recovers - measured on the owner, which reports hk=0 for

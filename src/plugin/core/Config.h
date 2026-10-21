@@ -532,6 +532,18 @@ struct Config {
     // measures the unsynced baseline). "0" is the A/B escape hatch.
     bool          researchSync;
 
+    // KENSHICOOP_JOINSTATE_SYNC (default ON): join-authored state sync
+    // (protocol 64, upstream #74.1). Only the host's world is ever saved, so
+    // whatever a join sets on its own squad that the engine keeps locally was
+    // lost on the next coordinated save: squad display names (Nameless_0),
+    // the player faction name and every permanent job assignment. BOTH clients
+    // sample ~1 Hz and stream reliable PKT_JOIN_STATE rows on change (the
+    // loaded save is the silent baseline): squad names from each tab's owner,
+    // faction renames via the host (its word final), job lists join -> host
+    // (rewritten on the join's body only when they differ; > JS_JOBS_MAX jobs
+    // on one body are not synced). "0" is the A/B escape hatch.
+    bool          joinStateSync;
+
     // KENSHICOOP_DEED_SYNC (default ON): property-deed sync (protocol 54) -
     // BOTH clients sample the player faction's owned-building set ~1 Hz and
     // stream one reliable PKT_DEED row per owned hand (first sight is the

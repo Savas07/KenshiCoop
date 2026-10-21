@@ -249,6 +249,7 @@ void loadConfig(Config& c) {
     c.loadSync    = envOr("KENSHICOOP_LOAD_SYNC", "1") != "0";
     c.prodSync    = envOr("KENSHICOOP_PROD_SYNC", "1") != "0";
     c.researchSync = envOr("KENSHICOOP_RESEARCH_SYNC", "1") != "0";
+    c.joinStateSync = envOr("KENSHICOOP_JOINSTATE_SYNC", "1") != "0";
     c.deedSync    = envOr("KENSHICOOP_DEED_SYNC", "1") != "0";
     c.fixtureSync = envOr("KENSHICOOP_FIXTURE_SYNC", "1") != "0";
     c.storeSync   = envOr("KENSHICOOP_STORE_SYNC", "1") != "0";
@@ -474,6 +475,7 @@ std::string describeConfig(const Config& c) {
         { "deed",    c.deedSync },    { "fixture", c.fixtureSync },
         { "store",   c.storeSync },    { "squad",   c.squadSync },
         { "vendor",  c.vendorSync },   { "corpse",  c.corpseSync },
+        { "jstate",  c.joinStateSync },
         { "latejoin",c.latejoinSync }, { "aiSuspend", c.aiSuspend },
         { "gateAuth",c.gateAuthority },{ "camInterest", c.camInterest },
         { "censusFreezeAi", c.censusFreezeAi },

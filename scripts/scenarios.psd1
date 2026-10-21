@@ -1711,6 +1711,19 @@
             Tier = 'smoke'; WanVariant = $false
         }
 
+        # joinstate_sync (upstream #74.1): the JOIN renames its own squad and the
+        # player faction and gives one of its characters a bench job; the host's
+        # world (and so the host-authored save) must carry all three. Gates: the
+        # host's copies hold the names + job, and the host's save file holds both
+        # names.
+        joinstate_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'joinstate'
+            Gating   = @('joinstate', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth')
+            Tier = 'smoke'; WanVariant = $false
+        }
+
         # deed_probe: property-ownership phase-0 diagnostic (protocol 54 -
         # deedSync forced OFF). Buying a house/shop is purely local today, so
         # the buyer owns it and the partner still sees it for sale. Both sides

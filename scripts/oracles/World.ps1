@@ -2660,6 +2660,35 @@ function Test-ResearchCost {
                 -Metrics @{ costSend = $send.Count; costApply = $apply.Count; hostRecv = $recv.Count } -Detail $detail)
 }
 
+# joinstate_sync (upstream #74.1): the join's squad name, faction name and bench
+# job must reach the host's world and the host-authored save. Reads each side's
+# JSTATE verdict; [jstate] rows show which leg moved.
+function Test-JoinState {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $re = "JSTATE verdict role=(\w+) pass=(\d) why=(\S+) squad=(\d) faction=(\d) job=(\d) " +
+          "act=(-?\d+),(-?\d+),(-?\d+)->(-?\d+) save=(-?\d+) fileSquad=(\d) fileFaction=(\d)"
+    foreach ($pair in @(@($HostFile, 'host'), @($JoinFile, 'join'))) {
+        $m = Select-String -Path $pair[0] -Pattern $re -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $m) { $why += "$($pair[1]) never logged its JSTATE verdict"; continue }
+        $g = $m.Matches[0].Groups
+        $line = ("    FINDING: {0} why={1} squad={2} faction={3} job={4} act={5},{6},{7}->{8} " +
+                 "save={9} fileSquad={10} fileFaction={11}") -f $pair[1], $g[3].Value, $g[4].Value,
+                 $g[5].Value, $g[6].Value, $g[7].Value, $g[8].Value, $g[9].Value, $g[10].Value,
+                 $g[11].Value, $g[12].Value, $g[13].Value
+        Write-Host $line
+        if ($g[2].Value -ne '1') { $why += "$($pair[1]) $($g[3].Value)" }
+    }
+    $send  = @(Select-String -Path $JoinFile -Pattern '\[jstate\] SEND ' -ErrorAction SilentlyContinue)
+    $apply = @(Select-String -Path $HostFile -Pattern '\[jstate\] APPLY ' -ErrorAction SilentlyContinue)
+    Write-Host "    FINDING: join [jstate] SEND=$($send.Count) host [jstate] APPLY=$($apply.Count)"
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  JOINSTATE $v - $detail"
+    return (Add-GateResult -Name "joinstate" -Status $v `
+                -Metrics @{ send = $send.Count; apply = $apply.Count } -Detail $detail)
+}
+
 # Parse the 1 Hz SCENARIO CONT container census into hand -> ordered samples
 # @{class; complete; inv; n; qty; hash; firstSid; firstQty; sid; name; t}
 # (protocol 34).

@@ -124,6 +124,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(VendorDeltaPacket)",       sizeof(VendorDeltaPacket),       188); // v60: shop-counter stock/cash change
     CHECK_EQ("sizeof(VendorCashPacket)",        sizeof(VendorCashPacket),        29);  // v60: merchant cash mirror
     CHECK_EQ("sizeof(NativeTakenPacket)",       sizeof(NativeTakenPacket),       69);  // v61: save-native pickup notice
+    CHECK_EQ("sizeof(JoinStatePacket)",         sizeof(JoinStatePacket),       1183);  // v64: squad/faction name + permajobs
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -313,8 +314,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v63: research union + bench cost deltas)",
-             (int)PROTOCOL_VERSION, 63);
+    CHECK_EQ("PROTOCOL_VERSION (v64: join-authored squad/faction names + permanent jobs)",
+             (int)PROTOCOL_VERSION, 64);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -397,6 +398,7 @@ static void testSizes() {
     CHECK_EQ("PKT_VENDOR_DELTA id", (int)PKT_VENDOR_DELTA, 52);
     CHECK_EQ("PKT_VENDOR_CASH id", (int)PKT_VENDOR_CASH, 53);
     CHECK_EQ("PKT_NATIVE_TAKEN id", (int)PKT_NATIVE_TAKEN, 54);
+    CHECK_EQ("PKT_JOIN_STATE id", (int)PKT_JOIN_STATE, 55);
     // `count` must remain the LAST header field: the entry array is framed immediately
     // after it, so inserting `flags` anywhere else would shift the payload.
     {
@@ -453,7 +455,7 @@ static void roundTrip(const char* name, u8 typeTag) {
     T in;
     fillPattern(&in, (unsigned char)(typeTag * 31));
     in.type = typeTag;
-    unsigned char buf[512];
+    unsigned char buf[2048]; // >= the largest packet (JoinStatePacket, 1183 B)
     std::memcpy(buf, &in, sizeof(T));
 
     char label[128];
@@ -515,6 +517,7 @@ static void testRoundTrips() {
     roundTrip<VendorDeltaPacket>("VendorDeltaPacket", (u8)PKT_VENDOR_DELTA);
     roundTrip<VendorCashPacket>("VendorCashPacket", (u8)PKT_VENDOR_CASH);
     roundTrip<NativeTakenPacket>("NativeTakenPacket", (u8)PKT_NATIVE_TAKEN);
+    roundTrip<JoinStatePacket>("JoinStatePacket", (u8)PKT_JOIN_STATE);
 
     CHECK("packetType(null) == 0", packetType(0, 10) == 0);
     unsigned char b0[1] = { 0 };
@@ -1401,6 +1404,7 @@ static void testFlushWorldStateContract() {
     DoorPacket      dp;  std::memset(&dp,  0, sizeof(dp));
     ProdPacket      pr;  std::memset(&pr,  0, sizeof(pr));
     ResearchPacket  rp;  std::memset(&rp,  0, sizeof(rp));
+    JoinStatePacket jsp; std::memset(&jsp, 0, sizeof(jsp));
     DeedPacket      de;  std::memset(&de,  0, sizeof(de));
     FixturePacket   fx;  std::memset(&fx,  0, sizeof(fx));
     BuildPlacePacket  bp; std::memset(&bp,  0, sizeof(bp));
@@ -1449,6 +1453,7 @@ static void testFlushWorldStateContract() {
     in.pushDoor(1, dp);
     in.pushProd(1, pr);
     in.pushResearch(1, rp);
+    in.pushJoinState(1, jsp);
     in.pushDeed(1, de);
     in.pushFixture(1, fx);
     in.pushBuildPlace(1, bp);
@@ -1505,6 +1510,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("door",        InboundDoor,        drainDoor);
     WS_EMPTY("prod",        InboundProd,        drainProd);
     WS_EMPTY("research",    InboundResearch,    drainResearch);
+    WS_EMPTY("joinState",   InboundJoinState,   drainJoinState);
     WS_EMPTY("deed",        InboundDeed,        drainDeed);
     WS_EMPTY("fixture",     InboundFixture,     drainFixture);
     WS_EMPTY("buildPlace",  InboundBuildPlace,  drainBuildPlace);

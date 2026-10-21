@@ -260,6 +260,12 @@ struct InboundResearch {
     ResearchPacket pkt;
 };
 
+// One received squad-name / faction-name / permanent-job row (protocol 64).
+struct InboundJoinState {
+    u32             ownerId;
+    JoinStatePacket pkt;
+};
+
 // One received property-deed row (protocol 54): a peer reports that a BAKED
 // building is (or is no longer) owned by the shared player faction. Applied as
 // a pure state write - never the buy path, which would charge the cats twice.
@@ -476,7 +482,8 @@ public:
         vendorDelta_(worldReset_), vendorCash_(worldReset_),
         faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
-        research_(worldReset_),   deed_(worldReset_),       fixture_(worldReset_),
+        research_(worldReset_),   joinState_(worldReset_),  deed_(worldReset_),
+        fixture_(worldReset_),
         charGen_(worldReset_),
         buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
@@ -656,6 +663,11 @@ public:
     void pushResearch(u32 ownerId, const ResearchPacket& pkt) {
         InboundResearch ir; ir.ownerId = ownerId; ir.pkt = pkt;
         EnterCriticalSection(&cs_); research_.push_back(ir); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received join-state row (protocol 64), owner-tagged.
+    void pushJoinState(u32 ownerId, const JoinStatePacket& pkt) {
+        InboundJoinState ij; ij.ownerId = ownerId; ij.pkt = pkt;
+        EnterCriticalSection(&cs_); joinState_.push_back(ij); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received property-deed row (protocol 54), owner-tagged.
     void pushDeed(u32 ownerId, const DeedPacket& pkt) {
@@ -842,6 +854,9 @@ public:
     void drainResearch(std::deque<InboundResearch>& out) {
         EnterCriticalSection(&cs_); out.swap(research_); LeaveCriticalSection(&cs_);
     }
+    void drainJoinState(std::deque<InboundJoinState>& out) {
+        EnterCriticalSection(&cs_); out.swap(joinState_); LeaveCriticalSection(&cs_);
+    }
     void drainDeed(std::deque<InboundDeed>& out) {
         EnterCriticalSection(&cs_); out.swap(deed_); LeaveCriticalSection(&cs_);
     }
@@ -991,6 +1006,7 @@ private:
     WorldQ<InboundDoor>            door_;
     WorldQ<InboundProd>            prod_;
     WorldQ<InboundResearch>        research_;
+    WorldQ<InboundJoinState>       joinState_;
     WorldQ<InboundDeed>            deed_;
     WorldQ<InboundFixture>         fixture_;
     WorldQ<InboundCharGen>         charGen_;

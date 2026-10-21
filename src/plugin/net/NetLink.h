@@ -142,9 +142,12 @@ public:
     // MAIN thread: queue a reliable host-authoritative machine state row
     // (protocol 33). Change-gated + safety-resent by the caller.
     void queueProd(const ProdPacket& pkt);
-    // MAIN thread: queue a reliable host-authoritative known-research row
-    // (protocol 38). First-sight sent + safety-resent by the caller.
+    // MAIN thread: queue a reliable known-research row (protocol 38; protocol 63:
+    // both roles). First-sight sent + safety-resent by the caller.
     void queueResearch(const ResearchPacket& pkt);
+    // MAIN thread: queue a reliable squad-name / faction-name / permanent-job row
+    // (protocol 64). Change-gated + safety-resent by the caller.
+    void queueJoinState(const JoinStatePacket& pkt);
     // MAIN thread: queue a reliable property-deed ownership row (protocol 54).
     // Symmetric (either client may buy); first-sight sent + safety-resent by the
     // caller, so a party that buys nothing is silent after the baseline.
@@ -350,6 +353,8 @@ private:
     std::vector<ProdPacket>      outProd_;
     // Reliable known-research rows (protocol 38). Guarded by outCs_.
     std::vector<ResearchPacket>  outResearch_;
+    // Reliable join-state rows (protocol 64). Guarded by outCs_.
+    std::vector<JoinStatePacket> outJoinState_;
     // Reliable property-deed ownership rows (protocol 54). Guarded by outCs_.
     std::vector<DeedPacket>      outDeed_;
     // Reliable runtime-fixture identity rows (protocol 55). Guarded by outCs_.

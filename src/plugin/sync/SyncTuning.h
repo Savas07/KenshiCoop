@@ -46,6 +46,11 @@ struct SyncTuning {
     unsigned long researchSampleMs;
     unsigned long researchResendMs;
 
+    // Join state (protocol 64): renames / job assignments are rare; 1 Hz sample,
+    // research-length lost-row corrector resend.
+    unsigned long joinStateSampleMs;
+    unsigned long joinStateResendMs;
+
     // Property deeds (protocol 54): purchases are rare; 1 Hz sample. The resend
     // is the lost-row corrector AND the not-yet-resolvable corrector - the peer
     // may have the building's zone unloaded when the row first lands - so it
@@ -67,6 +72,7 @@ struct SyncTuning {
           doorSampleMs(1000),     doorResendMs(10000),
           prodSampleMs(1000),     prodResendMs(10000),
           researchSampleMs(1000), researchResendMs(15000),
+          joinStateSampleMs(1000), joinStateResendMs(15000),
           deedSampleMs(1000),     deedResendMs(15000),
           buildSampleMs(1000),    buildResendMs(10000),
           bdoorSampleMs(1000),    bdoorResendMs(10000) {}
