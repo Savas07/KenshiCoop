@@ -243,6 +243,7 @@ function Invoke-OneOracle {
         "pickup_mirror" { return (Test-WorldPickupMirror -HostFile $HostLog -JoinFile $JoinLog) }
         "native_pickup" { return (Test-NativePickup    -HostFile $HostLog -JoinFile $JoinLog) }
         "corpse_loot"   { return (Test-CorpseLoot      -HostFile $HostLog -JoinFile $JoinLog) }
+        "corpse_loot_race" { return (Test-CorpseLootRace -HostFile $HostLog -JoinFile $JoinLog) }
         "gear_repickup" { return (Test-GearRepickup    -HostFile $HostLog -JoinFile $JoinLog) }
         "gear_repickup_retry" { return (Test-GearRepickup -HostFile $HostLog -JoinFile $JoinLog `
                                             -GateName "gear_repickup_retry" -RequireRetry) }
@@ -511,7 +512,7 @@ Export-ModuleMember -Function @(
     "Test-InventoryOverflow", "Test-InventoryDropFull",
     "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
     "Test-WorldItemSync", "Test-RejoinItems", "Test-WpnRelocate", "Test-WeaponDrop",
-    "Test-WorldPickupMirror", "Test-NativePickup", "Test-CorpseLoot", "Test-GearRepickup", "Test-NoPhantomPickups", "Test-WorldItemBurst",
+    "Test-WorldPickupMirror", "Test-NativePickup", "Test-CorpseLoot", "Test-CorpseLootRace", "Test-GearRepickup", "Test-NoPhantomPickups", "Test-WorldItemBurst",
     "Test-NestedBag", "Test-DumpAll",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",

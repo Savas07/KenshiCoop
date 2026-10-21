@@ -2019,7 +2019,12 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
                                                       p.itemType, (int)p.quantity);
         int fab = 0;
-        if (moved < (int)p.quantity) {
+        // Upstream #40 race: when WE author the source (a corpse or chest we census,
+        // our own bag), our copy is the truth, not a desync - a short source means the
+        // item already left it (the two players looted the same unit within the removal
+        // settle window). Fabricating the shortfall would mint a second copy, so the
+        // shortfall is refused instead and the author rolls its optimistic move back.
+        if (moved < (int)p.quantity && sAuth != localId) {
             // Our src copy is short (desync) - fabricate the shortfall into dst so the
             // trade still lands. Non-gear always did this; gear joined once spike 451
             // made weapon fabrication work (armour always could). Dupe safety: the
@@ -2125,6 +2130,28 @@ void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
         //              itself dupe.
         if (takeSrc) { releaseXferLatch(x.src, x.key, +x.qty); x.srcSettled = true; }
         if (takeDst) { releaseXferLatch(x.dst, x.key, -x.qty); x.dstSettled = true; }
+        // Upstream #40 race: the latch release only rolls back a PEER end (its
+        // owner's snapshots put it back). Units the source's owner refused that
+        // landed in OUR OWN container have no such snapshot - nothing but us will
+        // ever take them out, and keeping them is the duplicate (the other player
+        // already holds the real one). The owner said they never left the source,
+        // so removing them cannot lose a real item.
+        int refused = (int)a.requested - (int)a.applied;
+        if (takeSrc && !x.dstPeer && refused > 0) {
+            if (refused > x.qty) refused = x.qty;
+            unsigned int dh[5] = { x.dst.t, x.dst.c, x.dst.cs, x.dst.i, x.dst.s };
+            // A gear count edge in an own bag is otherwise a ground DROP to the W2 census.
+            if (isGearType(x.key.second))
+                wdSuppress_[std::make_pair(x.dst, x.key.first)] = now + 10000;
+            int removed = engine::removeItemsFromContainerBySid(gw, dh, x.key.first.c_str(),
+                                                                x.key.second, refused);
+            xferRebase(gw, x.dst); // our own removal is not a new transfer
+            char rb[224]; _snprintf(rb, sizeof(rb) - 1,
+                "[xfer] ROLLBACK id=%u sid='%s' refused=%d removed=%d dst=%u,%u,%u,%u,%u",
+                a.xferId, x.key.first.c_str(), refused, removed,
+                x.dst.t, x.dst.c, x.dst.cs, x.dst.i, x.dst.s);
+            rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+        }
         const char* vn = (a.verdict == XFER_ACK_ACCEPT)  ? "accept"
                        : (a.verdict == XFER_ACK_PARTIAL) ? "partial" : "reject";
         char b[224]; _snprintf(b, sizeof(b) - 1,
@@ -2133,7 +2160,6 @@ void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
             now - x.sentMs, x.key.first.c_str());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         if (x.srcSettled && x.dstSettled) xferOut_.erase(o);
-        (void)gw;
     }
     // Sweep intents nobody answered. The latches themselves already expire on
     // XFER_GRACE_MS; this only stops the pending map growing over a session and
