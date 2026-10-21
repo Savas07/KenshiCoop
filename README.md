@@ -209,6 +209,9 @@ packet recording and replay) are built into every DLL and switched on with
 
 ## Credits
 
+- [nhoral](https://github.com/nhoral) - original KenshiCoop
+- [Savas07](https://github.com/Savas07) - this fork: Steam lobby, Workshop
+  release, sync fixes (2026)
 - [BFrizzleFoShizzle](https://github.com/BFrizzleFoShizzle) - RE_Kenshi and
   KenshiLib, which make plugins like this possible
 - [lsalzman/enet](https://github.com/lsalzman/enet) - UDP networking library
