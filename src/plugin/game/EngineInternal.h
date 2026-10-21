@@ -78,6 +78,7 @@
 #include <kenshi/Globals.h>         // gui (ForgottenGUI*, KenshiLib data export)
 #include <kenshi/gui/ForgottenGUI.h> // ForgottenGUI::mainbar
 #include <kenshi/gui/MainBarGUI.h>  // MainBarGUI::speedButtons (vote-button probe)
+#include <kenshi/gui/InventoryGUI.h> // InventoryGUI::getInventory (trade window probe)
 // NOTE: kenshi/ZoneManager.h cannot be included here - it redefines ParticlePool
 // (also defined by CombatClass.h above). The zone-loaded query lives in its own
 // TU (game/ZoneQuery.cpp); see engine::isZoneLoadedAt / engine::resolveZoneQuery.
@@ -687,6 +688,10 @@ Character* findWorkerNear(GameWorld* gw, RootObject* fixture);
 unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                           unsigned int maxOut, bool* outTruncated = 0,
                           bool includeNested = false);
+// The container reconcile pointed at an Inventory directly (protocol 65: a
+// ShopTrader's aggregated stock has no container hand). Top-level entries only.
+bool applyInventoryItems(GameWorld* gw, Inventory* inv, const InvItemEntry* items,
+                         unsigned int count, bool truncated);
 
 // Item::quality - CONDITION, a 0..100 float, NOT the craft grade (see gradeLevelOf and
 // InvItemEntry::level) - as the wire's integer hundredths, so a pristine item is 10000.

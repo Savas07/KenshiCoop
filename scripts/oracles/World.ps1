@@ -3076,8 +3076,15 @@ function Test-CellProbe {
 #      gates 4/5 count them (stock +sold, seller's bag -sold);
 #   8. merchant cash (VSTOCK cash=, the counter's getMoney): equal host/join
 #      within 5 s of any change and at the end.
+# vendor_away (-JoinOnly, manual T1): the host's leader walks 400 u off the bar
+# and only the join trades - gates 1/1b require the join's trades only; every
+# sync gate (2-8) still holds, so the host's copy must follow the join's trades.
+# vendor_ui (-UiTrades, manual T1): the trades go through the real trade window,
+# so no VBUY/VSELL lines exist - only the sync gates (2, 3, 3b) judge.
 function Test-VendorStock {
-    param([string]$HostFile, [string]$JoinFile)
+    param([string]$HostFile, [string]$JoinFile, [switch]$JoinOnly, [switch]$UiTrades)
+    $traders = if ($UiTrades) { @() } elseif ($JoinOnly) { @('join') } else { @('host', 'join') }
+    $gate = if ($UiTrades) { "vendor_ui" } elseif ($JoinOnly) { "vendor_away" } else { "vendor_stock" }
     $why = @()
     $parseItems = {
         param([string]$s)
@@ -3145,7 +3152,7 @@ function Test-VendorStock {
     }
     $allBuys = @($H.buys | Where-Object { $_.who -eq 'host' }) + @($J.buys | Where-Object { $_.who -eq 'join' })
     $okBuys = @($allBuys | Where-Object { $_.res -eq 1 -and $_.sid })
-    foreach ($s in @('host', 'join')) {
+    foreach ($s in $traders) {
         $b = @($allBuys | Where-Object { $_.who -eq $s })
         if ($b.Count -eq 0) { $why += "$s never logged VBUY" }
         elseif (@($b | Where-Object { $_.res -eq 1 }).Count -eq 0) { $why += "$s never bought (res=$($b[0].res))" }
@@ -3153,7 +3160,7 @@ function Test-VendorStock {
     # 1b. both sales happened and the merchant paid the seller.
     $allSells = @($H.sells | Where-Object { $_.who -eq 'host' }) + @($J.sells | Where-Object { $_.who -eq 'join' })
     $okSells = @($allSells | Where-Object { $_.res -eq 1 -and $_.sid })
-    foreach ($s in @('host', 'join')) {
+    foreach ($s in $traders) {
         $x = @($allSells | Where-Object { $_.who -eq $s })
         if ($x.Count -eq 0) { $why += "$s never logged VSELL" }
         elseif ($x[0].res -ne 1) { $why += "$s sale failed (res=$($x[0].res))" }
@@ -3269,8 +3276,72 @@ function Test-VendorStock {
     $hc = if ($null -ne $hFinal) { $hFinal.cash } else { -1 }
     $jc = if ($null -ne $jFinal) { $jFinal.cash } else { -1 }
     Write-Host "  VENDOR-STOCK $v - pick host=$($H.pick) join=$($J.pick) finalQty=$hq/$jq cash=$hc/$jc pairs=$pairs zeroRunMs=$zeroRunMax divRunMs=$divRunMax cashRunMs=$cashRunMax $detail"
-    return (Add-GateResult -Name "vendor_stock" -Status $v `
+    return (Add-GateResult -Name $gate -Status $v `
                 -Metrics @{ hostQty = $hq; joinQty = $jq; pairs = $pairs; zeroRunMs = $zeroRunMax
                             divRunMs = $divRunMax; cashRunMs = $cashRunMax; hostCash = $hc; joinCash = $jc
                             hostWallet = $H.wallet; joinWallet = $J.wallet } -Detail $detail)
+}
+
+# trade_lock (protocol 65): one player trades with a merchant at a time and the
+# holder's closing shop (the trade window's own stock + money) reaches the other
+# side. Script: join opens 8 s, buys 14 s, closes 20 s; host opens 12 s (must be
+# refused - "[trade] BUSY"), opens 26 s, buys 30 s, closes 34 s; join reopens
+# 38 s, closes 42 s. VSHOP is each side's shop at 1 Hz - readable only while that
+# side's trade window is open (n=-1 otherwise).
+function Test-TradeLock {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $read = {
+        param([string]$file)
+        $r = @{ shop = (New-Object System.Collections.ArrayList); buys = @(); busy = 0 }
+        if (-not (Test-Path $file)) { return $r }
+        foreach ($m in (Select-String -Path $file -Pattern 'SCENARIO VSHOP who=\w+ n=(-?\d+) qty=(-?\d+) money=(-?\d+) open=(\d) trunc=(\d) t=(\d+) items=(.*)$' -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            [void]$r.shop.Add(@{ n = [int]$g[1].Value; qty = [int]$g[2].Value; money = [int]$g[3].Value
+                                 open = [int]$g[4].Value; t = [long]$g[6].Value; items = $g[7].Value.Trim() })
+        }
+        foreach ($m in (Select-String -Path $file -Pattern 'SCENARIO VTBUY who=\w+ res=(-?\d+) qty=(-?\d+)' -ErrorAction SilentlyContinue)) {
+            $r.buys += @{ res = [int]$m.Matches[0].Groups[1].Value; qty = [int]$m.Matches[0].Groups[2].Value }
+        }
+        $r.busy = @(Select-String -Path $file -Pattern '\[trade\] BUSY' -ErrorAction SilentlyContinue).Count
+        return $r
+    }
+    $H = & $read $HostFile
+    $J = & $read $JoinFile
+    $at = {
+        param($series, [long]$lo, [long]$hi, [switch]$Last)
+        $s = @($series | Where-Object { $_.n -ge 0 -and $_.t -ge $lo -and $_.t -lt $hi })
+        if ($s.Count -eq 0) { return $null }
+        if ($Last) { return $s[$s.Count - 1] } else { return $s[0] }
+    }
+    $hb = @($H.buys | Where-Object { $_.res -eq 1 })
+    $jb = @($J.buys | Where-Object { $_.res -eq 1 })
+    if ($jb.Count -lt 1) { $why += "join shop buy failed ($(@($J.buys | ForEach-Object { $_.res }) -join ','))" }
+    if ($hb.Count -lt 1) { $why += "host shop buy failed ($(@($H.buys | ForEach-Object { $_.res }) -join ','))" }
+    if ($H.busy -lt 1) { $why += "host opened the trader the join held without being refused (no [trade] BUSY)" }
+
+    $jInit   = & $at $J.shop 9000 14000            # join's shop before its buy
+    $jLeft   = & $at $J.shop 15000 20000 -Last     # ... as the join left it
+    $hTaken  = & $at $H.shop 27000 30000           # host's shop after its own open, before its buy
+    $hFinal  = & $at $H.shop 31000 34000 -Last     # host's shop as it left it
+    $jFinal  = & $at $J.shop 39000 42000           # join's shop at its reopen
+    if ($null -eq $jLeft -or $null -eq $hTaken) { $why += "missing VSHOP samples (joinLeft/hostTaken)" }
+    elseif ($jLeft.items -ne $hTaken.items -or $jLeft.money -ne $hTaken.money) {
+        $why += "hand-over join->host failed: join left qty=$($jLeft.qty) money=$($jLeft.money), host opened on qty=$($hTaken.qty) money=$($hTaken.money)"
+    }
+    if ($null -eq $hFinal -or $null -eq $jFinal) { $why += "missing final VSHOP samples" }
+    elseif ($hFinal.items -ne $jFinal.items -or $hFinal.money -ne $jFinal.money) {
+        $why += "final shop diverged host qty=$($hFinal.qty) money=$($hFinal.money) / join qty=$($jFinal.qty) money=$($jFinal.money)"
+    }
+    if ($null -ne $jInit -and $null -ne $hFinal -and $jb.Count -ge 1 -and $hb.Count -ge 1) {
+        $want = $jInit.qty - $jb[0].qty - $hb[0].qty
+        if ($hFinal.qty -ne $want) { $why += "final qty $($hFinal.qty) != initial $($jInit.qty) - both purchases ($want)" }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    $fmt = { param($x) if ($null -eq $x) { "-" } else { "$($x.qty)/$($x.money)" } }
+    Write-Host "  TRADE-LOCK $v - busy=$($H.busy) joinInit=$(& $fmt $jInit) joinLeft=$(& $fmt $jLeft) hostTaken=$(& $fmt $hTaken) final=$(& $fmt $hFinal)|$(& $fmt $jFinal) $detail"
+    return (Add-GateResult -Name "trade_lock" -Status $v `
+                -Metrics @{ busy = $H.busy; hostBuys = $hb.Count; joinBuys = $jb.Count } -Detail $detail)
 }

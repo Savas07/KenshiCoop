@@ -2369,6 +2369,39 @@ unsigned int listTradersNear(GameWorld* gw, float radius, TraderRead* out,
 int openTradeWindow(const unsigned int buyerHand[5], const unsigned int traderHand[5]);
 // SEH-guarded: close any open trade window.
 void closeTradeWindow();
+// SEH-guarded probe (manual T1): every open inventory window - its key hand,
+// the hand of the Inventory's owner and its item count - plus the GUI's current
+// trade target (inventoryWindowTrader). Returns the window count written.
+struct InvWindowRead {
+    unsigned int key[5];    // inventoryWindowsOpen key
+    unsigned int owner[5];  // getInventory()->owner hand (0s if none)
+    int          items;     // getInventory()->_allItems.size(), -1 if no inventory
+};
+unsigned int readInventoryWindows(InvWindowRead* out, unsigned int maxOut,
+                                  unsigned int traderOut[5]);
+// ---- Trader lock + shop hand-over (protocol 65) ----------------------------
+// The trade window shows a ShopTrader's own aggregated Inventory (created lazily
+// when the window opens) and money - not the shop counters.
+// SEH-guarded: true while a trade window with a ShopTrader is open locally;
+// traderHand = that ShopTrader's trader CHARACTER (raw, save-stable hand).
+bool localTradeTarget(unsigned int traderHand[5]);
+// SEH-guarded: the shop of the trader character at traderHand - its stock
+// (top-level entries) and money. Found through the OPEN trade window (a
+// ShopTrader is non-physical; world queries miss it). Returns the entry count,
+// or -1 when that shop is not open / does not exist here.
+int captureTraderStock(GameWorld* gw, const unsigned int traderHand[5], InvItemEntry* out,
+                       unsigned int maxOut, int* outMoney, bool* outTruncated);
+// SEH-guarded: set the trader platoon's money, and make the shop hold exactly
+// `items` (additive-only when truncated). 1 applied, 0 money set but the shop
+// stock is not reachable (window closed) - apply again at the next open, -1 fault.
+int applyTraderStock(GameWorld* gw, const unsigned int traderHand[5], const InvItemEntry* items,
+                     unsigned int count, bool truncated, int money);
+// SEH-guarded (tests): buy the first loose stack of the trader's SHOP stock
+// (the trade window's own inventory) into buyerHand. 1 bought, 0 nothing to buy,
+// -1 no shop stock here (the window was never opened) / fault.
+int traderBuyOne(GameWorld* gw, const unsigned int traderHand[5],
+                 const unsigned int buyerHand[5], char* outSid, unsigned int sidLen,
+                 int* outQty);
 // SEH-guarded: ONE purchase exactly as the trade window performs it - the
 // engine's Inventory::buyItem on the stock container at srcHand (debits the
 // player pool, credits the shop, takes the stack out of stock), then the

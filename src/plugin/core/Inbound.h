@@ -189,6 +189,13 @@ struct InboundVendorCash {
     VendorCashPacket pkt;
 };
 
+// One received trader lock / shop hand-over op (protocol 65).
+struct InboundTrade {
+    u32                       ownerId; // == hdr.ownerId (WorldQ::eraseOwner)
+    TradeHeader               hdr;
+    std::vector<InvItemEntry> items;
+};
+
 // One received player-faction relation row (protocol 24): from the host it is
 // the authoritative row (the join applies it); from the join it is a forwarded
 // intent (the host applies it, then its own stream echoes the row back).
@@ -479,7 +486,7 @@ public:
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
-        vendorDelta_(worldReset_), vendorCash_(worldReset_),
+        vendorDelta_(worldReset_), vendorCash_(worldReset_), trade_(worldReset_),
         faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
         research_(worldReset_),   joinState_(worldReset_),  deed_(worldReset_),
@@ -638,6 +645,12 @@ public:
     void pushVendorCash(u32 ownerId, const VendorCashPacket& pkt) {
         InboundVendorCash ivc; ivc.ownerId = ownerId; ivc.pkt = pkt;
         EnterCriticalSection(&cs_); vendorCash_.push_back(ivc); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one trader lock / shop hand-over op (protocol 65).
+    void pushTrade(const TradeHeader& hdr, const InvItemEntry* items, unsigned int count) {
+        InboundTrade t; t.ownerId = hdr.ownerId; t.hdr = hdr;
+        if (items && count > 0) t.items.assign(items, items + count);
+        EnterCriticalSection(&cs_); trade_.push_back(t); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received faction-relation row (protocol 24), owner-tagged.
     void pushFaction(u32 ownerId, const FactionPacket& pkt) {
@@ -890,6 +903,9 @@ public:
     void drainVendorCash(std::deque<InboundVendorCash>& out) {
         EnterCriticalSection(&cs_); out.swap(vendorCash_); LeaveCriticalSection(&cs_);
     }
+    void drainTrade(std::deque<InboundTrade>& out) {
+        EnterCriticalSection(&cs_); out.swap(trade_); LeaveCriticalSection(&cs_);
+    }
     void drainStealth(std::deque<InboundStealth>& out) {
         EnterCriticalSection(&cs_); out.swap(stealth_); LeaveCriticalSection(&cs_);
     }
@@ -987,6 +1003,7 @@ private:
     WorldQ<InboundWorldRemove>     wir_;
     WorldQ<InboundWorldClaim>      wic_;
     WorldQ<InboundNativeTaken>     nativeTaken_;
+    WorldQ<InboundTrade>           trade_;
     WorldQ<InboundNpcCensus>       npcCensus_;
     WorldQ<InboundWorldDrop>       wd_;
     WorldQ<InboundInvXfer>         invXfer_;
