@@ -1555,6 +1555,90 @@ function Test-WorldItemBurst {
                             joinSpreadMs = $j.spread; limitMs = $j.limit; overflowed = $defer })
 }
 
+# gear_redrop (manual T8): the join's OWN gear drops must reach the host as they really happened.
+#   position - the re-dropped piece (carried >= 40 units from where it was picked up): the join's
+#              [wd] DROP and the host's [wd] APPLY must be within 10 units (XZ) of where the
+#              grounded object SETTLED. By hand it appeared at an old ground spot.
+#   identity - the host then picks that piece up; the join must hand over exactly that ground
+#              object: tab 1 still holds its base count of G and no G is left on the join's
+#              ground (join-checkA held=base ground=0). Naming the copy still in the bag gave the
+#              kept copy away and left the dropped one behind.
+#   strip    - tab 1 drops everything and ends with zero rows; every gear unit dropped in the strip
+#              needs a join DROP and a host APPLY moved=1 after it. By hand the last worn piece
+#              (pants) was never mirrored.
+# Missing scenario mechanics make the run inconclusive - reported as FAIL with the reason, never
+# as a pass.
+function Test-GearRedrop {
+    param([string]$HostFile, [string]$JoinFile)
+    $pre = @(); $fail = @()
+    $jl = if (Test-Path $JoinFile) { Get-Content $JoinFile } else { @() }
+    $hl = if (Test-Path $HostFile) { Get-Content $HostFile } else { @() }
+    $start   = $jl | Select-String -Pattern "WRDP start role=join have=1 sid='([^']+)' type=\d+ bagBase=(-?\d+) r1=(\S+)" | Select-Object -Last 1
+    $redrop  = $jl | Select-String -Pattern 'WRDP join-redrop n=(-?\d+) of=(\d+) held=-?\d+ owner=\S+ walked=([\d.]+)' | Select-Object -Last 1
+    $settled = $jl | Select-String -Pattern 'WRDP join-settled ok=1 pos=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)' | Select-Object -Last 1
+    $checkA  = $jl | Select-String -Pattern 'WRDP join-checkA held=(-?\d+) base=(-?\d+) ground=(-?\d+)' | Select-Object -Last 1
+    $strips  = @($jl | Select-String -Pattern "WRDP join-strip sid='([^']+)' type=\d+ gear=1 n=([1-9]\d*)")
+    $stripped = $jl | Select-String -Pattern 'WRDP join-stripped rows=(-?\d+)' | Select-Object -Last 1
+    $hpick   = $hl | Select-String -Pattern 'WRDP host-pick try=\d+ got=([1-9]\d*)' | Select-Object -Last 1
+    if ($null -eq $start) { $pre += "no join WRDP start (have=1)" }
+    if ($null -eq $redrop -or [int]$redrop.Matches[0].Groups[1].Value -le 0) { $pre += "join re-drop did not happen" }
+    elseif ([double]$redrop.Matches[0].Groups[3].Value -lt 40) { $pre += "join walked only $($redrop.Matches[0].Groups[3].Value) (< 40)" }
+    elseif ([int]$redrop.Matches[0].Groups[2].Value -lt 2) { $pre += "tab 1 listed only $($redrop.Matches[0].Groups[2].Value) copy at the re-drop: identity not stressed" }
+    if ($null -eq $settled) { $pre += "no settled position for the re-dropped object" }
+    if ($null -eq $hpick)   { $pre += "host never picked the re-dropped piece up" }
+    if ($null -eq $checkA)  { $pre += "no join-checkA" }
+    if ($null -eq $stripped -or [int]$stripped.Matches[0].Groups[1].Value -ne 0) { $pre += "strip did not leave tab 1 with zero rows" }
+    if ($strips.Count -eq 0) { $pre += "strip dropped no gear" }
+    if ($pre.Count -eq 0) {
+        $sid = $start.Matches[0].Groups[1].Value; $r1 = $start.Matches[0].Groups[3].Value
+        $ownerRx = [regex]::Escape($r1)
+        $P = @([double]$settled.Matches[0].Groups[1].Value, [double]$settled.Matches[0].Groups[3].Value)
+        $dist = { param($x, $z) [math]::Sqrt(($x - $P[0]) * ($x - $P[0]) + ($z - $P[1]) * ($z - $P[1])) }
+        # position: the join's first DROP of G by tab 1 after the re-drop line, and the host APPLY of
+        # that same drop id.
+        $jd = $jl | Select-String -Pattern ("\[wd\] DROP id=(\d+) sid='" + [regex]::Escape($sid) + "' owner=" + $ownerRx + " pos=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)") |
+              Where-Object { $_.LineNumber -ge $redrop.LineNumber } | Select-Object -First 1
+        if ($null -eq $jd) { $fail += "no join [wd] DROP of '$sid' after the re-drop" }
+        else {
+            $id = $jd.Matches[0].Groups[1].Value
+            $ha = $hl | Select-String -Pattern ("\[wd\] APPLY id=$id sid='" + [regex]::Escape($sid) + "' owner=" + $ownerRx + " moved=(\d+) pos=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)") | Select-Object -Last 1
+            if ($null -eq $ha) { $fail += "no host [wd] APPLY of drop id=$id" }
+            else {
+                $dj = & $dist ([double]$jd.Matches[0].Groups[2].Value) ([double]$jd.Matches[0].Groups[4].Value)
+                $dh = & $dist ([double]$ha.Matches[0].Groups[2].Value) ([double]$ha.Matches[0].Groups[4].Value)
+                $okP = ($dj -le 10) -and ($dh -le 10) -and ([int]$ha.Matches[0].Groups[1].Value -eq 1)
+                Write-Host (("  GEAR-REDROP position: joinDROP off={0:N1} hostAPPLY off={1:N1} moved=$($ha.Matches[0].Groups[1].Value) (want <= 10, moved=1) " -f $dj, $dh) + $(if ($okP) { "PASS" } else { "FAIL" }))
+                if (-not $okP) { $fail += "re-drop position/mirror" }
+            }
+        }
+        # identity
+        $held = [int]$checkA.Matches[0].Groups[1].Value; $base = [int]$checkA.Matches[0].Groups[2].Value
+        $grnd = [int]$checkA.Matches[0].Groups[3].Value
+        $okA = ($held -eq $base) -and ($grnd -eq 0)
+        Write-Host ("  GEAR-REDROP identity: join held=$held (want base $base) joinGround=$grnd (want 0) " + $(if ($okA) { "PASS" } else { "FAIL" }))
+        if (-not $okA) { $fail += "host pickup took the wrong object from the join" }
+        # strip: units per sid, then DROP (join, after the strip) and APPLY moved=1 (host, at or
+        # after the strip's wall-clock time) must cover them.
+        $t0 = $strips[0].Line.Substring(1, 12)
+        $want = @{}
+        foreach ($s in $strips) { $k = $s.Matches[0].Groups[1].Value; $want[$k] = [int]$want[$k] + [int]$s.Matches[0].Groups[2].Value }
+        foreach ($k in $want.Keys) {
+            $kr = [regex]::Escape($k)
+            $nd = @($jl | Select-String -Pattern ("\[wd\] DROP id=\d+ sid='" + $kr + "' owner=" + $ownerRx) | Where-Object { $_.LineNumber -ge $strips[0].LineNumber }).Count
+            $na = @($hl | Select-String -Pattern ("\[wd\] APPLY id=\d+ sid='" + $kr + "' owner=" + $ownerRx + " moved=1") | Where-Object { $_.Line.Substring(1, 12) -ge $t0 }).Count
+            $okS = ($nd -ge $want[$k]) -and ($na -ge $want[$k])
+            Write-Host ("  GEAR-REDROP strip '$k': dropped=$($want[$k]) joinDROP=$nd hostAPPLY=$na " + $(if ($okS) { "PASS" } else { "FAIL" }))
+            if (-not $okS) { $fail += "strip of '$k' not mirrored" }
+        }
+    }
+    foreach ($w in $pre)  { Write-Host "  GEAR-REDROP inconclusive - $w" }
+    foreach ($w in $fail) { Write-Host "  GEAR-REDROP FAIL - $w" }
+    $ok = ($pre.Count -eq 0) -and ($fail.Count -eq 0)
+    Write-Host ("  GEAR-REDROP " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "gear_redrop" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ failures = $fail.Count; inconclusive = $pre.Count })
+}
+
 # no_phantom_pickups (protocol 47): every W2 PICKUP intent must NAME the instance it is about
 # (ref=<dropOwner>/<dropId>, the identity both clients took from the DROP). ref=0/0 is the
 # phantom signature, and it was mass-produced two ways: the gear census read an increase it

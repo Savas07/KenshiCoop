@@ -1018,9 +1018,9 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
         for (unsigned int i = 0; i < nwp; ++i) curPtrs[std::string(wsids[i])].push_back(wptrs[i]);
 
         WCensus& prevC = weaponCensus_[*it];
-        // ZERO-ROW READ = NO INFORMATION. A container that yields NO rows at all is
-        // mid-reload / not fully resolved, not stripped, so nothing may be concluded from
-        // it - neither an edge NOR a baseline. Note the test is the RAW row count, not the
+        // ZERO-ROW READ = NO INFORMATION, AT FIRST. A container that yields NO rows at all is
+        // usually mid-reload / not fully resolved, not stripped, so nothing may be concluded
+        // from a single such read - neither an edge NOR a baseline. Note the test is the RAW row count, not the
         // gear-only census: a character who really does drop all their gear but still
         // carries food reads rows>0 with an empty gear map, and that IS a real full-strip
         // the drop pass must see (gating on the gear map hid it).
@@ -1046,14 +1046,22 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
                 continue;
             }
-            if (dumpWd) { char b[180]; _snprintf(b, sizeof(b) - 1,
-                "[wd] census-skip hand=%u,%u,%u,%u,%u (zero-row read #%u; seeded=%d had %u kinds)",
-                it->t, it->c, it->cs, it->i, it->s, prevC.zeroReads,
-                prevC.seeded ? 1 : 0, (unsigned)prevC.items.size());
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
-            continue;
+            // Seeded, and the empty read has REPEATED: the character really carries nothing now
+            // (manual T8 - worn pants were the last item, and every later read was zero rows, so
+            // the drop was never seen). Fall through with the empty census; the drop pass below
+            // still needs a ground copy or its full debounce before it authors anything, so a
+            // container that is merely slow to resolve has to stay empty far longer than this.
+            if (!prevC.seeded || prevC.zeroReads < WD_EMPTY_SEED_TICKS) {
+                if (dumpWd) { char b[180]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] census-skip hand=%u,%u,%u,%u,%u (zero-row read #%u; seeded=%d had %u kinds)",
+                    it->t, it->c, it->cs, it->i, it->s, prevC.zeroReads,
+                    prevC.seeded ? 1 : 0, (unsigned)prevC.items.size());
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                continue;
+            }
+        } else {
+            prevC.zeroReads = 0; // the read is trustworthy again
         }
-        prevC.zeroReads = 0; // the read is trustworthy again
         if (!prevC.seeded) {
             prevC.items = cur; prevC.ptrs = curPtrs; prevC.seeded = true; // baseline; never emit
             if (dumpWd) { char b[140]; _snprintf(b, sizeof(b) - 1,
@@ -1232,10 +1240,24 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
             } else {
                 prevC.retries.erase(pe->first); prevC.retryArmMs.erase(pe->first);
             }
-            // The departed weapon's REAL Item* is the prior tick's handle for this sid; after a
-            // UI drop it persists as the now-grounded object (conservation). Remember it so a
-            // later PICKUP intent re-homes this exact object without a spatial re-query.
-            std::deque<void*>& departed = prevC.ptrs[pe->first];
+            // The departed weapon's REAL Item* is a handle this bag held last tick and does NOT
+            // hold now; after a UI drop it persists as the now-grounded object (conservation).
+            // Remember it so a later PICKUP intent re-homes this exact object without a spatial
+            // re-query. It must be the handle that LEFT - not merely the oldest one: with two
+            // copies of a sid, the oldest can still be in the bag (manual T8: stillHeld=1), and
+            // naming it tracked the wrong object and authored the drop at that object's stale
+            // transform (its previous ground spot). No departed handle -> no tracking, never a guess.
+            std::deque<void*> departed;
+            {
+                std::set<void*> nowHeld;
+                std::map<std::string, std::deque<void*> >::iterator cp = curPtrs.find(pe->first);
+                if (cp != curPtrs.end())
+                    for (std::deque<void*>::iterator q = cp->second.begin(); q != cp->second.end(); ++q)
+                        nowHeld.insert(*q);
+                std::deque<void*>& was = prevC.ptrs[pe->first];
+                for (std::deque<void*>::iterator q = was.begin(); q != was.end(); ++q)
+                    if (nowHeld.count(*q) == 0) departed.push_back(*q);
+            }
             for (int d = 0; d < delta; ++d) {
                 void* di = departed.empty() ? 0 : departed.front();
                 // Prefer the REAL dropped object's position (the exact cursor-drop spot) over
@@ -1247,6 +1269,24 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                 if (di) { float ip[3]; if (engine::itemWorldPos(di, ip) &&
                           !(ip[0] == 0.0f && ip[1] == 0.0f && ip[2] == 0.0f)) {
                     dpos[0] = ip[0]; dpos[1] = ip[1]; dpos[2] = ip[2]; } }
+                if (dumpWd) {
+                    // Is the handle we are about to name as "the dropped object" still in this
+                    // bag (FIFO picked the wrong one)? And where is it versus the owner?
+                    int held = 0;
+                    std::map<std::string, std::deque<void*> >::iterator cp = curPtrs.find(pe->first);
+                    if (cp != curPtrs.end())
+                        for (std::deque<void*>::iterator q = cp->second.begin(); q != cp->second.end(); ++q)
+                            if (*q == di) { held = 1; break; }
+                    float ip[3] = { 0, 0, 0 }; float op[3] = { 0, 0, 0 };
+                    int iok = di ? engine::itemWorldPos(di, ip) : 0;
+                    int ook = engine::objectWorldPos(cHand, op);
+                    char b[260]; _snprintf(b, sizeof(b) - 1,
+                        "[wd] drop-src sid='%s' d=%d/%d item=%p stillHeld=%d departed=%u "
+                        "itemPos(%d)=%.2f,%.2f,%.2f ownerPos(%d)=%.2f,%.2f,%.2f onGround=%d",
+                        pe->first.c_str(), d + 1, delta, di, held, (unsigned)departed.size(),
+                        iok, ip[0], ip[1], ip[2], ook, op[0], op[1], op[2], onGround ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
                 WorldDropPacket pkt; memset(&pkt, 0, sizeof(pkt));
                 pkt.type = (u8)PKT_WORLD_DROP; pkt.ownerId = ownerId; pkt.dropId = nextDropId_++;
                 pkt.oType = it->t; pkt.oContainer = it->c; pkt.oContainerSerial = it->cs;

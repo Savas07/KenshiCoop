@@ -2435,6 +2435,18 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $false
         }
+        # gear_redrop gates the join's OWN gear drops (manual T8): a picked-up piece re-dropped
+        # after walking away must appear on the host where it really lies (it appeared at its old
+        # ground spot), and a worn armour piece dropped straight from its slot must be mirrored at
+        # all (it never was). Two tabs required (host tab 0 drops, join tab 1 picks up/re-drops).
+        gear_redrop = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'gear_redrop'
+            Gating   = @('gear_redrop', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
         # Same round trip with the author's FIRST re-home refused. That is the case that
         # used to strand the item in both places forever - the author tried once, off a
         # cached pointer, and never revisited it. Now it retries and, once it can READ the
