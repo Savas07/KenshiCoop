@@ -1298,6 +1298,11 @@ bool isBuildSiteTask(int taskKey);
 // output the host simulates, so a copy that stopped working stops production.
 bool isMachineWorkTask(int taskKey);
 
+// True for MOVE_ON_FREE_WILL - the body's own AI walk (patrol, return to post).
+// A peer-driven squad copy never chooses one itself once its AI is suspended, so
+// one still running is left over from before it was recruited.
+bool isFreeWillMoveTask(int taskKey);
+
 // AI-gating probe lever: recruit a world NPC into the local player's squad (the
 // "inhabit" path) so it stops self-assigning town tasks and obeys our drive.
 // Join-side only. Returns the engine's recruit() result (false if unresolved).

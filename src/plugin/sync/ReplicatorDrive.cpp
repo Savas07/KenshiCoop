@@ -980,13 +980,27 @@ void Replicator::applyTargets(GameWorld* gw) {
         // gap 108 u) or crawled at the action's pace (rj_after2: 15 u/s vs 55).
         // Once the OWNER moves with no task of its own, the pose is stale: end
         // it, forget the applied pose, and re-issue the walk at once.
+        // A leftover MOVE_ON_FREE_WILL is the same staleness for a free-standing
+        // recruit: the host's copy of a JOIN recruit was a host NPC with live AI
+        // up to the recruit (a guard walking back to its post), the suspend only
+        // stops NEW decisions, and that walk kept steering the body back at walk
+        // pace against our orders - 150 u behind the running owner and a hard
+        // snap every ~1.5 s (recruit_run: medGap 84 u, 11 snaps; the join's copy
+        // of a host recruit, driven all along, never has one: 7.8 u, 0 snaps).
+        // Once per drive: far from this client's own squad the engine re-issues a
+        // free-will move for a driven copy on its own (run_apart: the host tab's
+        // copies 118k u away re-gained one within 500 ms of every heal, 109 heals),
+        // so re-ending it only churns - the walk the body brought INTO the drive
+        // is the stale one.
         if (isSquad && out.cMoving != 0 && out.task == TASK_NONE &&
             (now - d.poseHealTick) >= POSE_HEAL_MS) {
             int lt = engine::readTaskKey(c);
-            bool stalePose = engine::taskIsSeatPose(lt) ||
+            bool freeWill  = !d.freeWillHealed && engine::isFreeWillMoveTask(lt);
+            bool stalePose = engine::taskIsSeatPose(lt) || freeWill ||
                              (d.issuedTask != TASK_NONE && lt == (int)d.issuedTask);
             if (stalePose && !coop::bodyIsDown(engine::readBodyState(c))) {
                 d.poseHealTick = now;
+                if (freeWill) d.freeWillHealed = true;
                 bool ok = engine::endAction(c);
                 d.taskApplied = false; d.taskBad = false; d.taskRetries = 0;
                 d.issuedTask = TASK_NONE; d.taskNoneTick = 0;
