@@ -169,6 +169,7 @@ function Invoke-OneOracle {
         "prod_sync"      { return (Test-ProdSync       -HostFile $HostLog -JoinFile $JoinLog) }
         "research_probe" { return (Test-ResearchProbe  -HostFile $HostLog -JoinFile $JoinLog) }
         "research_sync"  { return (Test-ResearchSync   -HostFile $HostLog -JoinFile $JoinLog) }
+        "research_cost"  { return (Test-ResearchCost   -HostFile $HostLog -JoinFile $JoinLog) }
         "store_probe"    { return (Test-StoreProbe     -HostFile $HostLog -JoinFile $JoinLog) }
         "store_sync"     { return (Test-StoreSync      -HostFile $HostLog -JoinFile $JoinLog) }
         "squad_probe"    { return (Test-SquadProbe     -HostFile $HostLog -JoinFile $JoinLog) }

@@ -1129,6 +1129,14 @@ int researchStartBySid(GameWorld* gw, const char* sid);
 // canResearch (gamedata enumeration order is shared, so every client picks the
 // same sid). Returns 1 picked / 0 none / -1 fault.
 int researchPickSubject(GameWorld* gw, char* outSid, unsigned int outLen);
+// research_cost scenario subject: the FIRST RESEARCH record that is not known,
+// canResearch, and has a "cost" reference list (enumeration order is shared, so
+// both clients pick the same). Writes its sid and the first cost item's sid +
+// count. Research::startResearch does NOT pay this cost (#84 spike, rb_spike3) -
+// the research UI's click handler takes it out of the bench first.
+// Returns 1 picked / 0 none / -1 fault.
+int researchPickCostSubject(GameWorld* gw, char* rsid, unsigned int rcap, char* costSid,
+                            unsigned int cap, int* costQty);
 // Enumerate every RESEARCH GameData: log the first maxLog rows (sid, name,
 // known, can) plus a total/known summary. Returns the total record count.
 unsigned int probeResearchEnum(GameWorld* gw, unsigned int maxLog);
@@ -1140,7 +1148,8 @@ unsigned int researchEnumKnown(GameWorld* gw, char* outSids,
                                unsigned int sidCap, unsigned int maxN);
 // Research-bench read beyond ProdRead: techLevel (getTechLevel), the
 // UseableStuff progress-bar float (0x3A4 - candidate bench-local progress
-// scalar) and the power bit. Returns 1 ok / 0 not a research bench / -1 fault.
+// scalar) and the power bit. Returns 1 ok / 0 not a research bench (incl. any
+// non-BUILDING hand, e.g. a character's inventory key) / -1 fault.
 int probeResearchBenchRead(const unsigned int mHand[5], int* outTech,
                            float* outProg, int* outPower);
 

@@ -1135,6 +1135,12 @@ void Replicator::publishResearch(const SyncContext& ctx) {
     for (unsigned int i = 0; i < n; ++i) {
         const char* sid = sids + (size_t)i * SID_CAP;
         ResearchRow& rr = researchRows_[std::string(sid)];
+        // Protocol 63 (symmetric union): a join publishes only what it knows that
+        // the wire never told it - its own research. A row the host sent (applied
+        // here, or already known when it arrived) is the host's ack, so the
+        // join's resends for its own research stop once the host echoes it. The
+        // host publishes everything: it is the relay to every other join.
+        if (!ctx.isHost && rr.applied) continue;
         bool first  = !rr.sent;
         // Known-set membership is monotonic (no value to diff): send on first
         // sight then resend periodically. No silent seed -> resendUnsent=true.
@@ -1842,7 +1848,10 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         // so a pairing that arrives this tick is usable by the very next row.
         { &Replicator::fixtureSync_,  0,                     &Replicator::publishFixtures,   &Replicator::applyFixtures,   false },
         { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
-        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  },
+        // Protocol 63: research is a grow-only UNION (adapted from upstream PR
+        // #21) - a join's research reaches the host, whose save is the one that
+        // persists. applyResearch skips known sids, so an echo dies in one hop.
+        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   false },
         { &Replicator::deedSync_,     0,                     &Replicator::publishDeeds,      &Replicator::applyDeeds,      false }
     };
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));

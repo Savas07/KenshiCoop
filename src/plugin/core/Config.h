@@ -520,15 +520,16 @@ struct Config {
     bool          prodSync;
 
     // KENSHICOOP_RESEARCH_SYNC (default ON): research tech-tree sync
-    // (protocol 38) - the HOST samples its Research store's known set ~1 Hz
-    // (Research::isKnown over the shared RESEARCH GameData enumeration) and
-    // streams one reliable PKT_RESEARCH row per known stringID (first sight
-    // is the session baseline, then a safety resend); the join applies each
-    // row via Research::startResearch - idempotent against already-known
-    // sids. Without it the tech tree is per-client: a tech the host
-    // researches never unlocks on the join (spike 401). Forced OFF for
-    // research_probe (it measures the unsynced baseline). "0" is the A/B
-    // escape hatch.
+    // (protocol 38; protocol 63: a grow-only UNION) - BOTH clients sample their
+    // Research store's known set ~1 Hz (Research::isKnown over the shared
+    // RESEARCH GameData enumeration) and stream one reliable PKT_RESEARCH row
+    // per known stringID (a join only its own research; the host everything,
+    // relaying); the receiver applies each row via Research::startResearch -
+    // idempotent against already-known sids. Protocol 63 also sends a join's
+    // research-bench changes (the tech cost the research UI pays out of the
+    // bench) to the host as protocol-60 deltas (upstream #84). Without it the
+    // tech tree is per-client (spike 401). Forced OFF for research_probe (it
+    // measures the unsynced baseline). "0" is the A/B escape hatch.
     bool          researchSync;
 
     // KENSHICOOP_DEED_SYNC (default ON): property-deed sync (protocol 54) -

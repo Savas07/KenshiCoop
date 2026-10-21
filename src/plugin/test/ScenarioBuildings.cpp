@@ -1132,6 +1132,151 @@ private:
     char          sid_[48];
 };
 
+// research_cost (upstream #84, protocol 63): a research started on the JOIN must
+// pay its cost on the host's bench and unlock on the host. The research UI pays
+// a tech's "cost" items out of the bench and then calls Research::startResearch,
+// which pays nothing itself (rb_spike3) - so the join replays exactly that click:
+// remove the cost from its copy of the bench, then startResearch.
+// Script: host places + completes a research bench (no fixture has one) 8 m ahead
+// (t=4 s / t=7 s); both pick the same subject (first not-known, researchable tech
+// with a cost list) at t=10 s; host seeds 2x the cost into the bench at t=12 s;
+// the join clicks at t=24 s; both sample the bench + known 1 Hz to t=60 s.
+// Pass: host bench ends at seeded-qty AND the host knows the tech; join's click
+// paid qty, its bench ends at (count before click)-qty AND it knows the tech.
+// RESCOST log contract (Test-ResearchCost).
+class ResearchCostScenario : public TimedScenario {
+public:
+    ResearchCostScenario() : TimedScenario("research_cost", 0), haveBench_(false),
+                             placeRc_(-9), ramped_(false), pickRc_(-9), type_(0), qty_(0),
+                             seeded_(-1), pre_(-1), removed_(-1), startRc_(-9), maxAfter_(-1),
+                             samples_(0), lastSampleMs_(0), lastScanMs_(0) {
+        memset(bench_, 0, sizeof(bench_)); rsid_[0] = cost_[0] = '\0';
+    }
+    virtual void onStart(const ScenarioContext& ctx) {
+        char b[64]; _snprintf(b, sizeof(b) - 1, "RESCOST start role=%s",
+                              ctx.isHost ? "host" : "join");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    virtual bool onTick(const ScenarioContext& ctx) {
+        unsigned long t = ctx.elapsedMs;
+        if (ctx.isHost && placeRc_ == -9 && t >= 4000) {
+            char bsid[48]; bsid[0] = '\0';
+            placeRc_ = engine::probePlaceMachine(ctx.gw, 8.0f, 0.0f, 3, bench_, bsid, sizeof(bsid));
+            haveBench_ = placeRc_ == 1;
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "RESCOST bench role=host place=%d sid='%s' hand=%u,%u,%u,%u,%u", placeRc_, bsid,
+                bench_[0], bench_[1], bench_[2], bench_[3], bench_[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (ctx.isHost && haveBench_ && !ramped_ && t >= 7000) {
+            ramped_ = true;
+            engine::BuildRead post;
+            engine::writeBuildProgressByHand(bench_, 1.0f, true, &post);
+        }
+        if (!ctx.isHost && !haveBench_ && t >= 8000 && t - lastScanMs_ >= 1000) {
+            lastScanMs_ = t;
+            engine::ProdRead rows[48];
+            unsigned int n = engine::enumMachinesNear(ctx.gw, 200.0f, rows, 48);
+            for (unsigned int i = 0; i < n && !haveBench_; ++i)
+                if (rows[i].classType == 5 /*BCTYPE_RESEARCH*/) {
+                    memcpy(bench_, rows[i].hand, sizeof(bench_)); haveBench_ = true;
+                }
+            if (haveBench_) {
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "RESCOST bench role=join hand=%u,%u,%u,%u,%u",
+                    bench_[0], bench_[1], bench_[2], bench_[3], bench_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (pickRc_ == -9 && t >= 10000) {
+            pickRc_ = engine::researchPickCostSubject(ctx.gw, rsid_, sizeof(rsid_), cost_,
+                                                      sizeof(cost_), &qty_);
+            char res[48]; res[0] = '\0';
+            if (pickRc_ == 1 && !(engine::commonItemTemplate(ctx.gw, res, sizeof(res), &type_, cost_)
+                                  && strcmp(res, cost_) == 0))
+                pickRc_ = 0; // the cost item is not an ITEM template we can seed
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "RESCOST pick role=%s rc=%d rsid='%s' cost='%s' type=%u qty=%d",
+                ctx.isHost ? "host" : "join", pickRc_, rsid_, cost_, type_, qty_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        bool ready = haveBench_ && pickRc_ == 1;
+        if (ctx.isHost && ready && ramped_ && seeded_ < 0 && t >= 12000) {
+            seeded_ = engine::addItemsToContainerBySid(ctx.gw, bench_, cost_, type_, 2 * qty_,
+                                                       0, 0, 0);
+            char b[96]; _snprintf(b, sizeof(b) - 1, "RESCOST seed got=%d now=%d", seeded_,
+                                  books(ctx));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (!ctx.isHost && ready && removed_ < 0 && t >= 24000) {
+            pre_ = books(ctx);
+            removed_ = engine::removeItemsFromContainerBySid(ctx.gw, bench_, cost_, type_, qty_);
+            startRc_ = engine::researchStartBySid(ctx.gw, rsid_);
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "RESCOST click pre=%d removed=%d start=%d now=%d", pre_, removed_, startRc_,
+                books(ctx));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (ready && t - lastSampleMs_ >= 1000) {
+            lastSampleMs_ = t;
+            int n = books(ctx), k = known(ctx);
+            ++samples_;
+            if (removed_ >= 0 && n > maxAfter_) maxAfter_ = n;
+            char b[128]; _snprintf(b, sizeof(b) - 1, "RESCOST %s t=%lu books=%d known=%d",
+                                   ctx.isHost ? "host" : "join", t, n, k);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (t >= DURATION_MS) { verdict(ctx); return true; }
+        if (t >= 16000 && !ready) { verdict(ctx); return true; } // setup never landed
+        return false;
+    }
+private:
+    int books(const ScenarioContext& ctx) const {
+        InvItemEntry it[64];
+        unsigned int n = engine::captureContainerContents(ctx.gw, bench_, it, 64, 0);
+        int q = 0;
+        for (unsigned int i = 0; i < n; ++i)
+            if (it[i].itemType == type_ && strcmp(it[i].stringID, cost_) == 0)
+                q += it[i].quantity < 1 ? 1 : it[i].quantity;
+        return q;
+    }
+    int known(const ScenarioContext& ctx) const {
+        int k = -1, c = -1;
+        engine::researchQueryBySid(ctx.gw, rsid_, &k, &c);
+        return k;
+    }
+    void verdict(const ScenarioContext& ctx) {
+        bool ready = haveBench_ && pickRc_ == 1;
+        int fin = ready ? books(ctx) : -1, k = ready ? known(ctx) : -1;
+        int want = -1;
+        const char* why = "ok";
+        if (!ready) why = haveBench_ ? "no-subject" : "no-bench";
+        else if (ctx.isHost) {
+            want = seeded_ - qty_;
+            if (seeded_ != 2 * qty_) why = "seed";
+            else if (fin != want) why = "host-bench";
+            else if (k != 1) why = "host-unknown";
+        } else {
+            want = pre_ - qty_;
+            if (removed_ != qty_ || startRc_ != 1) why = "click";
+            else if (fin != want) why = "join-bench";
+            else if (k != 1) why = "join-unknown";
+        }
+        passed_ = strcmp(why, "ok") == 0;
+        char b[320]; _snprintf(b, sizeof(b) - 1,
+            "RESCOST verdict role=%s pass=%d why=%s rsid='%s' cost='%s' qty=%d seeded=%d pre=%d "
+            "removed=%d start=%d finalBooks=%d want=%d maxAfter=%d known=%d samples=%d",
+            ctx.isHost ? "host" : "join", passed_ ? 1 : 0, why, rsid_, cost_, qty_, seeded_,
+            pre_, removed_, startRc_, fin, want, maxAfter_, k, samples_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    static const unsigned long DURATION_MS = 60000;
+    bool haveBench_; int placeRc_; bool ramped_; int pickRc_; unsigned int type_; int qty_;
+    int seeded_, pre_, removed_, startRc_, maxAfter_, samples_;
+    unsigned long lastSampleMs_, lastScanMs_;
+    unsigned int bench_[5]; char rsid_[48], cost_[48];
+};
+
 // store_probe (protocol 34 phase 0, probe tier; storeSync forced OFF, the
 // protocol-27 mint channel deliberately ON so host-placed buildings exist on
 // both sides) / store_sync (probe=false, full tier; storeSync ON). Storage
@@ -1514,6 +1659,7 @@ Scenario* makeBuildingScenario(const std::string& name) {
     if (name == "prod_sync")      return new ProdProbeScenario(false);
     if (name == "research_probe") return new ResearchProbeScenario(true);
     if (name == "research_sync")  return new ResearchProbeScenario(false);
+    if (name == "research_cost")  return new ResearchCostScenario();
     if (name == "store_probe")    return new StoreProbeScenario(true);
     if (name == "store_sync")     return new StoreProbeScenario(false);
     return 0;

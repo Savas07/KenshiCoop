@@ -1976,9 +1976,11 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         if (g_cfg.xferSync)
             g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId());
         // Protocol 60 (join): a local trade with a shop whose counters the host
-        // mirrors goes back to the host as per-item counter changes.
-        if (g_cfg.invSync && g_cfg.vendorSync) {
+        // mirrors goes back to the host as per-item counter changes. Protocol 63:
+        // so does a research start's cost paid out of a mirrored research bench.
+        if (g_cfg.invSync && (g_cfg.vendorSync || g_cfg.researchSync))
             g_repl.detectAndPublishVendorDeltas(gw, g_net, g_net.localId());
+        if (g_cfg.invSync && g_cfg.vendorSync) {
             // Protocol 60 (host): the merchant cash of every mirrored shop.
             g_repl.publishVendorCash(gw, g_net, g_net.localId());
         }
@@ -2194,9 +2196,10 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
             g_repl.applyXferAcks(gw, g_inbound, g_net.localId());
         }
         // Protocol 60 (host): the joins' trades land in the real shop stock before
-        // the census captures it again.
-        if (g_cfg.vendorSync) {
+        // the census captures it again (protocol 63: research-bench costs too).
+        if (g_cfg.vendorSync || g_cfg.researchSync)
             g_repl.applyVendorDeltas(gw, g_inbound);
+        if (g_cfg.vendorSync) {
             // Protocol 60 (join): the host's merchant cash.
             g_repl.applyVendorCash(gw, g_inbound);
         }

@@ -2625,6 +2625,41 @@ function Test-ResearchSync {
                 -Metrics @{ crossMs = $crossMs; sent = $sent.Count; applied = $recv.Count } -Detail $detail)
 }
 
+# research_cost (upstream #84, protocol 63): a research the JOIN starts must pay
+# its cost on the host's bench and unlock on the host. Reads each side's
+# RESCOST verdict; the trace shows which leg moved ([research] COST SEND on the
+# join, [research] COST APPLY on the host, the host's [research] RECV).
+function Test-ResearchCost {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $re = "RESCOST verdict role=(\w+) pass=(\d) why=(\S+) rsid='([^']*)' cost='([^']*)' qty=(-?\d+) " +
+          "seeded=(-?\d+) pre=(-?\d+) removed=(-?\d+) start=(-?\d+) finalBooks=(-?\d+) want=(-?\d+) " +
+          "maxAfter=(-?\d+) known=(-?\d+)"
+    $subj = @{}
+    foreach ($pair in @(@($HostFile, 'host'), @($JoinFile, 'join'))) {
+        $m = Select-String -Path $pair[0] -Pattern $re -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $m) { $why += "$($pair[1]) never logged its RESCOST verdict"; continue }
+        $g = $m.Matches[0].Groups
+        $subj[$pair[1]] = $g[4].Value
+        $line = ("    FINDING: {0} why={1} rsid='{2}' cost='{3}' qty={4} seeded={5} pre={6} removed={7} " +
+                 "final={8} want={9} maxAfter={10} known={11}") -f $pair[1], $g[3].Value, $g[4].Value,
+                 $g[5].Value, $g[6].Value, $g[7].Value, $g[8].Value, $g[9].Value, $g[11].Value,
+                 $g[12].Value, $g[13].Value, $g[14].Value
+        Write-Host $line
+        if ($g[2].Value -ne '1') { $why += "$($pair[1]) $($g[3].Value) (final=$($g[11].Value) want=$($g[12].Value) known=$($g[14].Value))" }
+    }
+    if ($subj.Count -eq 2 -and $subj['host'] -ne $subj['join']) { $why += "subject sids differ" }
+    $send  = @(Select-String -Path $JoinFile -Pattern '\[research\] COST SEND ' -ErrorAction SilentlyContinue)
+    $apply = @(Select-String -Path $HostFile -Pattern '\[research\] COST APPLY ' -ErrorAction SilentlyContinue)
+    $recv  = @(Select-String -Path $HostFile -Pattern '\[research\] RECV sid=' -ErrorAction SilentlyContinue)
+    Write-Host "    FINDING: join COST SEND=$($send.Count) host COST APPLY=$($apply.Count) host research RECV=$($recv.Count)"
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  RESEARCH-COST $v - $detail"
+    return (Add-GateResult -Name "research_cost" -Status $v `
+                -Metrics @{ costSend = $send.Count; costApply = $apply.Count; hostRecv = $recv.Count } -Detail $detail)
+}
+
 # Parse the 1 Hz SCENARIO CONT container census into hand -> ordered samples
 # @{class; complete; inv; n; qty; hash; firstSid; firstQty; sid; name; t}
 # (protocol 34).

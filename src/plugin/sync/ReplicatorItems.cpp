@@ -258,7 +258,10 @@ void Replicator::applyInventories(GameWorld* gw) {
         // the host. Defer until it is sent + latched (the detector settles in
         // ~1 s); on deadline fall through. Shop keys never enter the protocol-37
         // detector, so xferDefer_ is free to time this defer.
-        if (it->second.shop && vendorSync_ && vendorUnreported(gw, k, cHand)) {
+        // Protocol 63: a research bench is the same case (a research start's
+        // cost payment still settling), so the test is deltaMirror.
+        if (it->second.bench == BENCH_UNKNOWN) classifyBench(k, it->second);
+        if (deltaMirror(it->second) && vendorUnreported(gw, k, cHand)) {
             const unsigned long VENDOR_DEFER_MS = 3000;
             unsigned long now = nowMs();
             unsigned long& since = xferDefer_[k];
@@ -272,7 +275,7 @@ void Replicator::applyInventories(GameWorld* gw) {
                 k.t, k.c, k.cs, k.i, k.s);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
-        if (it->second.shop) xferDefer_.erase(k);
+        if (it->second.shop || deltaMirror(it->second)) xferDefer_.erase(k);
         const InvItemEntry* items = it->second.items.empty() ? 0 : &it->second.items[0];
         unsigned int n = (unsigned int)it->second.items.size();
         // Protocol 37 (the race that blinded the detector in run 141024): if this
@@ -390,9 +393,9 @@ void Replicator::applyInventories(GameWorld* gw) {
             n = (unsigned int)adj.size();
         }
         engine::applyContainerContents(gw, cHand, items, n, it->second.truncated);
-        // Keep the transfer detector (or, for a mirrored shop counter, the
-        // vendor detector) blind to the reconcile we just performed.
-        if (it->second.shop && vendorSync_) vendorRebase(gw, k, cHand);
+        // Keep the transfer detector (or, for a mirrored shop counter / research
+        // bench, the vendor detector) blind to the reconcile we just performed.
+        if (deltaMirror(it->second)) vendorRebase(gw, k, cHand);
         else xferRebase(gw, k);
         char b[160];
         _snprintf(b, sizeof(b) - 1,
@@ -1807,8 +1810,9 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     // Protocol 60: a mirrored shop counter is the vendor detector's - a purchase
     // pairs its loss with the buyer's gain exactly like a drag, and authoring it
     // here as well would take the item out of the host's stock twice.
+    // Protocol 63: so is a mirrored research bench (deltaMirror).
     for (std::map<Key, InvRecv>::iterator ri = invRecv_.begin(); ri != invRecv_.end(); ++ri)
-        if (!(ri->second.shop && vendorSync_)) tracked.insert(ri->first);
+        if (!deltaMirror(ri->second)) tracked.insert(ri->first);
     if (tracked.empty()) return;
 
     // Capture this scan's per-item totals for each resolvable container.
@@ -2176,6 +2180,23 @@ void Replicator::vendorTotals(GameWorld* gw, const unsigned int cHand[5],
     }
 }
 
+// Protocol 63: decide once whether a mirrored container is a research bench. Its
+// class is static, so the verdict sticks; an unresolvable hand stays unknown and
+// is retried. A bench leaves the transfer detector's books - from here on the
+// vendor detector diffs it (deltaMirror), and stale protocol-37 baselines/pends
+// for it would only defer applies against a picture nobody updates.
+void Replicator::classifyBench(const Key& k, InvRecv& r) {
+    unsigned int h[5];
+    handForContainerKey(k, h, r.ownerId);
+    if (engine::resolveObjectByHand(h) == 0) return;
+    int tech = 0, power = 0; float prog = 0.0f;
+    int rc = engine::probeResearchBenchRead(h, &tech, &prog, &power);
+    if (rc < 0) return; // fault: retry on the next snapshot
+    r.bench = (rc == 1) ? (unsigned char)BENCH_RESEARCH : (unsigned char)BENCH_OTHER;
+    if (r.bench != BENCH_RESEARCH) return;
+    xferBase_.erase(k); xferPend_.erase(k); xferSeeded_.erase(k);
+}
+
 // The host just put this counter in a known state: that is the baseline every
 // later local change is measured against.
 void Replicator::vendorRebase(GameWorld* gw, const Key& k, const unsigned int cHand[5]) {
@@ -2198,7 +2219,7 @@ bool Replicator::vendorRefreshGated(unsigned int platContainer, unsigned int pla
 }
 
 void Replicator::detectAndPublishVendorDeltas(GameWorld* gw, NetLink& net, u32 ownerId) {
-    if (!vendorSync_ || isHostRole()) return;
+    if ((!vendorSync_ && !researchSync_) || isHostRole()) return;
     const unsigned long SCAN_MS   = 400;   // detector cadence (the protocol-37 one)
     const unsigned long SETTLE_MS = 600;   // a stack on the trade cursor is not a trade yet
     const unsigned long GRACE_MS  = 10000; // latch lifetime (the host answers by snapshot)
@@ -2209,10 +2230,20 @@ void Replicator::detectAndPublishVendorDeltas(GameWorld* gw, NetLink& net, u32 o
     vendorOwners_.clear();
     std::set<ShopKey> cashSeen; // one cash check per shop, however many counters
     for (std::map<Key, InvRecv>::iterator ri = invRecv_.begin(); ri != invRecv_.end(); ++ri) {
-        if (!ri->second.shop) continue;
+        bool shop = ri->second.shop && vendorSync_;
+        if (!shop && !deltaMirror(ri->second)) continue; // else: a research bench
         const Key& k = ri->first;
         unsigned int cHand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        // A bench may be a session-placed building: our key is then OUR hand for
+        // it - resolve through the pairing, and report in the placer's key space
+        // (the host's own hand when the host placed it).
+        Key wk = k;
+        if (!shop) {
+            handForContainerKey(k, cHand, ri->second.ownerId);
+            buildKeyForLocalHand(k, wk);
+        }
         if (engine::resolveObjectByHand(cHand) == 0) continue;
+        if (shop) {
         unsigned int owner[5];
         if (!engine::readShopCounterOwner(cHand, owner)) continue;
         ShopKey sk((u32)owner[1], (u32)owner[2]);
@@ -2248,6 +2279,7 @@ void Replicator::detectAndPublishVendorDeltas(GameWorld* gw, NetLink& net, u32 o
                 }
             }
         }
+        } // shop
         std::map<Key, std::map<XKey, int> >::iterator bi = vendorBase_.find(k);
         if (bi == vendorBase_.end()) continue; // not applied yet: no baseline to diff
         std::map<XKey, int> cur;
@@ -2273,8 +2305,8 @@ void Replicator::detectAndPublishVendorDeltas(GameWorld* gw, NetLink& net, u32 o
             VendorDeltaPacket pkt; memset(&pkt, 0, sizeof(pkt));
             pkt.type = (u8)PKT_VENDOR_DELTA; pkt.ownerId = ownerId;
             pkt.deltaId = nextVendorDeltaId_++;
-            pkt.cType = k.t; pkt.cContainer = k.c; pkt.cContainerSerial = k.cs;
-            pkt.cIndex = k.i; pkt.cSerial = k.s;
+            pkt.cType = wk.t; pkt.cContainer = wk.c; pkt.cContainerSerial = wk.cs;
+            pkt.cIndex = wk.i; pkt.cSerial = wk.s;
             strncpy(pkt.stringID, ky->first.c_str(), sizeof(pkt.stringID) - 1);
             pkt.itemType = ky->second;
             pkt.delta = delta;
@@ -2300,9 +2332,17 @@ void Replicator::detectAndPublishVendorDeltas(GameWorld* gw, NetLink& net, u32 o
             XferLatch& L = xferLatch_[k][*ky];
             L.delta += delta; L.deadlineMs = now + GRACE_MS;
             if (L.delta == 0) xferLatch_[k].erase(*ky);
-            char b[224]; _snprintf(b, sizeof(b) - 1,
-                "[vendor] DELTA SEND id=%u counter=%u,%u,%u,%u,%u sid='%s' type=%u delta=%d",
-                pkt.deltaId, k.t, k.c, k.cs, k.i, k.s, pkt.stringID, pkt.itemType, delta);
+            char b[256];
+            if (shop)
+                _snprintf(b, sizeof(b) - 1,
+                    "[vendor] DELTA SEND id=%u counter=%u,%u,%u,%u,%u sid='%s' type=%u delta=%d",
+                    pkt.deltaId, k.t, k.c, k.cs, k.i, k.s, pkt.stringID, pkt.itemType, delta);
+            else
+                _snprintf(b, sizeof(b) - 1,
+                    "[research] COST SEND id=%u bench=%u,%u,%u,%u,%u wire=%u,%u,%u,%u,%u "
+                    "sid='%s' type=%u delta=%d",
+                    pkt.deltaId, k.t, k.c, k.cs, k.i, k.s, wk.t, wk.c, wk.cs, wk.i, wk.s,
+                    pkt.stringID, pkt.itemType, delta);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
         if (pend.empty()) vendorPend_.erase(k);
@@ -2312,7 +2352,7 @@ void Replicator::detectAndPublishVendorDeltas(GameWorld* gw, NetLink& net, u32 o
 void Replicator::applyVendorDeltas(GameWorld* gw, Inbound& in) {
     std::deque<InboundVendorDelta> got;
     in.drainVendorDeltas(got);
-    if (got.empty() || !vendorSync_ || !isHostRole()) return;
+    if (got.empty() || (!vendorSync_ && !researchSync_) || !isHostRole()) return;
     for (std::deque<InboundVendorDelta>::iterator it = got.begin(); it != got.end(); ++it) {
         const VendorDeltaPacket& p = it->pkt;
         std::pair<u32, u32> id(p.ownerId, p.deltaId);
@@ -2320,6 +2360,27 @@ void Replicator::applyVendorDeltas(GameWorld* gw, Inbound& in) {
         appliedVendorDeltas_.insert(id);
         if (appliedVendorDeltas_.size() > 4096) appliedVendorDeltas_.erase(appliedVendorDeltas_.begin());
         unsigned int cHand[5] = { p.cType, p.cContainer, p.cContainerSerial, p.cIndex, p.cSerial };
+        // Protocol 63: a research bench's key is in the placer's hand space - map
+        // it to ours (fixture pairing, else build map). Only a bench that really
+        // is a research bench here takes the delta; everything else keeps the
+        // protocol-60 counter path unchanged.
+        bool bench = false;
+        if (researchSync_) {
+            Key wk; wk.t = p.cType; wk.c = p.cContainer; wk.cs = p.cContainerSerial;
+            wk.i = p.cIndex; wk.s = p.cSerial;
+            unsigned int bh[5];
+            handForContainerKey(wk, bh, p.ownerId);
+            if (engine::resolveObjectByHand(bh) == 0) {
+                unsigned int lh[5];
+                if (localHandForBuildKey(wk, lh, p.ownerId)) memcpy(bh, lh, sizeof(bh));
+            }
+            int tech = 0, power = 0; float prog = 0.0f;
+            if (engine::probeResearchBenchRead(bh, &tech, &prog, &power) == 1) {
+                bench = true;
+                memcpy(cHand, bh, sizeof(cHand));
+            }
+        }
+        if (!bench && !vendorSync_) continue;
         char sid[sizeof(p.stringID) + 1];
         memcpy(sid, p.stringID, sizeof(p.stringID)); sid[sizeof(p.stringID)] = '\0';
         int done = 0;
@@ -2333,7 +2394,7 @@ void Replicator::applyVendorDeltas(GameWorld* gw, Inbound& in) {
                                                     (int)p.quality, man, mat, p.level);
         }
         int cashAfter = -1;
-        if (p.cash != 0) {
+        if (!bench && p.cash != 0) {
             // The trade's cash leg: the merchant received (bought from) or paid
             // out (sold to) the player on the join's screen; same here.
             int cur = -1;
@@ -2342,11 +2403,19 @@ void Replicator::applyVendorDeltas(GameWorld* gw, Inbound& in) {
                 engine::setShopCash(cHand, target, &cashAfter);
             }
         }
-        char b[256]; _snprintf(b, sizeof(b) - 1,
-            "[vendor] DELTA APPLY id=%u from=%u counter=%u,%u,%u,%u,%u sid='%s' delta=%d applied=%d "
-            "cash=%d cashNow=%d",
-            p.deltaId, p.ownerId, cHand[0], cHand[1], cHand[2], cHand[3], cHand[4], sid,
-            p.delta, done, p.cash, cashAfter);
+        char b[256];
+        if (bench)
+            _snprintf(b, sizeof(b) - 1,
+                "[research] COST APPLY id=%u from=%u bench=%u,%u,%u,%u,%u sid='%s' delta=%d "
+                "applied=%d",
+                p.deltaId, p.ownerId, cHand[0], cHand[1], cHand[2], cHand[3], cHand[4], sid,
+                p.delta, done);
+        else
+            _snprintf(b, sizeof(b) - 1,
+                "[vendor] DELTA APPLY id=%u from=%u counter=%u,%u,%u,%u,%u sid='%s' delta=%d applied=%d "
+                "cash=%d cashNow=%d",
+                p.deltaId, p.ownerId, cHand[0], cHand[1], cHand[2], cHand[3], cHand[4], sid,
+                p.delta, done, p.cash, cashAfter);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }

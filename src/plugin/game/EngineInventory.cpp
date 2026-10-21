@@ -12,6 +12,7 @@
 // the API consumed by the PowerShell oracles (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include <kenshi/util/TripleInt.h> // GameDataReference::values (research cost)
 
 namespace coop {
 namespace engine {
@@ -2612,6 +2613,50 @@ int researchPickSubject(GameWorld* gw, char* outSid, unsigned int outLen) {
     return 0;
 }
 
+// The research record's "cost" reference list (one ref per item: sid + count in
+// values[0]). Kept out of the __try frame: the boost map iterator walk is plain
+// C++ (C2712), the caller guards it.
+typedef boost::unordered::unordered_map<std::string, Ogre::vector<GameDataReference>::type,
+    boost::hash<std::string>, std::equal_to<std::string>,
+    Ogre::STLAllocator<std::pair<std::string const, Ogre::vector<GameDataReference>::type>,
+                       Ogre::GeneralAllocPolicy> > ResearchRefMap;
+static bool researchFirstCost(GameData* gd, char* costSid, unsigned int cap, int* costQty) {
+    ResearchRefMap::const_iterator it = gd->objectReferences.find("cost");
+    if (it == gd->objectReferences.end() || it->second.empty()) return false;
+    const GameDataReference& r = it->second[0];
+    if (r.sid.empty() || r.values.value[0] < 1) return false;
+    strncpy(costSid, r.sid.c_str(), cap - 1); costSid[cap - 1] = '\0';
+    *costQty = r.values.value[0];
+    return true;
+}
+static int researchPickCostWalk(GameWorld* gw, void* res, const R401Levers* lv, char* rsid,
+                                unsigned int rcap, char* costSid, unsigned int cap,
+                                int* costQty) {
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, RESEARCH);
+    for (unsigned int i = 0; i < g_dataScratch.size(); ++i) {
+        GameData* t = g_dataScratch[i];
+        if (!t || lv->isKnown(res, t) || !lv->can(res, t, false, false)) continue;
+        if (t->stringID.empty() || !researchFirstCost(t, costSid, cap, costQty)) continue;
+        strncpy(rsid, t->stringID.c_str(), rcap - 1); rsid[rcap - 1] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+int researchPickCostSubject(GameWorld* gw, char* rsid, unsigned int rcap, char* costSid,
+                            unsigned int cap, int* costQty) {
+    if (rsid && rcap) rsid[0] = '\0';
+    if (costSid && cap) costSid[0] = '\0';
+    void* res = r401Research(gw);
+    const R401Levers* lv = r401GetLevers();
+    if (!gw || !res || !lv || !g_getDataOfTypeFn || !rsid || rcap < 2 || !costSid ||
+        cap < 2 || !costQty) return 0;
+    __try {
+        return researchPickCostWalk(gw, res, lv, rsid, rcap, costSid, cap, costQty);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
 unsigned int probeResearchEnum(GameWorld* gw, unsigned int maxLog) {
     void* res = r401Research(gw);
     const R401Levers* lv = r401GetLevers();
@@ -2680,6 +2725,9 @@ int probeResearchBenchRead(const unsigned int mHand[5], int* outTech,
     if (outProg)  *outProg  = -1.0f;
     if (outPower) *outPower = -1;
     if (!mHand) return 0;
+    // Only a BUILDING hand may be read as a Building (a mirrored container key can
+    // name a character - its classType offset is unrelated memory).
+    if (mHand[0] != (unsigned int)BUILDING) return 0;
     RootObject* ro = resolveObjectByHand(mHand);
     if (!ro) return 0;
     __try {

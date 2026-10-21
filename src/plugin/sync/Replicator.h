@@ -369,12 +369,17 @@ public:
     // latched on the counter so a host snapshot captured before the host
     // applied it cannot reconcile it back. Also refreshes the set of shops
     // whose own restock the join skips (vendorRefreshGated).
+    // Protocol 63: mirrored RESEARCH BENCHES ride the same path (deltaMirror) -
+    // the research UI pays a tech's cost out of the bench, a lone loss the
+    // transfer detector would fold and the next host snapshot put back
+    // (upstream #84). A bench key leaves in the host's hand space.
     void detectAndPublishVendorDeltas(GameWorld* gw, NetLink& net, u32 ownerId);
 
     // Protocol 60, HOST, AFTER engine: apply the joins' counter changes to the
     // real stock (remove what was bought, fabricate what was sold); the next
     // census snapshot brings every client back in line. Idempotent by
-    // (ownerId, deltaId).
+    // (ownerId, deltaId). Protocol 63: also research-bench changes; a delta is
+    // applied only to a census shop counter or a local research bench.
     void applyVendorDeltas(GameWorld* gw, Inbound& in);
 
     // Protocol 60, JOIN: true when the trader platoon named by (container,
@@ -607,19 +612,22 @@ public:
     // Production machine sync master enable (KENSHICOOP_PROD_SYNC).
     void setProdSync(bool v) { prodSync_ = v; }
 
-    // BEFORE engine (protocol 38, HOST only - the tech-tree authority):
+    // BEFORE engine (protocol 38; protocol 63: BOTH roles - a grow-only union):
     // sample the Research store's known set ~1 Hz (Research::isKnown over
     // the shared RESEARCH GameData enumeration) and stream one PKT_RESEARCH
-    // row per known sid - first sight sends (the host's known set IS the
-    // session baseline), then a safety resend covers a lost row / a join
-    // whose apply lever needed prerequisites that arrived later.
+    // row per known sid - first sight sends, then a safety resend covers a lost
+    // row / a peer whose apply lever needed prerequisites that arrived later.
+    // A join skips rows the wire gave it (its own research only); the host
+    // sends everything (it relays one join's research to the others).
     void publishResearch(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 38, join side): drain received known-research
-    // rows; sids already known locally are skipped (idempotent), the rest
-    // apply through Research::startResearch - the exact lever a research-UI
-    // click commits (flips isKnown in the same tick, spike 401). Per-sid
-    // seq guard drops stale rows.
+    // BEFORE engine (protocol 38; protocol 63: BOTH roles): drain received
+    // known-research rows; sids already known locally are skipped (idempotent),
+    // the rest apply through Research::startResearch - the exact lever a
+    // research-UI click commits (flips isKnown in the same tick, spike 401).
+    // startResearch does NOT pay the tech's cost (the click handler takes it out
+    // of the bench first), so applying a peer's research never spends books
+    // here. Per-sender seq guard drops stale rows.
     void applyResearch(const SyncContext& ctx);
 
     // Research tech-tree sync master enable (KENSHICOOP_RESEARCH_SYNC).
@@ -1649,8 +1657,11 @@ private:
     // shop (protocol 60): the author flagged the container INV_FLAG_SHOP;
     // corpse (protocol 62): INV_FLAG_CORPSE - the key is a body's stream key;
     // recvMs: when its latest snapshot arrived (freshness of the mirror).
+    // bench (protocol 63): BENCH_UNKNOWN until the local hand resolves, then
+    // BENCH_RESEARCH / BENCH_OTHER (classifyBench; std::map value-init = unknown).
+    enum { BENCH_UNKNOWN = 0, BENCH_RESEARCH = 1, BENCH_OTHER = 2 };
     struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; bool truncated;
-                     bool shop; bool corpse; unsigned long recvMs; };
+                     bool shop; bool corpse; unsigned long recvMs; unsigned char bench; };
     std::set<Key>          ownedContainers_;
     std::map<Key, InvPub>  invPub_;
     std::map<Key, InvRecv> invRecv_;
@@ -1951,6 +1962,15 @@ private:
     void vendorTotals(GameWorld* gw, const unsigned int cHand[5], std::map<XKey, int>& out);
     void vendorRebase(GameWorld* gw, const Key& k, const unsigned int cHand[5]);
     bool vendorUnreported(GameWorld* gw, const Key& k, const unsigned int cHand[5]);
+    // Protocol 63: a mirrored container whose join-side changes travel as
+    // protocol-60 deltas instead of through the transfer detector - a shop
+    // counter (vendorSync) or a research bench (researchSync).
+    bool deltaMirror(const InvRecv& r) const {
+        return (r.shop && vendorSync_) || (r.bench == BENCH_RESEARCH && researchSync_);
+    }
+    // Resolve InvRecv::bench once the local hand resolves (static per key). A key
+    // that turns out to be a bench leaves the transfer detector's books.
+    void classifyBench(const Key& k, InvRecv& r);
     // True while the transfer detector is watching an unresolved LOSS of `sid` from
     // container `k` - the W2 census fallback defers its drop verdict for it.
     bool xferPendingLoss(const Key& k, const char* sid);
@@ -2419,10 +2439,11 @@ private:
     unsigned long prodSampleMs_;
     bool          prodSync_;
     // Protocol 38 known-research rows, keyed by the RESEARCH stringID (the
-    // cross-client-stable wire identity, spike 401). HOST: sent/lastSendMs =
-    // first-sight send + safety resend. JOIN: seqSeen = stale-row guard,
-    // applied = the local startResearch landed (isKnown flipped) so resends
-    // stop re-applying.
+    // cross-client-stable wire identity, spike 401). Protocol 63: BOTH roles
+    // publish and apply (grow-only union). sent/lastSendMs = first-sight send +
+    // safety resend; seqSeen = stale-row guard per sender; applied = the peer's
+    // row landed (or the sid was already known when it arrived) - a join stops
+    // publishing such a row, the host keeps relaying it.
     struct ResearchRow {
         unsigned long lastSendMs;
         sync::SenderSeq seqSeen;

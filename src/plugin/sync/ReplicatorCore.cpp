@@ -598,7 +598,9 @@ void Replicator::ingestInv(Inbound& in) {
             if (!localHandForBuildKey(k, lh, it->ownerId)) continue;
             k.t = lh[0]; k.c = lh[1]; k.cs = lh[2]; k.i = lh[3]; k.s = lh[4];
         }
+        bool fresh = invRecv_.count(k) == 0;
         InvRecv& r = invRecv_[k];
+        if (fresh) r.bench = BENCH_UNKNOWN; // explicit: never trust value-init here
         r.ownerId   = it->ownerId;
         r.items     = it->items; // latest snapshot supersedes
         r.dirty     = true;
@@ -606,6 +608,7 @@ void Replicator::ingestInv(Inbound& in) {
         r.shop      = (it->flags & INV_FLAG_SHOP) != 0;
         r.corpse    = (it->flags & INV_FLAG_CORPSE) != 0;
         r.recvMs    = nowMs();
+        if (r.bench == BENCH_UNKNOWN) classifyBench(k, r);
     }
 }
 

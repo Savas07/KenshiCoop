@@ -1696,6 +1696,21 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # research_cost (upstream #84, protocol 63): the host places + seeds a
+        # research bench; the JOIN replays a research-UI click (pays the tech's
+        # cost out of its copy of the bench, then Research::startResearch). Gates:
+        # the host's bench ends at seeded-cost and the host knows the tech; the
+        # join's bench is not put back and it knows the tech. Inventory sync is
+        # forced on (real sessions have it on; scripted scenarios default off).
+        research_cost = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'research_cost'
+            Gating   = @('research_cost', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth')
+            Tier = 'smoke'; WanVariant = $false
+        }
+
         # deed_probe: property-ownership phase-0 diagnostic (protocol 54 -
         # deedSync forced OFF). Buying a house/shop is purely local today, so
         # the buyer owns it and the partner still sees it for sale. Both sides
