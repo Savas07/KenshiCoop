@@ -2543,8 +2543,11 @@ const float InvDumpAllScenario::RADIUS = 60.0f;
 // leader exactly +1 on both sides (one copy per looted unit). CORPSE log contract.
 class CorpseLootScenario : public TimedScenario {
 public:
-    CorpseLootScenario()
-        : TimedScenario("corpse_loot", 0), have_(false), haveSubj_(false), haveLeaders_(false),
+    // race: corpse_loot_race - ONE seeded unit, both sides loot it at the same instant
+    // (inside the host's removal-settle window, so the join's copy still shows it).
+    explicit CorpseLootScenario(bool race)
+        : TimedScenario(race ? "corpse_loot_race" : "corpse_loot", 0), race_(race),
+          have_(false), haveSubj_(false), haveLeaders_(false),
           haveCorpse_(false), type_(0), killOk_(-1), c0_(-1), seeded_(-1), hostLoot_(-1),
           joinLoot_(-1), lastKillMs_(0), lastLogMs_(0), lastSearchMs_(0), maxCorpse_(-1),
           lastCorpse_(-1), hostBag0_(-1), joinBag0_(-1), hostBag_(-1), joinBag_(-1),
@@ -2595,7 +2598,7 @@ public:
             }
             if (seeded_ < 0 && ctx.elapsedMs >= SEED_MS) {
                 c0_ = countIn(ctx, subj_);
-                seeded_ = engine::addItemsToContainerBySid(ctx.gw, subj_, sid_, type_, PROBE_QTY,
+                seeded_ = engine::addItemsToContainerBySid(ctx.gw, subj_, sid_, type_, probeQty(),
                                                           0, 0, 0);
                 haveCorpse_ = true;
                 char b[160]; _snprintf(b, sizeof(b) - 1,
@@ -2611,7 +2614,7 @@ public:
                 lastSearchMs_ = ctx.elapsedMs;
                 findCorpse(ctx);
             }
-            if (joinLoot_ < 0 && ctx.elapsedMs >= JOIN_LOOT_MS)
+            if (joinLoot_ < 0 && ctx.elapsedMs >= (race_ ? HOST_LOOT_MS : JOIN_LOOT_MS))
                 joinLoot_ = haveCorpse_ ? loot(ctx, joinL_, "join") : 0;
         }
 
@@ -2702,7 +2705,7 @@ private:
 
     void logVerdict(const ScenarioContext& ctx, const char* why) {
         // Local mechanics only; the cross-client counts are the oracle's.
-        passed_ = ctx.isHost ? (killOk_ == 1 && seeded_ == PROBE_QTY && hostLoot_ == 1)
+        passed_ = ctx.isHost ? (killOk_ == 1 && seeded_ == probeQty() && hostLoot_ == 1)
                              : (haveCorpse_ && joinLoot_ == 1);
         char b[320]; _snprintf(b, sizeof(b) - 1,
             "CORPSE verdict role=%s pass=%d why=%s sid='%s' c0=%d seeded=%d hostLoot=%d "
@@ -2714,6 +2717,8 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
+    int probeQty() const { return race_ ? 1 : PROBE_QTY; }
+
     static const char*         PROBE_SID;
     static const int           PROBE_QTY        = 3;
     static const unsigned long KILL_MS          = 8000;
@@ -2724,6 +2729,7 @@ private:
     static const unsigned long JOIN_DURATION_MS = 54000;
     static const unsigned long HOST_DURATION_MS = 56000;
     static const unsigned int  MAX_SQUAD        = 32;
+    bool          race_;
     bool          have_, haveSubj_, haveLeaders_, haveCorpse_;
     unsigned int  type_;
     int           killOk_, c0_, seeded_, hostLoot_, joinLoot_;
@@ -2737,7 +2743,10 @@ private:
 const char* CorpseLootScenario::PROBE_SID = "95781-rebirth.mod";
 
 Scenario* makeInventoryScenario(const std::string& name) {
-    if (name == "corpse_loot") return new CorpseLootScenario();
+    if (name == "corpse_loot")      return new CorpseLootScenario(false);
+    // The same corpse looted by both players inside the host's removal-settle window:
+    // one unit, so any second copy is a duplicate (the #40 race found by hand).
+    if (name == "corpse_loot_race") return new CorpseLootScenario(true);
     // Same scenario twice: the plain run proves the round trip converges, and the
     // _refuse run drives it with the first re-home refused (KENSHICOOP_WD_REFUSE_REHOME),
     // which is the only deterministic way to exercise the retry + verify-then-destroy

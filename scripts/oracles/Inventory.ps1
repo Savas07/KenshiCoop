@@ -1059,6 +1059,62 @@ function Test-CorpseLoot {
                 -Metrics @{ tracked = $tracked; xfer = $xfer })
 }
 
+# corpse_loot_race (upstream #40 race): ONE probe unit in the corpse, looted by both sides at
+# the same instant. Both loot locally (each verdict pass=1), so the judgement is conservation,
+# read on BOTH sides from the final samples:
+#   finalCorpse == c0                     - the one seeded unit left the corpse;
+#   hostGain + joinGain == 1              - it exists exactly once across the two bags;
+#   both sides agree on hostGain/joinGain - the two games ended on the same owner.
+# The pre-fix outcome is hostGain=1 joinGain=1: the host fabricated the join's late loot.
+function Test-CorpseLootRace {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'CORPSE verdict role=(host|join) pass=(\d+) why=(\S+) sid=''([^'']*)'' c0=(-?\d+) seeded=(-?\d+) hostLoot=(-?\d+) joinLoot=(-?\d+) maxCorpse=(-?\d+) finalCorpse=(-?\d+) hostBag0=(-?\d+) hostBagF=(-?\d+) joinBag0=(-?\d+) joinBagF=(-?\d+) samples=(\d+)'
+    $res = @{}
+    foreach ($side in @(@{ role = 'host'; file = $HostFile }, @{ role = 'join'; file = $JoinFile })) {
+        $m = $null
+        if (Test-Path $side.file) {
+            $l = Select-String -Path $side.file -Pattern $rx -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Matches[0].Groups[1].Value -eq $side.role } | Select-Object -Last 1
+            if ($null -ne $l) {
+                $g = $l.Matches[0].Groups
+                $m = @{ pass = [int]$g[2].Value; why = $g[3].Value; c0 = [int]$g[5].Value
+                        seeded = [int]$g[6].Value; finalC = [int]$g[10].Value
+                        hostGain = [int]$g[12].Value - [int]$g[11].Value
+                        joinGain = [int]$g[14].Value - [int]$g[13].Value; samples = [int]$g[15].Value }
+            }
+        }
+        $res[$side.role] = $m
+    }
+    $h = $res['host']; $j = $res['join']
+    $ok = ($null -ne $h) -and ($null -ne $j) -and ($h.pass -eq 1) -and ($j.pass -eq 1) -and
+          ($h.c0 -ge 0) -and ($h.seeded -eq 1)
+    if ($ok) {
+        foreach ($r in @('host', 'join')) {
+            $m = $res[$r]
+            $sideOk = ($m.why -eq 'done') -and ($m.samples -gt 0) -and ($m.finalC -eq $h.c0) -and
+                      (($m.hostGain + $m.joinGain) -eq 1)
+            Write-Host ("  CORPSE-RACE [$r] " + $(if ($sideOk) { "PASS" } else { "FAIL" }) +
+                " - finalCorpse=$($m.finalC) (want $($h.c0)) hostGain=$($m.hostGain) joinGain=$($m.joinGain) (want total 1)")
+            $ok = $ok -and $sideOk
+        }
+        $agree = ($h.hostGain -eq $j.hostGain) -and ($h.joinGain -eq $j.joinGain)
+        if (-not $agree) { Write-Host "  CORPSE-RACE FAIL - the two games disagree on who holds the unit" }
+        $ok = $ok -and $agree
+    } else {
+        foreach ($r in @('host', 'join')) {
+            $m = $res[$r]
+            if ($null -eq $m) { Write-Host "  CORPSE-RACE [$r] FAIL - no CORPSE verdict"; continue }
+            Write-Host ("  CORPSE-RACE [$r] FAIL - pass=$($m.pass) why=$($m.why) seeded=$($m.seeded) finalCorpse=$($m.finalC)")
+        }
+    }
+    $fab      = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[xfer\] APPLY .* moved=0 fab=[1-9]' -Quiet)
+    $rollback = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[xfer\] ROLLBACK ' -Quiet)
+    Write-Host ("  CORPSE-RACE trace: host fabricated=$fab, join rollback=$rollback")
+    Write-Host ("  CORPSE-RACE " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "corpse_loot_race" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ fabricated = $fab; rollback = $rollback })
+}
+
 # world_item_stale: the join's proxy is freed by the ENGINE (KENSHICOOP_WI_TEST_STALE
 # injects it at the exact moment a zone teardown would) and the cull about to run on
 # it must notice through the proxy's HAND rather than by touching the object.

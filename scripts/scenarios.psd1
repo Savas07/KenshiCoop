@@ -2408,6 +2408,18 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $false
         }
+        # corpse_loot_race gates the #40 race found by hand: ONE seeded unit looted by both
+        # sides at the same instant, inside the host's removal-settle window (the join's copy
+        # still shows it). Exactly one copy may exist afterwards; the loser's loot is refused
+        # by the corpse's author and rolled back out of the loser's own bag.
+        corpse_loot_race = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'down1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'corpse_loot_race'
+            Gating   = @('corpse_loot_race', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
         # inv_regear gates the W2 round trip's ONE-INSTANCE invariant: after the peer picks
         # up gear WE dropped, the item is in its bag AND gone from our ground - the manual
         # session's "a few items stayed on the host's ground" was the duplicate outcome.
