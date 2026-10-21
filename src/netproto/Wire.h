@@ -897,17 +897,21 @@ struct VendorCashPacket {
 // The trade window shows the ShopTrader's OWN aggregated inventory and money, not
 // the shop counters, and the UI moves items without Inventory::buyItem - so no
 // per-trade observation exists. Instead ONE player trades with a merchant at a
-// time (host-arbitrated lock) and, when that player's window closes, the whole
-// shop (stock + money) is handed to everyone else. Path-independent: whatever the
-// UI did, the closing snapshot carries the result.
+// time (host-arbitrated lock) and, when that player's window closes, the shop
+// LINES its trades changed are recorded with their absolute counts (0 = gone),
+// together with the shop's absolute money, in a per-merchant table that every
+// side sets its own shop to. Only touched lines: a full snapshot undid counter
+// changes the protocol-60 vendor sync made meanwhile (integ5 vendor_stock);
+// absolute, not relative: a relative delta removed an item twice on a join
+// (run tl7). Re-applying a table is harmless.
 //   TRADE_REQUEST  join -> host   a join opened the merchant
-//   TRADE_GRANT    host -> all    `target` holds it now; tail = host's current shop
+//   TRADE_GRANT    host -> all    `target` holds it now
 //   TRADE_DENY     host -> all    `target` was refused; `holder` keeps it
 //   TRADE_HELD     host -> all    the host itself holds it (`holder` = 0)
-//   TRADE_RELEASE  holder -> host the window closed; tail = the shop as left. The
-//                  host applies it and re-sends its own RELEASE (target = the
-//                  releaser, same tail) to all joins - the host is the hub, so
-//                  PKT_TRADE is never relayed verbatim.
+//   TRADE_RELEASE  holder -> host the window closed; tail = its table. The host
+//                  merges it and re-sends its own RELEASE with the merged table
+//                  (target = the releaser) to all joins - the host is the hub,
+//                  so PKT_TRADE is never relayed verbatim.
 // Keyed by the trader CHARACTER's raw hand (save-stable; the ShopTrader wrapper's
 // serial is runtime-minted).
 enum TradeOp {
@@ -918,22 +922,24 @@ enum TradeOp {
     TRADE_RELEASE = 5
 };
 const u8  TRADE_FLAG_STOCK     = 0x01; // the InvItemEntry tail + money are valid
-const u8  TRADE_FLAG_TRUNCATED = 0x02; // the stock did not fit INV_ITEMS_MAX (additive apply)
+const u8  TRADE_FLAG_TRUNCATED = 0x02; // the table did not fit TRADE_LINES_MAX
 const u32 TRADE_NOBODY         = 0xFFFFFFFFu;
+const unsigned int TRADE_LINES_MAX = 2 * INV_ITEMS_MAX;
 struct TradeHeader {
     u8   type;       // = PKT_TRADE
     u8   op;         // TradeOp
     u8   flags;      // TRADE_FLAG_*
-    u8   count;      // InvItemEntry entries following the header
+    u8   count;      // InvItemEntry lines following the header; quantity = the
+                     // line's absolute count in the shop (may be 0)
     u32  ownerId;    // sender's network player id
     u32  holder;     // lock holder after this op (TRADE_NOBODY when free)
-    u32  target;     // GRANT/DENY: the requesting player
+    u32  target;     // GRANT/DENY: the requesting player; RELEASE: the releaser
     u32  tType;      // trader character hand (raw, save-stable)
     u32  tContainer;
     u32  tContainerSerial;
     u32  tIndex;
     u32  tSerial;
-    i32  money;      // the shop's money (valid with TRADE_FLAG_STOCK)
+    i32  money;      // RELEASE: the shop's absolute money (-1 unknown)
 };
 
 // Reserved netId meaning "no/invalid world item".

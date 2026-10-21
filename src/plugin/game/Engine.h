@@ -2404,7 +2404,7 @@ int captureTraderStock(GameWorld* gw, const unsigned int traderHand[5], InvItemE
 // stock is not reachable (window closed) - apply again at the next open, -1 fault.
 int applyTraderStock(GameWorld* gw, const unsigned int traderHand[5], const InvItemEntry* items,
                      unsigned int count, bool truncated, int money);
-// SEH-guarded (tests): buy the first loose stack of the trader's SHOP stock
+// SEH-guarded (tests): buy the first loose ONE-UNIT stack of the trader's SHOP stock
 // (the trade window's own inventory) into buyerHand. 1 bought, 0 nothing to buy,
 // -1 no shop stock here (the window was never opened) / fault.
 int traderBuyOne(GameWorld* gw, const unsigned int traderHand[5],

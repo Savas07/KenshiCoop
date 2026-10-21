@@ -1740,24 +1740,29 @@ private:
     std::map<ShopKey, CashIn>                         vendorCashIn_;
     unsigned long                                     vendorCashMs_;
     // Protocol 65 trader lock (tickTradeLock). Keyed by the trader character's hand.
-    // A shop is only reachable here while its trade window is open (a ShopTrader is
-    // non-physical), so each side keeps the last authoritative shop per merchant:
-    // snapshotted every tick while its own window is open, replaced by a received
-    // hand-over, and applied at the next open when it could not be applied at once.
-    struct TradeShop {
-        std::vector<InvItemEntry> items;
-        bool                      truncated;
-        int                       money;
-        bool                      applied;   // the engine's shop holds it
+    // A shop is only reachable while its trade window is open (a ShopTrader is
+    // non-physical). Per merchant, every side keeps the table of shop LINES a
+    // window session changed (absolute counts) + the shop's absolute money; the
+    // closing holder merges its touched lines in, the host merges and broadcasts,
+    // and each side sets its shop to the table when its window is open.
+    struct TradeTable {
+        std::map<std::string, InvItemEntry> lines;  // line key -> entry, quantity = count
+        int                                 money;  // absolute, -1 unknown
+        bool                                applied; // this side's shop holds it
+        TradeTable() : money(-1), applied(true) {}
     };
-    std::map<Key, u32>       tradeHolder_;   // merchant -> lock holder (player id)
-    std::map<Key, TradeShop> tradeShop_;     // merchant -> last authoritative shop
-    bool                     tradeOpen_;     // local trade window open last tick
-    Key                      tradeOpenKey_;  // ... with this merchant
+    std::map<Key, u32>        tradeHolder_;     // merchant -> lock holder
+    std::map<Key, TradeTable> tradeTable_;      // merchant -> touched lines + money
+    bool                      tradeOpen_;       // local trade window open last tick
+    Key                       tradeOpenKey_;    // ... with this merchant
+    bool                      tradeHaveFirst_;  // session's open snapshot taken
+    std::vector<InvItemEntry> tradeFirst_;      // shop at the session's start
+    std::vector<InvItemEntry> tradeLast_;       // shop at the latest tick
+    int                       tradeMoneyFirst_, tradeMoneyLast_;
     void sendTradeOp(NetLink& net, u8 op, u32 me, const Key& k, u32 holder, u32 target,
-                     const TradeShop* shop);
-    void applyShop(GameWorld* gw, const Key& k, const InvItemEntry* items, unsigned int n,
-                   bool truncated, int money, const char* why);
+                     const TradeTable* t);
+    // Set the open shop's touched lines + money to the table. false: not reachable here.
+    bool applyTradeTable(GameWorld* gw, const Key& k, const char* why);
 
     // Phase W1 world-item state.
     // HOST: worldTrack_ maps a ground item's LOCAL engine hand (Key) to its assigned

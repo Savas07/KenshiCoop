@@ -259,7 +259,7 @@ void NetLink::queueTrade(const TradeHeader& hdr, const InvItemEntry* items, unsi
     ot.hdr = hdr;
     ot.hdr.type = PKT_TRADE;
     if (!(hdr.flags & TRADE_FLAG_STOCK)) count = 0;
-    if (count > INV_ITEMS_MAX) { count = INV_ITEMS_MAX; ot.hdr.flags |= TRADE_FLAG_TRUNCATED; }
+    if (count > TRADE_LINES_MAX) { count = TRADE_LINES_MAX; ot.hdr.flags |= TRADE_FLAG_TRUNCATED; }
     ot.hdr.count = (u8)count;
     if (items && count > 0) ot.items.assign(items, items + count);
     pushLocked(outCs_, outTrade_, ot);

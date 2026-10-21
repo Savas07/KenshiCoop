@@ -2580,46 +2580,115 @@ const char* tradeOpName(u8 op) {
     default:            return "?";
     }
 }
+
+// One shop line's identity for the delta: template + craft grade.
+std::string tradeLineKey(const InvItemEntry& e) {
+    char b[64];
+    _snprintf(b, sizeof(b) - 1, "%s#%u", e.stringID, (unsigned int)e.level);
+    b[sizeof(b) - 1] = '\0';
+    return std::string(b);
+}
+int tradeQty(const InvItemEntry& e) { return e.quantity < 1 ? 1 : (int)e.quantity; }
+
+typedef std::map<std::string, std::pair<int, InvItemEntry> > TradeTally;
+void tradeTally(const std::vector<InvItemEntry>& v, TradeTally& out) {
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i].equipped) continue;
+        std::pair<int, InvItemEntry>& slot = out[tradeLineKey(v[i])];
+        if (slot.first == 0) slot.second = v[i];
+        slot.first += tradeQty(v[i]);
+    }
+}
+
+// The lines a window session changed (first -> last), with their absolute
+// counts at the end of it (0 = sold out), merged into `lines`.
+void tradeTouched(const std::vector<InvItemEntry>& first, const std::vector<InvItemEntry>& last,
+                  std::map<std::string, InvItemEntry>& lines) {
+    TradeTally a, b;
+    tradeTally(first, a);
+    tradeTally(last, b);
+    for (TradeTally::const_iterator it = a.begin(); it != a.end(); ++it) {
+        TradeTally::const_iterator jt = b.find(it->first);
+        int after = jt != b.end() ? jt->second.first : 0;
+        if (after == it->second.first) continue;
+        InvItemEntry e = jt != b.end() ? jt->second.second : it->second.second;
+        e.quantity = (u16)after;
+        lines[it->first] = e;
+    }
+    for (TradeTally::const_iterator it = b.begin(); it != b.end(); ++it) {
+        if (a.find(it->first) != a.end()) continue;
+        InvItemEntry e = it->second.second;
+        e.quantity = (u16)it->second.first;
+        lines[it->first] = e;
+    }
+}
 } // namespace
 
 void Replicator::sendTradeOp(NetLink& net, u8 op, u32 me, const Key& k, u32 holder,
-                             u32 target, const TradeShop* shop) {
+                             u32 target, const TradeTable* t) {
     TradeHeader h;
     memset(&h, 0, sizeof(h));
     h.type = PKT_TRADE; h.op = op; h.ownerId = me; h.holder = holder; h.target = target;
     h.tType = k.t; h.tContainer = k.c; h.tContainerSerial = k.cs; h.tIndex = k.i; h.tSerial = k.s;
     h.money = -1;
-    unsigned int n = 0;
-    if (shop) {
+    std::vector<InvItemEntry> tail;
+    if (t) {
         h.flags |= TRADE_FLAG_STOCK;
-        if (shop->truncated) h.flags |= TRADE_FLAG_TRUNCATED;
-        h.money = shop->money;
-        n = (unsigned int)shop->items.size();
+        h.money = t->money;
+        for (std::map<std::string, InvItemEntry>::const_iterator it = t->lines.begin();
+             it != t->lines.end(); ++it)
+            tail.push_back(it->second);
     }
-    net.queueTrade(h, n > 0 ? &shop->items[0] : 0, n);
+    net.queueTrade(h, tail.empty() ? 0 : &tail[0], (unsigned int)tail.size());
     char b[200];
     _snprintf(b, sizeof(b) - 1,
-              "[trade] SEND op=%s trader=%u,%u,%u,%u,%u holder=%d target=%d stock=%d money=%d",
+              "[trade] SEND op=%s trader=%u,%u,%u,%u,%u holder=%d target=%d lines=%d money=%d",
               tradeOpName(op), k.t, k.c, k.cs, k.i, k.s, (int)holder, (int)target,
-              shop ? (int)n : -1, h.money);
+              t ? (int)tail.size() : -1, h.money);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
-void Replicator::applyShop(GameWorld* gw, const Key& k, const InvItemEntry* items,
-                           unsigned int n, bool truncated, int money, const char* why) {
+bool Replicator::applyTradeTable(GameWorld* gw, const Key& k, const char* why) {
+    std::map<Key, TradeTable>::iterator ti = tradeTable_.find(k);
+    if (ti == tradeTable_.end()) return true;
+    TradeTable& t = ti->second;
     unsigned int th[5] = { k.t, k.c, k.cs, k.i, k.s };
-    int r = engine::applyTraderStock(gw, th, items, n, truncated, money);
-    TradeShop& s = tradeShop_[k];
-    if (items && n > 0) s.items.assign(items, items + n); else s.items.clear();
-    s.truncated = truncated;
-    s.money = money;
-    s.applied = (r == 1);
-    char b[200];
+    InvItemEntry cur[INV_ITEMS_MAX];
+    bool trunc = false;
+    int money = -1;
+    int n = engine::captureTraderStock(gw, th, cur, INV_ITEMS_MAX, &money, &trunc);
+    if (n < 0) return false;
+    std::vector<InvItemEntry> target(cur, cur + n);
+    for (std::map<std::string, InvItemEntry>::const_iterator it = t.lines.begin();
+         it != t.lines.end(); ++it) {
+        // Replace every entry of the line with its table count. A line already
+        // stacked here (an entry above 1) stays one stack; otherwise one entry
+        // per unit, as the shop lists non-stacking goods.
+        bool stacked = false;
+        for (size_t i = 0; i < target.size(); ) {
+            if (!target[i].equipped && tradeLineKey(target[i]) == it->first) {
+                if (target[i].quantity > 1) stacked = true;
+                target.erase(target.begin() + i);
+            } else {
+                ++i;
+            }
+        }
+        int count = (int)it->second.quantity;
+        InvItemEntry e = it->second;
+        if (count <= 0) continue;
+        if (stacked) { e.quantity = (u16)count; target.push_back(e); }
+        else { e.quantity = 1; for (int u = 0; u < count; ++u) target.push_back(e); }
+    }
+    int r = engine::applyTraderStock(gw, th, target.empty() ? 0 : &target[0],
+                                     (unsigned int)target.size(), trunc, t.money);
+    t.applied = (r == 1);
+    char b[220];
     _snprintf(b, sizeof(b) - 1,
-              "[trade] APPLY why=%s trader=%u,%u,%u,%u,%u items=%u money=%d res=%d%s",
-              why, k.t, k.c, k.cs, k.i, k.s, n, money, r,
-              r == 0 ? " (stock kept: applied at the next open)" : "");
+              "[trade] APPLY why=%s trader=%u,%u,%u,%u,%u lines=%u entries=%d->%u money=%d->%d res=%d",
+              why, k.t, k.c, k.cs, k.i, k.s, (unsigned int)t.lines.size(), n,
+              (unsigned int)target.size(), money, t.money, r);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return t.applied;
 }
 
 void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me, bool isHost) {
@@ -2630,19 +2699,17 @@ void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me,
     // 1. Received ops.
     for (size_t qi = 0; qi < q.size(); ++qi) {
         const TradeHeader& h = q[qi].hdr;
-        const InvItemEntry* items = q[qi].items.empty() ? 0 : &q[qi].items[0];
-        unsigned int n = (unsigned int)q[qi].items.size();
+        const std::vector<InvItemEntry>& tail = q[qi].items;
         bool stock = (h.flags & TRADE_FLAG_STOCK) != 0;
-        bool trunc = (h.flags & TRADE_FLAG_TRUNCATED) != 0;
         Key k; k.t = h.tType; k.c = h.tContainer; k.cs = h.tContainerSerial;
         k.i = h.tIndex; k.s = h.tSerial;
         std::map<Key, u32>::iterator hit = tradeHolder_.find(k);
         u32 holder = hit != tradeHolder_.end() ? hit->second : TRADE_NOBODY;
         char b[200];
         _snprintf(b, sizeof(b) - 1,
-                  "[trade] RECV op=%s from=%u trader=%u,%u,%u,%u,%u holder=%d target=%d stock=%d money=%d",
+                  "[trade] RECV op=%s from=%u trader=%u,%u,%u,%u,%u holder=%d target=%d lines=%d money=%d",
                   tradeOpName(h.op), h.ownerId, k.t, k.c, k.cs, k.i, k.s, (int)h.holder,
-                  (int)h.target, stock ? (int)n : -1, h.money);
+                  (int)h.target, stock ? (int)tail.size() : -1, stock ? h.money : -1);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         switch (h.op) {
         case TRADE_REQUEST:
@@ -2651,17 +2718,12 @@ void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me,
                 sendTradeOp(net, TRADE_DENY, me, k, holder, h.ownerId, 0);
             } else {
                 tradeHolder_[k] = h.ownerId;
-                // The last authoritative shop (none before anyone traded with it).
-                std::map<Key, TradeShop>::const_iterator si = tradeShop_.find(k);
-                sendTradeOp(net, TRADE_GRANT, me, k, h.ownerId, h.ownerId,
-                            si != tradeShop_.end() ? &si->second : 0);
+                sendTradeOp(net, TRADE_GRANT, me, k, h.ownerId, h.ownerId, 0);
             }
             break;
         case TRADE_GRANT:
             if (isHost) break;
             tradeHolder_[k] = h.target;
-            // The host's shop as it stands: the granted join trades on THAT.
-            if (h.target == me && stock) applyShop(gw, k, items, n, trunc, h.money, "grant");
             break;
         case TRADE_DENY:
             if (isHost) break;
@@ -2669,6 +2731,7 @@ void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me,
             if (h.target == me && tradeOpen_ && !(tradeOpenKey_ < k) && !(k < tradeOpenKey_)) {
                 engine::closeTradeWindow();
                 tradeOpen_ = false; // closed by us: no RELEASE for it
+                tradeHaveFirst_ = false;
                 coop::logLine("[trade] BUSY - another player is trading with this merchant; window closed");
             }
             break;
@@ -2676,27 +2739,36 @@ void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me,
             if (isHost) break;
             tradeHolder_[k] = h.holder;
             break;
-        case TRADE_RELEASE:
-            if (isHost) {
-                // Only the recorded holder's shop counts (a join that closed before
-                // its DENY arrived still sends one - its stock is stale).
-                if (holder != h.ownerId) {
-                    _snprintf(b, sizeof(b) - 1,
-                              "[trade] RELEASE-STALE from=%u holder=%d (ignored)", h.ownerId, (int)holder);
-                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-                    break;
-                }
-                tradeHolder_.erase(k);
-                if (stock) applyShop(gw, k, items, n, trunc, h.money, "release");
-                // Re-send as the hub: every join gets the same shop, in host order.
-                TradeHeader fw = h;
-                fw.ownerId = me; fw.holder = TRADE_NOBODY; fw.target = h.ownerId;
-                net.queueTrade(fw, items, n);
-            } else {
-                tradeHolder_.erase(k);
-                if (stock && h.target != me) applyShop(gw, k, items, n, trunc, h.money, "release");
+        case TRADE_RELEASE: {
+            if (isHost && holder != h.ownerId) {
+                // Only the recorded holder's session counts (a join that closed
+                // before its DENY arrived still sends one).
+                _snprintf(b, sizeof(b) - 1,
+                          "[trade] RELEASE-STALE from=%u holder=%d (ignored)", h.ownerId, (int)holder);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                break;
             }
+            tradeHolder_.erase(k);
+            if (!stock) break;
+            // Merge (host: the releaser's lines win) / adopt (join: the host's
+            // merged table) - absolute counts, so re-applying is harmless.
+            TradeTable& t = tradeTable_[k];
+            for (size_t i = 0; i < tail.size(); ++i) t.lines[tradeLineKey(tail[i])] = tail[i];
+            if (h.money >= 0) t.money = h.money;
+            bool own = !isHost && h.target == me; // our own session, echoed
+            if (own) {
+                t.applied = true;
+            } else if (!applyTradeTable(gw, k, "release")) {
+                t.applied = false;
+                _snprintf(b, sizeof(b) - 1,
+                          "[trade] PENDING trader=%u,%u,%u,%u,%u lines=%u (applied at the next open)",
+                          k.t, k.c, k.cs, k.i, k.s, (unsigned int)t.lines.size());
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            // Host as the hub: every join gets the merged table, in host order.
+            if (isHost) sendTradeOp(net, TRADE_RELEASE, me, k, TRADE_NOBODY, h.ownerId, &t);
             break;
+        }
         default:
             break;
         }
@@ -2714,47 +2786,53 @@ void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me,
         }
     }
 
-    // 3. The local trade window: snapshot while open, open / close edges.
+    // 3. The local trade window: session snapshots, open / close edges.
     unsigned int th[5];
     bool open = engine::localTradeTarget(th);
     Key k; k.t = th[0]; k.c = th[1]; k.cs = th[2]; k.i = th[3]; k.s = th[4];
     bool same = open && tradeOpen_ && !(tradeOpenKey_ < k) && !(k < tradeOpenKey_);
     if (same) {
-        // The shop is only reachable while its window is open: keep the latest,
-        // so the close edge (window already gone) hands over what the trade left.
+        // The shop is only reachable while its window is open: the first read is
+        // the session's start (after the table landed), the latest is what the
+        // close edge (window already gone) compares it with.
         InvItemEntry items[INV_ITEMS_MAX];
         bool trunc = false;
         int money = -1;
         int n = engine::captureTraderStock(gw, th, items, INV_ITEMS_MAX, &money, &trunc);
         if (n >= 0) {
-            TradeShop& s = tradeShop_[k];
-            s.items.assign(items, items + n);
-            s.truncated = trunc;
-            s.money = money;
-            s.applied = true;
+            tradeLast_.assign(items, items + n);
+            tradeMoneyLast_ = money;
+            if (!tradeHaveFirst_) {
+                tradeFirst_ = tradeLast_;
+                tradeMoneyFirst_ = money;
+                tradeHaveFirst_ = true;
+            }
         }
     }
     if (tradeOpen_ && !same) {
-        // Closed (or switched merchant): hand the shop over.
+        // Closed (or switched merchant): record the lines this session changed
+        // and hand the table over.
         Key k0 = tradeOpenKey_;
         tradeOpen_ = false;
         std::map<Key, u32>::iterator it = tradeHolder_.find(k0);
-        if (isHost || (it != tradeHolder_.end() && it->second == me)) {
-            if (it != tradeHolder_.end()) tradeHolder_.erase(it);
+        if (it != tradeHolder_.end() && (isHost || it->second == me)) tradeHolder_.erase(it);
+        TradeTable* t = 0;
+        if (tradeHaveFirst_) {
+            t = &tradeTable_[k0];
+            tradeTouched(tradeFirst_, tradeLast_, t->lines);
+            if (tradeMoneyLast_ >= 0) t->money = tradeMoneyLast_;
+            t->applied = true;
         }
-        std::map<Key, TradeShop>::const_iterator si = tradeShop_.find(k0);
-        sendTradeOp(net, TRADE_RELEASE, me, k0, TRADE_NOBODY, me,
-                    si != tradeShop_.end() ? &si->second : 0);
+        sendTradeOp(net, TRADE_RELEASE, me, k0, TRADE_NOBODY, me, t);
+        tradeHaveFirst_ = false;
+        tradeFirst_.clear();
+        tradeLast_.clear();
     }
     if (open && !tradeOpen_) {
-        // A hand-over received while this window was closed lands now, before
-        // anyone trades on the engine's own (stale) stock.
-        std::map<Key, TradeShop>::iterator si = tradeShop_.find(k);
-        if (si != tradeShop_.end() && !si->second.applied) {
-            TradeShop s = si->second;
-            applyShop(gw, k, s.items.empty() ? 0 : &s.items[0], (unsigned int)s.items.size(),
-                      s.truncated, s.money, "open");
-        }
+        // A table received while this window was closed lands now, before anyone
+        // trades on the engine's own (stale) stock.
+        std::map<Key, TradeTable>::iterator ti = tradeTable_.find(k);
+        if (ti != tradeTable_.end() && !ti->second.applied) applyTradeTable(gw, k, "open");
         std::map<Key, u32>::iterator it = tradeHolder_.find(k);
         if (it != tradeHolder_.end() && it->second != me) {
             engine::closeTradeWindow();
@@ -2766,6 +2844,7 @@ void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me,
         } else {
             tradeOpen_ = true;
             tradeOpenKey_ = k;
+            tradeHaveFirst_ = false;
             if (isHost) {
                 tradeHolder_[k] = me;
                 sendTradeOp(net, TRADE_HELD, me, k, me, me, 0);
