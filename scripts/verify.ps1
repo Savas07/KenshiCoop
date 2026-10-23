@@ -74,7 +74,7 @@ Write-Host "############################################################"
 Write-Host "# verify: oracle fixtures (synthetic logs)"
 Write-Host "############################################################"
 $oracleOk = $true
-foreach ($f in @("tests\CrawlMove.Fixture.ps1")) {
+foreach ($f in @("tests\CrawlMove.Fixture.ps1", "tests\SplitInterest.Fixture.ps1", "tests\Combat.Fixture.ps1")) {
     $p = Join-Path $scriptDir $f
     if (-not (Test-Path $p)) {
         Write-Host "ORACLE FIXTURE: FAIL - scripts\$f not found"

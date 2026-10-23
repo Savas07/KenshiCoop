@@ -1503,6 +1503,14 @@ function Test-WorldParity {
           [int]$TailGraceMs = 1000)
     $hostAll = Get-WnpcRows -File $HostFile
     $joinAll = Get-WnpcRows -File $JoinFile
+    # A join body the engine re-keyed when a fight split it into a fresh local
+    # platoon dumps under its LOCAL hand from then on, while the host keeps
+    # dumping the wire hand. File those rows under the wire hand, or a body the
+    # join is driving reads as missing: 9 of the 10 named near-missing Holy
+    # Sentinels in runs 20261023_183920/183922_s2 were re-keyed, and the one
+    # traced (1,2601440512 -> 1,692016576) dumped cls=drv every time after it.
+    $wireOf = Get-RekeyWireOf -File $JoinFile
+    foreach ($r in $joinAll) { if ($wireOf.ContainsKey($r.hand)) { $r.hand = $wireOf[$r.hand] } }
     $hostSamples = Group-WnpcSamples -Rows $hostAll
     $joinSamples = Group-WnpcSamples -Rows $joinAll
     if ($hostSamples.Count -lt $MinSamples -or $joinSamples.Count -lt $MinSamples) {

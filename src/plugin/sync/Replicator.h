@@ -1083,6 +1083,7 @@ private:
         float         dbgGap, dbgVlen;
         float         dbgNx, dbgNy, dbgNz;  // newest stream sample
         bool          dbgHaveNewest;
+        int           dbgLoggedRegime; // last regime the [regime] trace named (-1 = none yet)
         unsigned long carryNoSeeTick; // first tick a locally-carrying copy's stream
                                       //   stopped reporting TASK_CARRY_BODY (the
                                       //   debounced host-side-drop detector)
@@ -1186,7 +1187,7 @@ private:
                    glideUntilMs(0), glideFastSinceMs(0), glideStallX(0), glideStallZ(0),
                    glideStallSinceMs(0), glideActive(false), glideFrames(0),
                    dbgRegime(0), dbgMs(0), dbgGap(0), dbgVlen(0), dbgNx(0), dbgNy(0), dbgNz(0),
-                   dbgHaveNewest(false),
+                   dbgHaveNewest(false), dbgLoggedRegime(-1),
                    carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
                    haveChainOwner(false), chainHealTick(0),
@@ -2255,6 +2256,9 @@ private:
     // KENSHICOOP_DEBUG_COMBAT_COPY=1: 10 Hz "[combat] trace" + "[combat] walk"
     // lines for every squad copy in the combat regime (diagnostic only).
     static bool combatCopyDebug();
+    // KENSHICOOP_DEBUG_REGIME=1: a "[regime]" line each time the branch that
+    // drove a body changes (diagnostic only; off = one cached getenv).
+    static bool regimeDebug();
     // ---- end MoveSync -------------------------------------------------------
 
     // Protocol 36 (wire v35): per-sender clock mapping for the batch send

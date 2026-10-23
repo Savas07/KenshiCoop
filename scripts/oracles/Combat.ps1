@@ -39,6 +39,20 @@ function Test-CombatOrder {
     if ($null -eq $T) { Write-Host "  COMBAT-ORDER FAIL - no 'SCENARIO COMBAT issued' marker on host"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "no COMBAT marker") }
     $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
     $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    # Pair by the wire "index,serial". The fight re-keys most of the join's
+    # duelists into fresh local platoons (pitfalls: [rekey]), and from then on
+    # they log RECV under the local hand AND a new container, so a full-hand
+    # match judged only the 2 of 10 duelists the engine left alone (runs
+    # 20261023_194654 / _195152_s3: postTotal 44 = 2 hands x 22 samples).
+    $wireOf = Get-RekeyWireOf -File $JoinFile
+    $Jw = @{}
+    foreach ($k in $J.Keys) {
+        $parts = $k.Split(',')
+        $is = $parts[0] + ',' + $parts[1]
+        if ($wireOf.ContainsKey($is)) { $is = $wireOf[$is] }
+        if (-not $Jw.ContainsKey($is)) { $Jw[$is] = New-Object System.Collections.ArrayList }
+        [void]$Jw[$is].AddRange(@($J[$k]))
+    }
     $duelists = @()
     foreach ($hand in $H.Keys) {
         if (@($H[$hand] | Where-Object { $_.t -ge $T -and $_.task -eq $COMBAT }).Count -gt 0) { $duelists += $hand }
@@ -46,10 +60,12 @@ function Test-CombatOrder {
     if ($duelists.Count -lt 1) { Write-Host "  COMBAT-ORDER FAIL - host never streamed a combat task after the order"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "no combat task streamed") }
     $preCombat = 0; $preTotal = 0; $postCombat = 0; $postTotal = 0; $seen = 0
     foreach ($hand in $duelists) {
-        if (-not $J.ContainsKey($hand)) { continue }
+        $hp = $hand.Split(',')
+        $is = $hp[0] + ',' + $hp[1]
+        if (-not $Jw.ContainsKey($is)) { continue }
         $seen++
-        $pre  = @($J[$hand] | Where-Object { $_.t -lt $T })
-        $post = @($J[$hand] | Where-Object { $_.t -ge ($T + $GraceMs) })
+        $pre  = @($Jw[$is] | Where-Object { $_.t -lt $T })
+        $post = @($Jw[$is] | Where-Object { $_.t -ge ($T + $GraceMs) })
         $preTotal  += $pre.Count;  $preCombat  += @($pre  | Where-Object { $_.task -eq $COMBAT }).Count
         $postTotal += $post.Count; $postCombat += @($post | Where-Object { $_.task -eq $COMBAT }).Count
     }
@@ -1141,6 +1157,12 @@ function Test-CombatSnapRate {
     # arming, wait, seg, n (the .* tolerates future field additions).
     $rx = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[combat\] snap hand=(\d+),(\d+) drift=([\d\.]+) srcVel=([\d\.]+) localFight=(\d) wrongTgt=(\d) arming=(\d) wait=(\d) seg=\d+ n=(\d+)'
     $churn = 0; $chase = 0; $wrongT = 0; $total = 0
+    # Persistence is judged over the same window as the buckets: in-window snap
+    # lines per hand (each snap logs one). The line's n= counts since the copy
+    # was first driven, so a runtime-spawned battler the host places in the
+    # first seconds arrived with n=3-4 before settle ended (run
+    # 20261023_195149_s2: n=8, 4 of them in the window), and n restarts when a
+    # body is re-acquired.
     $persist = @{}; $drifts = @()
     foreach ($sm in (Select-String -Path $JoinFile -Pattern $rx -ErrorAction SilentlyContinue)) {
         $g = $sm.Matches[0].Groups
@@ -1151,10 +1173,9 @@ function Test-CombatSnapRate {
         $srcVel    = [double]$g[8].Value
         $localFight= ($g[9].Value -eq "1")
         $wrong     = ($g[10].Value -eq "1")
-        $n         = [int]$g[13].Value
         $total++
         $drifts += $drift
-        if ($persist[$hand] -lt $n) { $persist[$hand] = $n }
+        $persist[$hand] = 1 + [int]$persist[$hand]
         if ($wrong) { $wrongT++ }
         if (($srcVel -ge $ChurnVel) -or ($drift -ge $ChaseDrift)) { $chase++ }
         elseif ($localFight) { $churn++ }

@@ -2438,11 +2438,52 @@ function Test-SpeedProbe {
 # tracking on the join - the second interest sphere (centered on the join's tab
 # leader, who stayed) is what makes that possible. Pre-dual-interest this fails:
 # the bar leaves the host's only sphere and its NPCs freeze/vanish on the join.
+#
+# A copy renders its body in the PAST: the interp render delay scales with the
+# send cadence up to maxCadenceDelayMs (1200 ms, Interp.cpp), and both clients
+# sample on their own 500 ms timers. A bar NPC that WALKS is therefore judged by
+# where the join's copy is against the host's PATH over [t - LagMs, t + LeadMs],
+# not against the host's position at the same instant. Equal-time pairing
+# charged speed x delay as drift: a patron walking to a seat at 25 u/s, exactly
+# on the host's path 0.5 s late, scored 13 u against Tol 6 (runs
+# 20261023_182820/182822/182826, path error 0.0-2.1 u). A frozen or unstreamed
+# copy still fails: once the host is more than LagMs past it, the gap grows at
+# walking speed.
+function Get-WindowPathDistance {
+    param($S, [double[]]$P, [double]$T0, [double]$T1)
+    $best = [double]::MaxValue
+    for ($i = 0; $i -lt $S.Count; $i++) {
+        $a = $S[$i]
+        if ($a.t -gt $T1) { break }
+        $b = if ($i + 1 -lt $S.Count) { $S[$i + 1] } else { $a }
+        if ($b.t -lt $T0) { continue }
+        # Clip the segment to the time window, then take the closest point on it.
+        $u0 = 0.0; $u1 = 1.0
+        $span = [double]($b.t - $a.t)
+        if ($span -gt 0) {
+            $u0 = [Math]::Max(0.0, ($T0 - $a.t) / $span)
+            $u1 = [Math]::Min(1.0, ($T1 - $a.t) / $span)
+        }
+        $dx = $b.p[0] - $a.p[0]; $dy = $b.p[1] - $a.p[1]; $dz = $b.p[2] - $a.p[2]
+        $len2 = $dx*$dx + $dy*$dy + $dz*$dz
+        $u = 0.0
+        if ($len2 -gt 1e-9) {
+            $u = (($P[0] - $a.p[0])*$dx + ($P[1] - $a.p[1])*$dy + ($P[2] - $a.p[2])*$dz) / $len2
+        }
+        $u = [Math]::Min($u1, [Math]::Max($u0, $u))
+        $qx = $a.p[0] + $dx*$u - $P[0]; $qy = $a.p[1] + $dy*$u - $P[1]; $qz = $a.p[2] + $dz*$u - $P[2]
+        $d = [Math]::Sqrt($qx*$qx + $qy*$qy + $qz*$qz)
+        if ($d -lt $best) { $best = $d }
+    }
+    return $best
+}
+
 function Test-SplitInterest {
     param([string]$HostFile, [string]$JoinFile,
           [double]$AnchorR = 150.0, [double]$Tol = 6.0,
           [double]$MinRatio = 0.8, [int]$MinJudged = 2,
-          [int]$GraceMs = 6000, [int]$MaxDt = 800)
+          [int]$GraceMs = 6000, [int]$MaxDt = 800,
+          [int]$LagMs = 1200, [int]$LeadMs = 500)
     $bar = Select-String -Path $HostFile -Pattern 'SCENARIO SPLIT bar=(-?[\d\.]+),(-?[\d\.]+),(-?[\d\.]+) have=1' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $bar) {
         Write-Host "  SPLIT-INTEREST FAIL - no bar anchor on host (2-tab save required)"
@@ -2474,8 +2515,7 @@ function Test-SplitInterest {
                 if ($dt -lt $best) { $best = $dt; $bj = $js }
             }
             if ($best -le $MaxDt -and $null -ne $bj) {
-                $dx = $hs.p[0]-$bj.p[0]; $dy = $hs.p[1]-$bj.p[1]; $dz = $hs.p[2]-$bj.p[2]
-                [void]$dists.Add([Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz))
+                [void]$dists.Add((Get-WindowPathDistance -S $H[$hand] -P $bj.p -T0 ($bj.t - $LagMs) -T1 ($bj.t + $LeadMs)))
             }
         }
         if ($dists.Count -lt 4) { continue }  # join stopped receiving it post-move

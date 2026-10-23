@@ -334,6 +334,20 @@ void Replicator::applyTargets(GameWorld* gw) {
             continue;
         }
         drivenChars_.insert(c);
+        // The branch that drove this body LAST tick is still in dbgRegime here;
+        // name it when it changes. The 5 s audit dumps cannot say why a copy
+        // stood 18-29 u off a host body that never moved (world_parity
+        // 20261023_183920, Holy Sentinel 1,3001586944, HI tier throughout).
+        if (regimeDebug() && d.dbgRegime != d.dbgLoggedRegime) {
+            char rb[200]; _snprintf(rb, sizeof(rb) - 1,
+                "[regime] hand=%u,%u %s->%s gap=%.1f vlen=%.2f new=%.0f,%.0f body=%.0f,%.0f",
+                it->first.i, it->first.s,
+                d.dbgLoggedRegime < 0 ? "start" : devRegimeName(d.dbgLoggedRegime),
+                devRegimeName(d.dbgRegime), d.dbgGap, d.dbgVlen,
+                d.dbgNx, d.dbgNz, d.lx, d.lz);
+            rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+            d.dbgLoggedRegime = d.dbgRegime;
+        }
         d.dbgRegime = DR_NONE; d.dbgMs = now;
         drivenSeen_[c] = now; // recently-driven grace for the authority passes
         canonicalOf_[c] = it->first; // capture translation (combat subjects)
@@ -1742,6 +1756,19 @@ void Replicator::applyTargets(GameWorld* gw) {
         // touch the ~13% holdStop slice, and dip noise swamped it. Second, single
         // runs cannot judge anything here: marchFrac spans 0.046-0.183 WITHIN one
         // arm, so fewer than ~5 runs per arm just reports the last run.
+        //
+        // Most of the remaining walk->rest flips are STEPPED sources (2026-10-23,
+        // KENSHICOOP_DEBUG_REGIME traces of world_parity): a walker the host
+        // simulates coarsely, far from every host PC, streams a staircase at the
+        // full 20 Hz - still ~0.5 s, then a 15-20 u jump (newest-pair velocity
+        // 300-3300 u/s, then 0). This hold ends inside every step, so each step
+        // is walk -> rest (a re-park teleport) -> walk: 58-73% of all flips.
+        // Holding the verdict across a detected step (1.5x the still gap, steps
+        // >= 5 u) and dropping the lead cut flips 2-5x but was reverted: in a
+        // 3+3 npc_sync A/B march idleFrac failed 2/3 (0.0106 / 0.0202 vs base
+        // <= 0.0083) and snap_rate 1/3, because walk-ordered animal copies stalled
+        // 5 s and then snapped 200-400 u where the per-step park had kept them
+        // within a step.
         // Mid-tier body = sparse stream cadence (the round-robin period).
         // Its drive shares the near-tier code below, but its counters/oracles
         // are tracked apart: the near-tier gates guard the validated 20 Hz
@@ -2543,6 +2570,16 @@ bool Replicator::combatCopyDebug() {
     static int v = -1;
     if (v < 0) {
         const char* e = getenv("KENSHICOOP_DEBUG_COMBAT_COPY");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+// ---- KENSHICOOP_DEBUG_REGIME=1 drive-branch transition trace ----
+bool Replicator::regimeDebug() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("KENSHICOOP_DEBUG_REGIME");
         v = (e && e[0] == '1') ? 1 : 0;
     }
     return v != 0;

@@ -108,6 +108,20 @@ function Get-HandAliases {
     return ,$ids
 }
 
+# The inverse of Get-HandAliases over a whole log: local "index,serial" -> the
+# wire "index,serial" it answers to. Oracles that pair whole dumps row by row
+# (world_parity) need every translation at once rather than one wire hand's.
+# A body re-keyed twice logs both locals against the same wire hand.
+function Get-RekeyWireOf {
+    param([string]$File)
+    $map = @{}
+    if (-not (Test-Path $File)) { return $map }
+    foreach ($m in (Select-String -Path $File -Pattern '\[rekey\] wire=(\d+,\d+) local=(\d+,\d+)' -ErrorAction SilentlyContinue)) {
+        $map[$m.Matches[0].Groups[2].Value] = $m.Matches[0].Groups[1].Value
+    }
+    return $map
+}
+
 # Find the first timestamped marker line matching $Pattern in $File and return its
 # ms-since-midnight in the HOST clock frame, or $null.
 function Get-MarkerTimeMs {
