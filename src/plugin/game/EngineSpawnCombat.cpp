@@ -2086,7 +2086,8 @@ int applyLimbStates(GameWorld* gw, Character* c, const unsigned char states[4],
     return changed;
 }
 
-int destroySeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float radius) {
+int destroySeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float radius,
+                            RootObject* const* keep, unsigned int nKeep) {
     if (!gw || !g_getObjsFn || !g_destroyObjFn) return 0;
     RootObject* ro = resolveObjectByHand(cHand);
     if (!ro) return 0;
@@ -2102,6 +2103,9 @@ int destroySeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float ra
             Item* it = reinterpret_cast<Item*>(o);
             if (it->isInInventory) continue; // only FREE ground copies
             if (it->itemFunction != ITEM_SEVERED_LIMB) continue;
+            bool kept = false;
+            for (unsigned int j = 0; j < nKeep && !kept; ++j) kept = (keep[j] == o);
+            if (kept) continue;
             victims[nv++] = o;
         }
         for (unsigned int i = 0; i < nv; ++i) {

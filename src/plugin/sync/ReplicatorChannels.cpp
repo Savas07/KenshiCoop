@@ -168,13 +168,27 @@ void Replicator::publishMedical(GameWorld* gw, NetLink& net, u32 ownerId) {
                         ev.eventId, (unsigned)evType, k.i, k.s, i,
                         (unsigned)prev, (unsigned)cur);
                     eb[sizeof(eb) - 1] = '\0'; coop::logLine(eb);
+                    // Host = world authority: our sim just grounded the severed
+                    // limb, with no drop edge. Mark the spot so the world-item scan
+                    // streams it instead of baselining it as a save-native.
+                    if (evType == EVT_AMPUTATE && streamNpcs_)
+                        noteSeveredLimbAt(bodyForKey(k, 0, 0));
                     // Severed-item dedupe (JOIN only): our own damage sim just
                     // created a local severed-limb ground item, but the HOST's
                     // copy is canonical (it spawns one on event-apply and the
                     // world-item channel streams it back as a proxy). Destroy
-                    // the local one so the join doesn't end up with two.
+                    // the local one so the join doesn't end up with two - but
+                    // never a proxy of a limb the host already streamed (an
+                    // earlier cut nearby), or that host copy vanishes here only.
                     if (evType == EVT_AMPUTATE && !streamNpcs_ && !isNpc) {
-                        int nd = engine::destroySeveredLimbsNear(gw, hand, 15.0f);
+                        std::vector<RootObject*> keep;
+                        for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi =
+                                 worldProxies_.begin(); pi != worldProxies_.end(); ++pi) {
+                            RootObject* live = liveWorldProxy(pi->second);
+                            if (live) keep.push_back(live);
+                        }
+                        int nd = engine::destroySeveredLimbsNear(gw, hand, 15.0f,
+                            keep.empty() ? 0 : &keep[0], (unsigned int)keep.size());
                         char db[120]; _snprintf(db, sizeof(db) - 1,
                             "[med] LIMB-ITEM DEDUPE hand=%u,%u destroyed=%d",
                             k.i, k.s, nd);

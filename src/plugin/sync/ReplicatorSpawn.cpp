@@ -901,9 +901,11 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 states[limb] = (ev.event == EVT_AMPUTATE) ? LIMB_WIRE_STUMP
                                                           : LIMB_WIRE_CRUSHED;
                 // Host = world authority: create the real severed ground item
-                // here (it streams to the join via the world-item channel).
+                // here and mark the spot, so the world-item scan streams it to
+                // the join instead of baselining it as a save-native.
                 int r = engine::applyLimbStates(0, c, states, 0,
                                                 /*createSeveredItem*/streamNpcs_);
+                if (streamNpcs_ && ev.event == EVT_AMPUTATE && r > 0) noteSeveredLimbAt(c);
                 char lb[140]; _snprintf(lb, sizeof(lb) - 1,
                     "[med] LIMB-EVT APPLY ev=%u hand=%u,%u limb=%d mask=%d",
                     (unsigned)ev.event, k.i, k.s, limb, r);

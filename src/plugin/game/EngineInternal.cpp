@@ -1546,6 +1546,7 @@ GetDataOfTypeFn  g_getDataOfTypeFn = 0;
 CreateItemFn     g_createItemFn   = 0;
 EquipItemFn      g_equipItemFn    = 0;
 GetAllSectionsFn g_getSectionsFn  = 0;
+ResizeSectionFn  g_resizeSectionFn = 0; // test lever (inv_bigstack)
 GetWeaponFn      g_getPrimaryWeaponFn   = 0;
 GetWeaponFn      g_getSecondaryWeaponFn = 0;
 FacBySidFn       g_facBySidFn     = 0; // protocol 21 proxy spawn (join)
@@ -1951,6 +1952,7 @@ void resolve() {
     // Worn gear lives in equip sections, not _allItems: enumerate ALL sections and
     // keep the equipped ones (covers every slot, incl. weapons + worn backpack).
     g_getSectionsFn = (GetAllSectionsFn)KenshiLib::GetRealAddress(&Inventory::getAllSections);
+    g_resizeSectionFn = (ResizeSectionFn)KenshiLib::GetRealAddress(&Inventory::resizeSection);
     // Worn weapons are NOT in any section: read the dedicated weapon accessors directly.
     g_getPrimaryWeaponFn   = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getPrimaryWeapon);
     g_getSecondaryWeaponFn = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getSecondaryWeapon);

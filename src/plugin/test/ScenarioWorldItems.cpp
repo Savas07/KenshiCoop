@@ -375,7 +375,18 @@ public:
     virtual const char* name() const { return joinAuthor_ ? "world_item_join" : "world_item_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
-        have_ = engine::pickInventoryContainer(ctx.gw, hand_);
+        // The author must drop from a body it OWNS: a drop from a peer-owned squad copy
+        // is that peer's to author, so the replicator deliberately never streams it. The
+        // squad leader belongs to the host's tab, so a join author uses its own tab leader.
+        if (joinAuthor_ && !ctx.isHost) {
+            EntityState sq[32];
+            unsigned int n = engine::captureSquad(ctx.gw, /*leaderOnly*/ false, sq, 32);
+            int idx = tabLeaderIdx(sq, n, ctx.localId);
+            have_ = (idx >= 0);
+            if (have_) handFromEntity(sq[idx], hand_);
+        } else {
+            have_ = engine::pickInventoryContainer(ctx.gw, hand_);
+        }
         char b[160];
         _snprintf(b, sizeof(b) - 1,
             "SCENARIO WI anchor host=%d have=%d hand=%u,%u,%u,%u,%u",

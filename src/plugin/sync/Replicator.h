@@ -1858,6 +1858,9 @@ private:
         // a later claim on the same netId (a second picker) loses: it must not
         // erase the track before the cull reaches the remaining peers.
         bool claimed;
+        // When the spatial scan first met the item (0 = found by the drop hook). Lets a
+        // limb-loss edge sampled AFTER the scan baselined its severed limb still claim it.
+        unsigned long firstSeenMs;
     };
     // `hand` is the proxy's engine identity, captured (and round-trip verified) at
     // mint. The engine owns the object's lifetime: when the block it stands in
@@ -1892,11 +1895,17 @@ private:
     //                    NOT picked up (its cell unloaded as we travelled; the peer's
     //                    proxy was removed with it). When it reloads it is still our
     //                    session drop, not a native, so it streams again.
-    // Both are bounded and cleared on resetSession (after a reload every ground item
+    //   severedDrops_  - (host) where a limb was just cut. The engine grounds the
+    //                    severed limb itself, with no drop edge, so the scan would
+    //                    baseline it as a save-native and no join ever saw one.
+    // All are bounded and cleared on resetSession (after a reload every ground item
     // is in the shared save, i.e. native).
     struct RecentDrop { char stringID[48]; float x, y, z; unsigned long ms; };
     std::vector<RecentDrop>    pendingDrops_;
     std::vector<RecentDrop>    dormantDrops_;
+    std::vector<RecentDrop>    severedDrops_;
+    // Host: remember that `body` just lost a limb whose severed item the engine grounded.
+    void noteSeveredLimbAt(Character* body);
     // Record one (bounded: the oldest record goes first) / consume the first record
     // of `sid` within `tol` on the ground plane (a dropped item settles vertically)
     // no older than maxAgeMs (0 = any age); expired records are pruned on the way.

@@ -191,6 +191,10 @@ struct Config {
     // a genuine two-machine clock disagreement. 0 = real clock.
     long          fakeClockSkewMs;
 
+    // Automated test runs only (KENSHICOOP_NO_FOCUS == "1", set by run_test.ps1):
+    // never take the desktop's foreground (core/FocusGuard.h). Off otherwise.
+    bool          noFocus;
+
     // Step-2 pruning experiment (KENSHICOOP_NO_DETACH == "1", join only): skip the
     // sitter detachFromTownAI in applyRest, betting that default AI-suspend alone
     // stops town-AI re-tasking. Off by default; for manual A/B runs only.

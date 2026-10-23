@@ -82,8 +82,8 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
     // Local mirror of the captured Item*s. The nested-container pass needs the parent objects
     // to reach into their private inventories, and most callers pass outItems = 0; every real
     // caller reads at most INV_ITEMS_MAX entries, so a fixed mirror covers them all.
-    const unsigned int MIRROR_MAX = 64;
-    Item* mine[64];
+    const unsigned int MIRROR_MAX = INV_ITEMS_MAX;
+    Item* mine[INV_ITEMS_MAX];
     memset(mine, 0, sizeof(mine));
     // EQUIPPED gear (Phase 4a equipment sync). Worn items - EVERY equippable slot:
     // weapons, all armour pieces, belt, worn backpack, ... - live in the inventory's
@@ -603,9 +603,12 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
     // truncated local read as "cannot create" the same way a truncated desired list means
     // "cannot delete": for a container neither side can fully describe, the reconcile
     // degrades to moves only rather than guessing in either direction.
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64];
-    Item* curItems[64];
+    // Main-thread only and never re-entered (nothing below reconciles), so the buffers
+    // sized by INV_ITEMS_MAX are static: at 255 entries this frame would otherwise need
+    // ~130 KB of the game's 1 MB main-thread stack, on top of the caller's own snapshot.
+    const unsigned int MAXC = INV_ITEMS_MAX;
+    static InvItemEntry cur[INV_ITEMS_MAX];
+    static Item* curItems[INV_ITEMS_MAX];
     bool curTruncated = false;
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC, &curTruncated);
 
@@ -625,13 +628,15 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
         unsigned char lvlEq, lvlLoose;
         char manufacturer[48]; char material[48]; // weapon provenance (needed to recreate)
     };
-    Grp g[128];
+    // Every desired template plus every current one, so no group is ever dropped.
+    const unsigned int MAXG = 2 * INV_ITEMS_MAX;
+    static Grp g[MAXG];
     unsigned int ng = 0;
     for (unsigned int i = 0; i < count; ++i) {
         unsigned int j = 0;
         for (; j < ng; ++j)
             if (g[j].type == items[i].itemType && strcmp(g[j].sid, items[i].stringID) == 0) break;
-        if (j == ng && ng < 128) {
+        if (j == ng && ng < MAXG) {
             memset(&g[ng], 0, sizeof(Grp));
             g[ng].lvlEq = g[ng].lvlLoose = GRADE_NA; // 0 would mean "mint at level 0"
             strncpy(g[ng].sid, items[i].stringID, sizeof(g[ng].sid) - 1);
@@ -653,7 +658,7 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
         unsigned int j = 0;
         for (; j < ng; ++j)
             if (g[j].type == cur[i].itemType && strcmp(g[j].sid, cur[i].stringID) == 0) break;
-        if (j == ng && ng < 128) {
+        if (j == ng && ng < MAXG) {
             memset(&g[ng], 0, sizeof(Grp));
             g[ng].lvlEq = g[ng].lvlLoose = GRADE_NA; // 0 would mean "mint at level 0"
             strncpy(g[ng].sid, cur[i].stringID, sizeof(g[ng].sid) - 1);
@@ -943,6 +948,102 @@ int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const cha
     return total;
 }
 
+int growLooseGrid(GameWorld* gw, const unsigned int cHand[5], int w, int h, char* outName,
+                  unsigned int nameLen, int* outItemsLimit) {
+    (void)gw;
+    if (outName && nameLen) outName[0] = '\0';
+    if (outItemsLimit) *outItemsLimit = -1;
+    if (!g_getSectionsFn || !g_resizeSectionFn) return -1;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return -1;
+    Inventory* inv = invOf(ro);
+    if (!inv) return -1;
+    int cells = -1;
+    __try {
+        // The biggest loose grid: not a worn slot, not a container slot.
+        InventorySection* best = 0;
+        lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+        unsigned int ns = secs ? secs->size() : 0;
+        for (unsigned int s = 0; s < ns; ++s) {
+            InventorySection* sec = (*secs)[s];
+            if (!sec || sec->isAnEquippedItemSection || sec->containerSlot || !sec->enabled) continue;
+            if (!best || sec->width * sec->height > best->width * best->height) best = sec;
+        }
+        if (!best) return -1;
+        int nw = best->width > w ? best->width : w;
+        int nh = best->height > h ? best->height : h;
+        if (nw != best->width || nh != best->height)
+            g_resizeSectionFn(inv, best, nw, nh, /*clearContent=*/false);
+        cells = best->width * best->height;
+        if (outName && nameLen) {
+            const char* nm = best->name.c_str();
+            strncpy(outName, nm ? nm : "", nameLen - 1);
+            outName[nameLen - 1] = '\0';
+        }
+        if (outItemsLimit) *outItemsLimit = best->itemsLimit;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { cells = -1; }
+    return cells;
+}
+
+namespace {
+// SEH-guarded virtual Inventory::hasRoomForItem: asked BEFORE minting, so a full grid costs
+// nothing (a failed tryAddItem leaves the freshly created item orphaned).
+bool hasRoomFor(Inventory* inv, GameData* gd) {
+    if (!inv || !gd) return false;
+    __try { return inv->hasRoomForItem(gd); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+} // namespace
+
+int fillDistinctStacks(GameWorld* gw, const unsigned int cHand[5], unsigned int wantEntries,
+                       int* outAdded) {
+    if (outAdded) *outAdded = 0;
+    if (!gw || !g_getDataOfTypeFn) return -1;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return -1;
+    Inventory* inv = invOf(ro);
+    if (!inv) return -1;
+    // Test-only, main thread: the snapshot-sized buffers are static.
+    static InvItemEntry ent[INV_ITEMS_MAX];
+    unsigned int n = readInvItems(inv, ent, 0, INV_ITEMS_MAX, 0, /*includeNested=*/true);
+    // Copy the template list out first: createItemAndAdd's own lookup reuses g_dataScratch.
+    const unsigned int MAXT = 4096;
+    static GameData* tmpl[MAXT];
+    unsigned int nt = 0;
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, ITEM);
+        unsigned int total = g_dataScratch.size();
+        for (unsigned int i = 0; i < total && nt < MAXT; ++i)
+            if (g_dataScratch[i]) tmpl[nt++] = g_dataScratch[i];
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return (int)n; }
+    const int bags = nestedContainerCount(gw, cHand);
+    int added = 0;
+    for (unsigned int t = 0; t < nt && n < wantEntries; ++t) {
+        char sid[48]; sid[0] = '\0';
+        __try {
+            const char* s = tmpl[t]->stringID.c_str();
+            strncpy(sid, s ? s : "", sizeof(sid) - 1);
+            sid[sizeof(sid) - 1] = '\0';
+        } __except (EXCEPTION_EXECUTE_HANDLER) { sid[0] = '\0'; }
+        if (!sid[0]) continue;
+        // A template already held would merge into its stack instead of adding an entry.
+        bool held = false;
+        for (unsigned int i = 0; i < n && !held; ++i) held = (strcmp(ent[i].stringID, sid) == 0);
+        if (held) continue;
+        Inventory* target = hasRoomFor(inv, tmpl[t]) ? inv : 0;
+        for (int w = 0; w < bags && !target; ++w) {
+            Inventory* sub = nestedInventoryOf(gw, cHand, (unsigned int)w);
+            if (hasRoomFor(sub, tmpl[t])) target = sub;
+        }
+        if (!target) continue;
+        if (!createItemAndAdd(gw, target, sid, (unsigned int)ITEM, 1, 0, /*equip=*/false)) continue;
+        ++added;
+        n = readInvItems(inv, ent, 0, INV_ITEMS_MAX, 0, /*includeNested=*/true);
+    }
+    if (outAdded) *outAdded = added;
+    return (int)n;
+}
+
 bool applyInventoryItems(GameWorld* gw, Inventory* inv, const InvItemEntry* items,
                          unsigned int count, bool truncated) {
     return applyToInventory(gw, inv, items, count, truncated);
@@ -963,8 +1064,10 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
     // must be reconciled separately or the two would fight: a bagged item counted at the top
     // level looks like a loose item the peer is missing, so the reconcile mints a second copy
     // out on the character and the bag stays empty.
-    InvItemEntry top[INV_ITEMS_MAX];
-    unsigned char topSrcIdx[INV_ITEMS_MAX]; // original index, so children can find their parent
+    // Main-thread only and never re-entered, so the INV_ITEMS_MAX-sized buffers below are
+    // static (~130 KB together at 255 entries; applyToInventory keeps its own).
+    static InvItemEntry top[INV_ITEMS_MAX];
+    static unsigned char topSrcIdx[INV_ITEMS_MAX]; // original index, so children can find their parent
     unsigned int nTop = 0;
     unsigned int nNested = 0;
     for (unsigned int i = 0; i < count && nTop < INV_ITEMS_MAX; ++i) {
@@ -978,8 +1081,8 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
 
     // Re-read AFTER the top-level pass: it may have created or moved the very bag we are about
     // to fill, and a bag identified from the stale read would be the wrong object (or gone).
-    InvItemEntry cur[INV_ITEMS_MAX];
-    Item* curItems[INV_ITEMS_MAX];
+    static InvItemEntry cur[INV_ITEMS_MAX];
+    static Item* curItems[INV_ITEMS_MAX];
     unsigned int ncur = readInvItems(inv, cur, curItems, INV_ITEMS_MAX, 0);
 
     static int dbg = -1;
@@ -989,14 +1092,14 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
     // indistinguishable by (sid,type), and a plain first-match rule pointed BOTH parents'
     // contents at whichever we happened to read first: the second apply reconciled away what
     // the first had just placed, and the other bag was never reconciled at all.
-    Inventory* used[INV_ITEMS_MAX];
+    static Inventory* used[INV_ITEMS_MAX];
     unsigned int nUsed = 0;
     unsigned int claimed = 0; // nested entries some parent accounted for
 
     for (unsigned int t = 0; t < nTop; ++t) {
         // Gather this parent's children. The wire names the parent by its index in the
         // ORIGINAL entry array, which survives the split via topSrcIdx.
-        InvItemEntry kids[INV_ITEMS_MAX];
+        static InvItemEntry kids[INV_ITEMS_MAX];
         unsigned int nk = 0;
         for (unsigned int i = 0; i < count && nk < INV_ITEMS_MAX; ++i)
             if (items[i].parentIdx == (unsigned char)(topSrcIdx[t] + 1)) kids[nk++] = items[i];
@@ -1013,7 +1116,7 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         // OUR copies of that template, in local carry order. Only an entry that actually owns
         // an inventory qualifies - matching on template alone could hand us a same-sid item
         // that is not a container at all.
-        Inventory* cands[INV_ITEMS_MAX];
+        static Inventory* cands[INV_ITEMS_MAX];
         unsigned int ncand = 0;
         for (unsigned int c = 0; c < ncur && ncand < INV_ITEMS_MAX; ++c) {
             if (cur[c].itemType != top[t].itemType) continue;
@@ -1187,12 +1290,32 @@ int probeAddAnyToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
     // until tryAddItem accepts one. This mirrors the protocol-34 apply path,
     // which only ever fabricates items the AUTHOR's copy of the container
     // already holds - i.e. items the container accepts by definition.
+    //
+    // Pass 0 matches the gamedata.base STRINGIDs of the stock each of
+    // probePlaceMachine's kind-2 candidates holds (Storage: Building Materials
+    // 2940 / Steel Bars 2941 / Chainmail 2942 ...), in that order. Pass 1 is
+    // the English-name fallback, which alone never fit: the first name match
+    // is often a mod item ("building materials" landed on a rebirth.mod record)
+    // the box refuses, and names are localised - run 20261023_154441 tried
+    // eight such items and every one was refused, so store_sync never had an
+    // add to replicate.
+    const char* sids[] = {
+        "580-gamedata.base",  // Building Materials
+        "579-gamedata.base",  // Steel bars
+        "2289-gamedata.base", // Chainmail Sheets
+        "584-gamedata.base",  // Fabrics
+        "1965-gamedata.base", // Hemp
+        "2292-gamedata.base"  // Leather
+    };
     const char* prefs[] = {
         "iron plate", "copper", "building materials", "raw meat", "dustwich",
         "foodcube", "ration", "rock", "cotton", "fabric"
     };
+    const unsigned int ns = sizeof(sids) / sizeof(sids[0]);
     const unsigned int np = sizeof(prefs) / sizeof(prefs[0]);
-    for (unsigned int k = 0; k < np; ++k) {
+    for (unsigned int k = 0; k < ns + np; ++k) {
+        const bool bySid = k < ns;
+        const char* key = bySid ? sids[k] : prefs[k - ns];
         char sid[48]; sid[0] = '\0';
         __try {
             g_dataScratch.clear();
@@ -1200,7 +1323,8 @@ int probeAddAnyToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
             unsigned int n = g_dataScratch.size();
             for (unsigned int i = 0; i < n; ++i) {
                 GameData* gd = g_dataScratch[i];
-                if (gd && ciContains(gd->name.c_str(), prefs[k])) {
+                if (!gd) continue;
+                if (bySid ? (gd->stringID == key) : ciContains(gd->name.c_str(), key)) {
                     const char* s = gd->stringID.c_str();
                     strncpy(sid, s ? s : "", sizeof(sid) - 1);
                     sid[sizeof(sid) - 1] = '\0';
@@ -1241,9 +1365,9 @@ int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int
     }
     if (!sid[0]) return 0;
     // Snapshot current contents (with parallel Item* for removal), then remove by key.
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64];
-    Item* curItems[64];
+    const unsigned int MAXC = INV_ITEMS_MAX;
+    InvItemEntry cur[INV_ITEMS_MAX];
+    Item* curItems[INV_ITEMS_MAX];
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
     return removeByKey(inv, curItems, cur, ncur, sid, typeCat, qty, /*wantEquipped=*/0);
 }
@@ -1278,9 +1402,9 @@ int readGearGradeBySid(GameWorld* gw, const unsigned int cHand[5], const char* s
     if (!ro) return 0;
     Inventory* inv = invOf(ro);
     if (!inv) return 0;
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64];
-    Item* curItems[64];
+    const unsigned int MAXC = INV_ITEMS_MAX;
+    InvItemEntry cur[INV_ITEMS_MAX];
+    Item* curItems[INV_ITEMS_MAX];
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
     __try {
         for (unsigned int i = 0; i < ncur; ++i) {
@@ -1349,9 +1473,9 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
     Inventory* src = invOf(srcRo);
     Inventory* dst = invOf(dstRo);
     if (!src || !dst) return 0;
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64];
-    Item* curItems[64];
+    const unsigned int MAXC = INV_ITEMS_MAX;
+    InvItemEntry cur[INV_ITEMS_MAX];
+    Item* curItems[INV_ITEMS_MAX];
     unsigned int ncur = readInvItems(src, cur, curItems, MAXC);
     int moved = 0;
     // This is normally a SANCTIONED cross-owner relocation (Protocol 37
@@ -1506,9 +1630,9 @@ int dropItemFromInventory(GameWorld* gw, const unsigned int cHand[5],
         // Re-snapshot each iteration: dropItem mutates _allItems, so a cached Item*
         // could dangle. Find the first LOOSE entry matching (sid,type) and drop it.
         for (int d = 0; d < qty; ++d) {
-            const unsigned int MAXC = 64;
-            InvItemEntry cur[64];
-            Item* curItems[64];
+            const unsigned int MAXC = INV_ITEMS_MAX;
+            InvItemEntry cur[INV_ITEMS_MAX];
+            Item* curItems[INV_ITEMS_MAX];
             unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
             Item* victim = 0;
             // Two passes so a LOOSE copy is always preferred over a worn one: dropping the
@@ -1660,8 +1784,9 @@ unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int ma
                 Ogre::Vector3 p(0,0,0);
                 __try { p = o->getPosition(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
                 Item* it = reinterpret_cast<Item*>(o);
-                int qty = 1; float ql = 0.0f;
-                __try { qty = it->quantity; ql = it->quality; } __except (EXCEPTION_EXECUTE_HANDLER) { qty = 1; ql = 0.0f; }
+                int qty = 1; float ql = 0.0f; bool sev = false;
+                __try { qty = it->quantity; ql = it->quality; sev = (it->itemFunction == ITEM_SEVERED_LIMB); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { qty = 1; ql = 0.0f; sev = false; }
                 if (qty < 1) qty = 1;
                 WorldItemRaw& w = out[n];
                 for (int t = 0; t < 5; ++t) w.hand[t] = hd[t];
@@ -1671,6 +1796,7 @@ unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int ma
                 w.quantity = (unsigned short)(qty > 0xFFFF ? 0xFFFF : qty);
                 w.quality  = qualityBucketOf(ql);
                 w.x = p.x; w.y = p.y; w.z = p.z;
+                w.severed = sev ? 1 : 0;
                 w.hash = worldItemHash(w.stringID, w.itemType, w.quantity, w.quality);
                 ++n;
             }
@@ -2176,9 +2302,9 @@ unsigned int captureWeaponPtrs(GameWorld* gw, const unsigned int cHand[5],
     if (!ro) return 0;
     Inventory* inv = invOf(ro);
     if (!inv) return 0;
-    const unsigned int MAXC = 64;
-    InvItemEntry ent[64];
-    Item* its[64];
+    const unsigned int MAXC = INV_ITEMS_MAX;
+    InvItemEntry ent[INV_ITEMS_MAX];
+    Item* its[INV_ITEMS_MAX];
     unsigned int ncur = readInvItems(inv, ent, its, MAXC);
     unsigned int n = 0;
     for (unsigned int i = 0; i < ncur && n < maxOut; ++i) {
@@ -2228,8 +2354,8 @@ int findEquippedItemKey(GameWorld* gw, const unsigned int cHand[5],
     if (!ro) return 0;
     Inventory* inv = invOf(ro);
     if (!inv) return 0;
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64];
+    const unsigned int MAXC = INV_ITEMS_MAX;
+    InvItemEntry cur[INV_ITEMS_MAX];
     unsigned int ncur = readInvItems(inv, cur, 0, MAXC);
     int found = 0; int eqCount = 0;
     for (unsigned int i = 0; i < ncur; ++i) {
@@ -2255,9 +2381,9 @@ int removeEquippedItem(GameWorld* gw, const unsigned int cHand[5],
     if (!ro) return 0;
     Inventory* inv = invOf(ro);
     if (!inv) return 0;
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64];
-    Item* curItems[64];
+    const unsigned int MAXC = INV_ITEMS_MAX;
+    InvItemEntry cur[INV_ITEMS_MAX];
+    Item* curItems[INV_ITEMS_MAX];
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
     return removeByKey(inv, curItems, cur, ncur, sid, typeCat, qty, /*wantEquipped=*/1);
 }
@@ -2286,8 +2412,8 @@ int unequipItemToLoose(GameWorld* gw, const unsigned int cHand[5],
     if (!ro) return 0;
     Inventory* inv = invOf(ro);
     if (!inv) return 0;
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64]; Item* curItems[64];
+    const unsigned int MAXC = INV_ITEMS_MAX;
+    InvItemEntry cur[INV_ITEMS_MAX]; Item* curItems[INV_ITEMS_MAX];
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
     int moved = 0;
     for (unsigned int i = 0; i < ncur && moved < qty; ++i) {
@@ -2309,8 +2435,8 @@ int reequipLooseItem(GameWorld* gw, const unsigned int cHand[5],
     if (!ro) return 0;
     Inventory* inv = invOf(ro);
     if (!inv) return 0;
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64]; Item* curItems[64];
+    const unsigned int MAXC = INV_ITEMS_MAX;
+    InvItemEntry cur[INV_ITEMS_MAX]; Item* curItems[INV_ITEMS_MAX];
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
     int moved = 0;
     for (unsigned int i = 0; i < ncur && moved < qty; ++i) {

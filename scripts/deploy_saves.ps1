@@ -31,7 +31,15 @@ param(
     # Restore even if a Kenshi process is running (unsafe: may fight a mid-write).
     [switch]$Force,
     # Override the live save root (defaults to the per-user AppData folder).
-    [string]$SaveRoot = (Join-Path $env:LOCALAPPDATA "kenshi\save")
+    [string]$SaveRoot = (Join-Path $env:LOCALAPPDATA "kenshi\save"),
+    # Live folder name for the single -Save fixture (default: the fixture name).
+    # Parallel test pairs each load a private copy (e.g. sync -> sync_s2): the
+    # game takes saves from the one per-user folder whatever its install dir.
+    [string]$As = "",
+    # ';'-separated folders whose Kenshi processes the running-game refusal
+    # ignores: other test pairs' private installs, which only ever load their
+    # own suffixed copies and so cannot be writing the folder restored here.
+    [string]$IgnoreProcessesUnder = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,13 +50,22 @@ $fixturesDir = Join-Path $repoRoot "fixtures\saves"
 if (-not $All -and $Save -eq "") {
     throw "Specify -Save <name> or -All."
 }
+if ($All -and $As -ne "") {
+    throw "-As renames one fixture; it cannot be combined with -All."
+}
 if (-not (Test-Path $fixturesDir)) {
     throw "Fixture store not found: $fixturesDir"
 }
 
 # Refuse to clobber a save the game might be mid-writing.
 if (-not $Force) {
-    $live = @(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue)
+    $ignore = @($IgnoreProcessesUnder -split ';' | Where-Object { $_.Trim() -ne "" } |
+                ForEach-Object { $_.Trim().TrimEnd('\') + '\' })
+    $live = @(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue |
+              Where-Object {
+                  $p = $_.Path
+                  -not ($p -and @($ignore | Where-Object { $p.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
+              })
     if ($live.Count -gt 0) {
         throw "Kenshi is running ($($live.Count) process(es)); refusing to restore saves. Close it or pass -Force."
     }
@@ -74,7 +91,8 @@ foreach ($name in $targets) {
         $skipped++
         continue
     }
-    $dst = Join-Path $SaveRoot $name
+    $liveName = if ($As -ne "") { $As } else { $name }
+    $dst = Join-Path $SaveRoot $liveName
     & robocopy $src $dst /MIR /R:1 /W:1 /NFL /NDL /NP /NJH /NJS | Out-Null
     $rc = $LASTEXITCODE
     if ($rc -ge 8) { throw "robocopy failed restoring '$name' (rc=$rc): $src -> $dst" }

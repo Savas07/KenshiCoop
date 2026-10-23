@@ -865,3 +865,30 @@ waits a full grace again instead of retrying every tick.
 on what both screens show. A shortfall the reconcile deliberately leaves open for
 another channel needs a deadline, or an edge that channel never sees is lost for
 good.
+
+## 28. An item the engine makes on its own has no drop edge
+
+The world-item scan sorts every new ground item into one of two kinds. A drop a
+player made has an edge (`rememberDrop`) and streams. Anything else is scenery
+both worlds already have, so it is baselined and never sent. A severed limb is
+neither. The engine creates it the moment a cut lands, with no drop behind it,
+so the host baselined every limb it cut. The join's engine makes its own limb
+when the amputation replicates, and the join-side dedupe
+(`destroySeveredLimbsNear`) removed it to avoid a double. `limb_loss` showed the
+result: no limb on the join, ever.
+
+The cut is now the edge. Whoever applies an amputation on the host
+(`EVT_AMPUTATE` sent for a host body, or applied for a join's) records the
+stump's position with `noteSeveredLimbAt`. The scan reads the item's
+`ITEM_SEVERED_LIMB` flag. A new severed item within 4 u of a recorded cut is
+claimed as an own drop. A track the scan already baselined is flipped while it
+is still young (`PEND_MS`), because the limb can appear a tick before the event
+is sent. The limb then streams (`[wi] SCAN-OWN ... (severed limb; streams)`),
+and the join's dedupe keeps the streamed proxy. Run 20261023_155852_s2: the
+limb crossed in 64 ms in both directions.
+
+**Rule.** A classifier that only sees "this appeared" cannot tell a player's
+action from the engine's side effect. Have the event that caused the effect
+leave the mark the classifier needs, at the moment it happens. The item's own
+template is not enough here: the limb's template is not known when the cut is
+recorded.

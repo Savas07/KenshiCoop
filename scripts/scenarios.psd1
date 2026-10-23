@@ -1211,14 +1211,16 @@
         # vendor_ui (manual T1, operator-driven): no scripted trade; the join
         # opens the bar's trade window at 8 s and the operator buys/sells
         # through the real UI. Both sides log VSTOCK at 1 Hz for 900 s; the
-        # same vendor_away gates judge the shared stock and cash.
+        # same vendor_away gates judge the shared stock and cash. Tier 'none':
+        # unattended it can only time out (nobody trades, and the 900 s window
+        # outlives every automated backstop), so it is run by hand only.
         vendor_ui = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'vendor_ui'
             Gating   = @('vendor_ui', 'clock_sync')
             Advisory = @()
-            Tier = 'full'; WanVariant = $false
+            Tier = 'none'; WanVariant = $false
         }
 
         # trade_lock (protocol 65): one player trades with a merchant at a time.
@@ -2589,6 +2591,17 @@
             Save = 'squad2'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'join_bag'
             Gating   = @('join_bag', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
+        # inv_bigstack (protocol 66): a join character holding more than 64 snapshot entries
+        # (top level + bag contents). Up to protocol 65 everything past the 64th was truncated
+        # and never reached the host's copy, i.e. the host's save.
+        inv_bigstack = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'big_stack'
+            Gating   = @('big_stack', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $false
         }

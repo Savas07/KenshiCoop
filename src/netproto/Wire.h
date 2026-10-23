@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 65;
+const u16 PROTOCOL_VERSION = 66;
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -606,11 +606,12 @@ const u8 INV_FLAG_CORPSE    = 0x04;
 // bytes cost nothing in steady state.
 //
 // Raised 20 -> 64 in protocol 46 to match the receiver's own read depth (MAXC in
-// applyContainerContents). At 20 a backpacked character overflowed constantly, and every
-// overflow was an item-loss event; 64 covers a realistically loaded squad member so
-// INV_FLAG_TRUNCATED becomes the rare fallback (big storage chests) rather than the
-// routine case. Bounded by the u8 `count` field (255).
-const unsigned int INV_ITEMS_MAX = 64;
+// applyContainerContents), and 64 -> 255 in protocol 66: a loaded character plus a full
+// backpack's contents passes 64 entries, and the tail of a truncated snapshot never
+// reached the peer (additive-only reconcile). 255 is the u8 `count` field's ceiling;
+// every local read and reconcile buffer is sized by this constant, so the receiver can
+// always hold whatever the sender describes.
+const unsigned int INV_ITEMS_MAX = 255;
 
 // ---- Phase W1: world-item (ground drop) snapshot ---------------------------
 // Generalizes the Phase 4a content-snapshot/reconcile model from CONTAINERS to the open
@@ -924,7 +925,7 @@ enum TradeOp {
 const u8  TRADE_FLAG_STOCK     = 0x01; // the InvItemEntry tail + money are valid
 const u8  TRADE_FLAG_TRUNCATED = 0x02; // the table did not fit TRADE_LINES_MAX
 const u32 TRADE_NOBODY         = 0xFFFFFFFFu;
-const unsigned int TRADE_LINES_MAX = 2 * INV_ITEMS_MAX;
+const unsigned int TRADE_LINES_MAX = 255; // TradeHeader::count is a u8
 struct TradeHeader {
     u8   type;       // = PKT_TRADE
     u8   op;         // TradeOp

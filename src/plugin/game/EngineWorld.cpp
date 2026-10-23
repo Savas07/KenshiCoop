@@ -1604,8 +1604,8 @@ static void fillContRead(Building* b, ContRead* r) {
     Inventory* inv = ro->getInventory();
     r->hasInv = inv ? 1 : 0;
     if (inv) {
-        InvItemEntry ent[64];
-        unsigned int n = readInvItems(inv, ent, 0, 64);
+        InvItemEntry ent[INV_ITEMS_MAX];
+        unsigned int n = readInvItems(inv, ent, 0, INV_ITEMS_MAX);
         r->nEntries = (int)n;
         unsigned int h = 0; int qt = 0;
         for (unsigned int i = 0; i < n; ++i) {

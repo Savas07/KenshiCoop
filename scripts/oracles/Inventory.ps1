@@ -1427,6 +1427,45 @@ function Test-JoinBag {
                             nestedSkip = $skipN })
 }
 
+# inv_bigstack: a JOIN character past the old 64-entry wire cap. The join fills its rank-1 tab
+# leader to ~100 snapshot entries; the host's copy (the save the next session loads) must end
+# with the same entry count and content hash, and neither side's read may be truncated.
+function Test-BigStack {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = "BIGINV verdict role=(host|join) pass=(\d+) count=(\d+) hash=(\d+) trunc=(\d+) fill=(-?\d+) added=(-?\d+)"
+    $read = {
+        param($file, $role)
+        if (-not (Test-Path $file)) { return $null }
+        $m = Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue |
+             Where-Object { $_.Matches[0].Groups[1].Value -eq $role } | Select-Object -Last 1
+        if ($null -eq $m) { return $null }
+        $g = $m.Matches[0].Groups
+        return [pscustomobject]@{ pass = ([int]$g[2].Value -eq 1); count = [int]$g[3].Value
+                                  hash = [uint32]$g[4].Value; trunc = [int]$g[5].Value
+                                  fill = [int]$g[6].Value; added = [int]$g[7].Value }
+    }
+    $h = & $read $HostFile 'host'
+    $j = & $read $JoinFile 'join'
+    $ok = $true
+    foreach ($side in @(@('host', $h), @('join', $j))) {
+        $role = $side[0]; $s = $side[1]
+        if ($null -eq $s) { Write-Host "  BIG-STACK [$role] FAIL - no BIGINV verdict"; $ok = $false; continue }
+        Write-Host ("  BIG-STACK [$role] " + $(if ($s.pass) { "PASS" } else { "FAIL" }) +
+                    " - entries=$($s.count) hash=$($s.hash) truncated=$($s.trunc)")
+        if (-not $s.pass) { $ok = $false }
+    }
+    $match = ($null -ne $h -and $null -ne $j -and $h.count -eq $j.count -and $h.hash -eq $j.hash)
+    if ($null -ne $j) { Write-Host "  BIG-STACK join filled to $($j.fill) entries ($($j.added) added)" }
+    $sendTrunc = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[inv\] SEND-TRUNCATED' -Quiet)
+    Write-Host "  BIG-STACK host copy matches the join: $match; join sent a truncated snapshot: $sendTrunc"
+    if (-not $match) { $ok = $false }
+    Write-Host ("  BIG-STACK " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "big_stack" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostCount = $(if ($h) { $h.count } else { $null })
+                            joinCount = $(if ($j) { $j.count } else { $null })
+                            hashMatch = $match; sendTruncated = $sendTrunc })
+}
+
 function Test-DumpAll {
     param([string]$HostFile, [string]$JoinFile)
     $rxH = "WDMP verdict role=host pass=(\d+) kit=(-?\d+) want=(-?\d+) dropped=(-?\d+) grndPeak=(-?\d+) grndFinal=(-?\d+) heldR1=(-?\d+) conserved=(\d+) dist='([^']*)'"

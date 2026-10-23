@@ -263,6 +263,7 @@ function Invoke-OneOracle {
         "world_item_stale" { return (Test-WorldItemStale -HostFile $HostLog -JoinFile $JoinLog) }
         "nested_bag"    { return (Test-NestedBag       -HostFile $HostLog -JoinFile $JoinLog) }
         "join_bag"      { return (Test-JoinBag         -HostFile $HostLog -JoinFile $JoinLog) }
+        "big_stack"     { return (Test-BigStack        -HostFile $HostLog -JoinFile $JoinLog) }
         "dump_all"      { return (Test-DumpAll         -HostFile $HostLog -JoinFile $JoinLog) }
         "no_phantom_pickups" { return (Test-NoPhantomPickups -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_loot"   { return (Test-WeaponLoot      -HostFile $HostLog -JoinFile $JoinLog) }
@@ -522,7 +523,7 @@ Export-ModuleMember -Function @(
     "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
     "Test-WorldItemSync", "Test-RejoinItems", "Test-WpnRelocate", "Test-WeaponDrop",
     "Test-WorldPickupMirror", "Test-NativePickup", "Test-CorpseLoot", "Test-CorpseLootRace", "Test-GearRepickup", "Test-GearRedrop", "Test-NoPhantomPickups", "Test-WorldItemBurst",
-    "Test-NestedBag", "Test-JoinBag", "Test-DumpAll",
+    "Test-NestedBag", "Test-JoinBag", "Test-BigStack", "Test-DumpAll",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",

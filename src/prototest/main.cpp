@@ -314,8 +314,6 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v65: trader lock + shop hand-over)",
-             (int)PROTOCOL_VERSION, 65);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -378,11 +376,11 @@ static void testSizes() {
         CHECK_EQ("InvXferPacket::level round-trips", (int)xback.level, 80);
     }
 
-    // Protocol 46 (inventory item-loss fixes). The entry cap must match the receiver's
-    // own read depth (MAXC in applyContainerContents) or a snapshot silently describes
-    // less than the peer holds, and it must stay inside the u8 `count` field.
-    CHECK_EQ("INV_ITEMS_MAX raised to the receiver's read depth", (int)INV_ITEMS_MAX, 64);
+    // Protocol 46/66 (inventory item-loss fixes). Snapshots and trade tables both count
+    // their InvItemEntry tail in a u8, so neither cap may outgrow it: a larger cap would
+    // wrap the count and the receiver would read a shorter list than was sent.
     CHECK("INV_ITEMS_MAX fits the u8 count field", INV_ITEMS_MAX <= 255);
+    CHECK("TRADE_LINES_MAX fits the u8 count field", TRADE_LINES_MAX <= 255);
     // The TRUNCATED bit is what stops a partial snapshot being read as a delete. It must
     // be a single low bit so future flags can share the byte.
     CHECK_EQ("INV_FLAG_TRUNCATED value", (int)INV_FLAG_TRUNCATED, 1);

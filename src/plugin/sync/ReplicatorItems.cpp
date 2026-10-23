@@ -102,10 +102,10 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
     if (owned.empty()) return;
     // Periodic safety resend (late join / a container returning to interest). The channel
-    // is RELIABLE, so this is not loss recovery - it is a cheap re-assert. With
-    // INV_ITEMS_MAX at 64 a full snapshot is ~10 KB, so a censused chest farm re-asserting
-    // every 5 s would cost real bandwidth for nothing; big snapshots re-assert on the slow
-    // interval instead. Small ones keep the historical cadence.
+    // is RELIABLE, so this is not loss recovery - it is a cheap re-assert. A full snapshot
+    // runs ~160 bytes per entry (~40 KB at INV_ITEMS_MAX), so a censused chest farm
+    // re-asserting every 5 s would cost real bandwidth for nothing; big snapshots re-assert
+    // on the slow interval instead. Small ones keep the historical cadence.
     const unsigned long INV_RESEND_MS      = 5000;
     const unsigned long INV_RESEND_BIG_MS  = 30000;
     const unsigned int  INV_RESEND_BIG_N   = 24;   // entries above which "big" applies
@@ -301,8 +301,8 @@ void Replicator::applyInventories(GameWorld* gw) {
         if (xferScanMs_ != 0 && xferSeeded_.count(k) != 0 &&
             engine::resolveObjectByHand(cHand) != 0) {
             const unsigned long XFER_DEFER_MS = 3000;
-            InvItemEntry cur[64];
-            unsigned int nc = engine::captureContainerContents(gw, cHand, cur, 64, 0);
+            InvItemEntry cur[INV_ITEMS_MAX];
+            unsigned int nc = engine::captureContainerContents(gw, cHand, cur, INV_ITEMS_MAX, 0);
             std::map<XKey, int> tot;
             for (unsigned int i = 0; i < nc; ++i) {
                 int q = cur[i].quantity; if (q < 1) q = 1;
@@ -335,8 +335,8 @@ void Replicator::applyInventories(GameWorld* gw) {
             engine::resolveObjectByHand(cHand) != 0) {
             unsigned long now = nowMs();
             // Local capture: totals for the catch-up check + entries for provenance.
-            InvItemEntry loc[64];
-            unsigned int nl = engine::captureContainerContents(gw, cHand, loc, 64, 0);
+            InvItemEntry loc[INV_ITEMS_MAX];
+            unsigned int nl = engine::captureContainerContents(gw, cHand, loc, INV_ITEMS_MAX, 0);
             adj.assign(items, items + n);
             for (std::map<XKey, XferLatch>::iterator le = lt->second.begin();
                  le != lt->second.end(); ) {
@@ -446,6 +446,10 @@ static u32 worldTrackHash(const char* sid, u32 type, u16 qty, u16 qual) {
     return h ? h : 1u;
 }
 
+// severedDrops_ records carry no template (a cut does not say which limb item the
+// engine minted); this key matches any severed limb the scan finds near the cut.
+static const char* const SEVERED_KEY = "*severed*";
+
 void Replicator::rememberDrop(std::vector<RecentDrop>& v, const char* sid,
                               float x, float y, float z, unsigned long now, size_t cap) {
     if (!sid || !sid[0] || cap == 0) return;
@@ -468,6 +472,14 @@ bool Replicator::takeRecentDrop(std::vector<RecentDrop>& v, const char* sid, flo
         ++i;
     }
     return false;
+}
+
+void Replicator::noteSeveredLimbAt(Character* body) {
+    unsigned int h[5]; float p[3];
+    if (!body || !engine::readObjectHand(reinterpret_cast<RootObject*>(body), h) ||
+        !engine::objectWorldPos(h, p))
+        return;
+    rememberDrop(severedDrops_, SEVERED_KEY, p[0], p[1], p[2], nowMs(), 16);
 }
 
 RootObject* Replicator::liveWorldProxy(const WorldProxy& wp) {
@@ -524,10 +536,12 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     // in a cell that loaded later (travel), streamed as a "new" item and was
     // duplicated on the peer. Now a row only the scan found (no drop-hook edge)
     // is a native whenever it is first seen, unless it is one of our own drops
-    // the hook could not key (pendingDrops_ / dormantDrops_, Discovery 2).
+    // the hook could not key (pendingDrops_ / dormantDrops_, Discovery 2), or the
+    // severed limb of an amputation this host just ran (severedDrops_).
     const float         PEND_TOL    = 2.5f;  // hook drop pos vs where it settled
     const unsigned long PEND_MS     = 10000; // the scan reaches a town drop late
     const float         DORMANT_TOL = 1.0f;  // an unloaded item reloads where it lay
+    const float         SEVER_TOL   = 4.0f;  // body pos at the cut vs where the limb fell
     const size_t        PEND_CAP    = 64;
     const size_t        DORMANT_CAP = 256;
 
@@ -622,12 +636,15 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 WorldTrack t; memset(&t, 0, sizeof(t));
                 t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
                 t.x = raw[i].x; t.y = raw[i].y; t.z = raw[i].z; t.seen = true;
+                t.firstSeenMs = now;
                 strncpy(t.stringID, raw[i].stringID, sizeof(t.stringID) - 1);
                 t.stringID[sizeof(t.stringID) - 1] = '\0';
                 t.itemType = raw[i].itemType; t.quantity = raw[i].quantity; t.quality = raw[i].quality;
                 const bool ownDrop =
                     takeRecentDrop(pendingDrops_, t.stringID, t.x, t.z, PEND_TOL, now, PEND_MS) ||
-                    takeRecentDrop(dormantDrops_, t.stringID, t.x, t.z, DORMANT_TOL, now, 0);
+                    takeRecentDrop(dormantDrops_, t.stringID, t.x, t.z, DORMANT_TOL, now, 0) ||
+                    (raw[i].severed &&
+                     takeRecentDrop(severedDrops_, SEVERED_KEY, t.x, t.z, SEVER_TOL, now, PEND_MS));
                 t.baseline = !ownDrop; // never emit a native
                 if (t.baseline) ++natives;
                 else if (dumpWi) { char b[200]; _snprintf(b, sizeof(b) - 1,
@@ -641,6 +658,19 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 strncpy(tr.stringID, raw[i].stringID, sizeof(tr.stringID) - 1);
                 tr.stringID[sizeof(tr.stringID) - 1] = '\0';
                 tr.itemType = raw[i].itemType; tr.quantity = raw[i].quantity; tr.quality = raw[i].quality;
+                // The medical publish samples limb loss at ~2.5 Hz, so the scan can meet
+                // a fresh severed limb before its cut is recorded and baseline it. A cut
+                // recorded while the track is still young claims it: it streams now.
+                if (tr.baseline && raw[i].severed && tr.firstSeenMs != 0 &&
+                    now - tr.firstSeenMs <= PEND_MS &&
+                    takeRecentDrop(severedDrops_, SEVERED_KEY, raw[i].x, raw[i].z, SEVER_TOL,
+                                   now, PEND_MS)) {
+                    tr.baseline = false;
+                    if (dumpWi) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[wi] SCAN-OWN netId=%u sid='%s' pos=%.2f,%.2f,%.2f (severed limb; streams)",
+                        tr.netId, tr.stringID, raw[i].x, raw[i].y, raw[i].z);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                }
             }
         }
         if (!worldSeeded_) {
@@ -1800,8 +1830,8 @@ void Replicator::xferRebase(GameWorld* gw, const Key& k) {
     std::map<XKey, int>& base = xferBase_[k];
     base.clear();
     if (engine::resolveObjectByHand(cHand) != 0) {
-        InvItemEntry items[64];
-        unsigned int n = engine::captureContainerContents(gw, cHand, items, 64, 0);
+        InvItemEntry items[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX, 0);
         for (unsigned int i = 0; i < n; ++i) {
             int q = items[i].quantity; if (q < 1) q = 1;
             base[XKey(std::string(items[i].stringID), items[i].itemType)] += q;
@@ -1876,14 +1906,14 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     if (tracked.empty()) return;
 
     // Capture this scan's per-item totals for each resolvable container.
-    InvItemEntry items[64];
+    InvItemEntry items[INV_ITEMS_MAX];
     std::map<Key, std::map<XKey, int> > cur;
     for (std::set<Key>::iterator it = tracked.begin(); it != tracked.end(); ++it) {
         unsigned int cHand[5];
         handForContainerKey(*it, cHand, peerContainerOwner(*it));
         if (engine::resolveObjectByHand(cHand) == 0) continue;
         std::map<XKey, int>& tot = cur[*it];
-        unsigned int n = engine::captureContainerContents(gw, cHand, items, 64, 0);
+        unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX, 0);
         for (unsigned int i = 0; i < n; ++i) {
             int q = items[i].quantity; if (q < 1) q = 1;
             tot[XKey(std::string(items[i].stringID), items[i].itemType)] += q;

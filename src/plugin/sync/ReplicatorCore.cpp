@@ -284,6 +284,7 @@ void Replicator::resetSession() {
     worldSeeded_ = false; // re-log the reloaded world's save-native census
     pendingDrops_.clear(); // after a reload every ground item is a save-native
     dormantDrops_.clear();
+    severedDrops_.clear();
     weaponCensus_.clear();
     appliedDrops_.clear();
     appliedPickups_.clear();

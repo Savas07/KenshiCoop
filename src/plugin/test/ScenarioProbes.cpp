@@ -1018,6 +1018,12 @@ private:
     static bool inPlatoon(const unsigned int ch[5], const unsigned int p[5]) {
         return ch[1] == p[1] && ch[2] == p[2];
     }
+    // Position-independent order for tied picks (every field, the type included).
+    static bool handBefore(const unsigned int a[5], const unsigned int b[5]) {
+        for (int i = 0; i < 5; ++i)
+            if (a[i] != b[i]) return a[i] < b[i];
+        return false;
+    }
 
     void logEvidence(const ScenarioContext& ctx) {
         engine::ShopCounterRead rows[MAX_COUNTERS];
@@ -1139,13 +1145,29 @@ private:
         if (pick < 0) return;
         engine::TraderRead trs[MAX_TRADERS];
         unsigned int nt = engine::listTradersNear(ctx.gw, RADIUS, trs, MAX_TRADERS);
-        float tb = 1e18f; int tp = -1;
+        // The shopkeeper outranks platoon members the engine does not call a trader.
+        bool anyTrader = false;
+        for (unsigned int i = 0; i < nt; ++i)
+            if (inPlatoon(trs[i].hand, rows[pick].owner) && trs[i].isTrader == 1) anyTrader = true;
+        float tb = 1e18f;
         for (unsigned int i = 0; i < nt; ++i) {
             if (!inPlatoon(trs[i].hand, rows[pick].owner)) continue;
+            if (anyTrader && trs[i].isTrader != 1) continue;
             float dx = trs[i].x - rows[pick].x, dz = trs[i].z - rows[pick].z;
-            float d2 = dx * dx + dz * dz;
-            if (trs[i].isTrader == 1) d2 *= 0.25f; // the shopkeeper wins ties
-            if (d2 < tb) { tb = d2; tp = (int)i; }
+            float d = sqrt(dx * dx + dz * dz);
+            if (d < tb) tb = d;
+        }
+        // Shop staff walk, and each client simulates its own copy: two traders about as near
+        // the counter (35.5 u vs 36.3 u in run 20261023_162604_s3) were ordered differently
+        // on the two clients, which then traded with different merchants. Everyone within
+        // TIE_U of the nearest counts as tied, and the lowest hand wins - the same body on both.
+        int tp = -1;
+        for (unsigned int i = 0; i < nt; ++i) {
+            if (!inPlatoon(trs[i].hand, rows[pick].owner)) continue;
+            if (anyTrader && trs[i].isTrader != 1) continue;
+            float dx = trs[i].x - rows[pick].x, dz = trs[i].z - rows[pick].z;
+            if (sqrt(dx * dx + dz * dz) > tb + TIE_U) continue;
+            if (tp < 0 || handBefore(trs[i].hand, trs[tp].hand)) tp = (int)i;
         }
         if (tp < 0) return;
         memcpy(thand_, rows[pick].owner, sizeof(thand_));
@@ -1370,6 +1392,7 @@ private:
     static const unsigned long LOCK_DURATION_MS = 46000; // trade_lock
     static const float         AWAY_DIST;
     static const float         RADIUS;
+    static const float         TIE_U;     // traders this close to the nearest count as tied
 
     bool          picked_, seeded_;
     unsigned int  step_;       // session step: 3 per session (open, buy, close)
@@ -1386,6 +1409,7 @@ private:
 };
 const float VendorStockScenario::RADIUS = 100.0f;
 const float VendorStockScenario::AWAY_DIST = 400.0f; // 4x the host census radius
+const float VendorStockScenario::TIE_U = 30.0f;
 const VendorStockScenario::Session VendorStockScenario::HOST_SESSIONS[] = {
     { 24000, 28000, 32000, VendorStockScenario::BUY_LAST },
     { 60000, 63000, 66000, VendorStockScenario::SELL }

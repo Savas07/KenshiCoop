@@ -101,7 +101,19 @@ param(
     # Accepts either a hashtable (@{ KEY = 'val' }) or a "KEY=val,KEY2=val2"
     # string. The string form exists because -File passes every argument as a
     # string, so a hashtable literal cannot survive being invoked that way.
-    [object]$DiagEnvOverride = @{}
+    [object]$DiagEnvOverride = @{},
+    # Parallel test pairs (kc_tc run_locked.py --slot N). The game takes saves
+    # from the one per-user folder whatever its install dir (a LOCALAPPDATA
+    # override is ignored: run 20261023_152851 still reported the real
+    # savePath), so every pair but the first loads a private copy of the
+    # fixture named <Save><SaveSuffix>, e.g. sync_s2.
+    [string]$SaveSuffix = "",
+    # ';'-separated install dirs of the OTHER pairs: their games only touch
+    # their own suffixed copies, so the restore's running-game refusal skips them.
+    [string]$PeerInstanceDirs = "",
+    # Cross-pair load lock file: held from the host launch until the join
+    # reaches gameplay, so no two pairs load zones at the same time (empty = off).
+    [string]$LoadLockFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -122,6 +134,8 @@ if ($Scenario -ne "" -and $manifest.Scenarios.ContainsKey($Scenario)) {
 }
 if ($Tolerance -eq 0) { $Tolerance = 3.0 }
 if ($Save -eq "") { throw "No -Save given and scenario '$Scenario' has no manifest default." }
+# The folder both games actually load (the fixture's private copy for a parallel pair).
+$liveSave = "$Save$SaveSuffix"
 
 # Normalize -DiagEnvOverride to a hashtable, then validate it HERE rather than at
 # apply time: apply happens per client inside the launch path, so a typo would
@@ -197,9 +211,9 @@ $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
 # Fail fast (before starting the WAN proxy) on a name that exists neither as a repo
 # fixture (restored later) nor already in AppData (debug saves not tracked in-repo).
 if (-not (Test-Path (Join-Path $repoRoot "fixtures\saves\$Save\quick.save")) -and `
-    -not (Test-Path (Join-Path $saveRoot $Save))) {
+    ($SaveSuffix -ne "" -or -not (Test-Path (Join-Path $saveRoot $Save)))) {
     $avail = (Get-ChildItem $saveRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
-    throw "Save '$Save' not found as a repo fixture or in $saveRoot. Available saves: $avail"
+    throw "Save '$Save' not found as a repo fixture or in $saveRoot (a -SaveSuffix run needs a repo fixture). Available saves: $avail"
 }
 
 $hostLog = Join-Path $OutDir "host.log"
@@ -243,7 +257,7 @@ if ($Wan -ne "") {
 }
 
 Write-Host "== KenshiCoop test run =="
-Write-Host "  save:     $Save"
+Write-Host "  save:     $Save$(if ($SaveSuffix -ne '') { " (live copy '$liveSave')" })"
 Write-Host "  seconds:  $Seconds"
 if ($Scenario -ne "") { Write-Host "  scenario: $Scenario (tolerance $Tolerance u)" }
 if ($Wan -ne "") { Write-Host "  wan:      $Wan (proxy port $joinPort)" }
@@ -277,6 +291,7 @@ $runJson = [ordered]@{
     scenario      = $Scenario
     variant       = $variant
     save          = $Save
+    liveSave      = $liveSave
     setup         = $Setup
     tolerance     = $Tolerance
     seconds       = $Seconds
@@ -313,13 +328,17 @@ if (-not $NoKill) {
 # validation save. Runs after the stale-Kenshi kill (the game must not be writing).
 # Debug saves with no repo fixture are left as-is. This is the single choke point
 # for the whole loopback matrix, since regress.ps1 invokes run_test.ps1 per scenario.
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "deploy_saves.ps1") -Save $Save
+# (Windows PowerShell drops an empty native argument, so -IgnoreProcessesUnder only when set.)
+$deployArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $scriptDir "deploy_saves.ps1"),
+                "-Save", $Save, "-As", $liveSave)
+if ($PeerInstanceDirs -ne "") { $deployArgs += @("-IgnoreProcessesUnder", $PeerInstanceDirs) }
+& powershell @deployArgs
 if ($LASTEXITCODE -ne 0) { throw "deploy_saves.ps1 failed for '$Save' ($LASTEXITCODE)" }
 
 # Fail fast on a bad save name (auto-loading a non-existent save crashes the game).
-if (-not (Test-Path (Join-Path $saveRoot $Save))) {
+if (-not (Test-Path (Join-Path $saveRoot $liveSave))) {
     $avail = (Get-ChildItem $saveRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
-    throw "Save '$Save' not found in $saveRoot (and no repo fixture to restore). Available saves: $avail"
+    throw "Save '$liveSave' not found in $saveRoot (and no repo fixture to restore). Available saves: $avail"
 }
 
 if ($Sync) {
@@ -343,7 +362,7 @@ function Set-CoopEnv {
     # The join connects through the WAN proxy when one is active.
     $env:KENSHICOOP_PORT         = if ($Mode -eq "join") { "$joinPort" } else { "$Port" }
     $env:KENSHICOOP_IP           = if ($Mode -eq "join") { $joinIp } else { $Ip }
-    $env:KENSHICOOP_SAVE         = $Save
+    $env:KENSHICOOP_SAVE         = $liveSave
     $env:KENSHICOOP_TEST_SECONDS = "$Seconds"
     $env:KENSHICOOP_LOG          = $Log
     $env:KENSHICOOP_SCENARIO     = $Scenario
@@ -370,6 +389,9 @@ function Set-CoopEnv {
     $env:KENSHICOOP_FAKE_CLOCK_SKEW_MS = if ($Mode -eq "join") { "$FakeClockSkewMs" } else { "0" }
     # Peer-ready arming fallback (0 = legacy immediate arming; spike runs).
     $env:KENSHICOOP_ARM_TIMEOUT_MS = "$effArmTimeoutMs"
+    # Automated runs share the desktop with whoever uses the machine: the plugin
+    # refuses to take the foreground (core/FocusGuard.h). Manual sessions do not set it.
+    $env:KENSHICOOP_NO_FOCUS = "1"
 }
 
 # Wait until a regex appears in a (growing) file, or timeout. Returns $true/$false.
@@ -399,7 +421,7 @@ function Take-Shot {
 # Launch a Kenshi instance and get it past Kenshi's Win32 launcher.
 function Start-PastLauncher {
     param([string]$Exe, [string]$WorkDir)
-    $out = & (Join-Path $scriptDir "start_kenshi.ps1") -ExePath $Exe -WorkDir $WorkDir -TimeoutSec $StartTimeoutSec 6>&1
+    $out = & (Join-Path $scriptDir "start_kenshi.ps1") -ExePath $Exe -WorkDir $WorkDir -TimeoutSec $StartTimeoutSec -NoActivate 6>&1
     $out | ForEach-Object { Write-Host "    $_" }
     $line = $out | Where-Object { "$_" -match "GAMEPID=(\d+)" } | Select-Object -First 1
     if ($line -and ("$line" -match "GAMEPID=(\d+)")) { return [int]$Matches[1] }
@@ -413,6 +435,59 @@ function Start-PastLauncher {
 Write-Host "Window layout: automated (1280x1024 x2, $ArrangeMonitor monitor)"
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "set_video_mode.ps1") `
     -Width 1280 -Height 1024 -HostDir $HostDir -JoinDir $JoinDir
+
+# Parallel pairs: only one pair loads at a time (see the zone-load note below;
+# the starvation holds across pairs too). Held from the host launch until the
+# join reaches gameplay; a dead owner's lock is taken over.
+$loadLockHeld = $false
+function Enter-LoadLock {
+    if ($LoadLockFile -eq "") { return }
+    $me = "pid=$PID out=$OutDir"
+    $since = Get-Date
+    $said = $false
+    while ($true) {
+        try {
+            $fs = [System.IO.File]::Open($LoadLockFile, [System.IO.FileMode]::CreateNew,
+                                         [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes($me)
+            $fs.Write($bytes, 0, $bytes.Length); $fs.Close()
+            $script:loadLockHeld = $true
+            if ($said) { Write-Host ("  load lock acquired after {0:N0} s" -f ((Get-Date) - $since).TotalSeconds) }
+            return
+        } catch {
+            # Exists (IOException) or is being deleted by its owner right now
+            # (UnauthorizedAccessException): both mean "busy, look again".
+            $owner = ""
+            try { $owner = [System.IO.File]::ReadAllText($LoadLockFile) } catch {}
+            $ownerPid = 0
+            if ($owner -match 'pid=(\d+)') { $ownerPid = [int]$Matches[1] }
+            $age = 0
+            try { $age = ((Get-Date) - (Get-Item $LoadLockFile -ErrorAction Stop).LastWriteTime).TotalSeconds } catch {}
+            if (($ownerPid -ne 0 -and $null -eq (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)) -or
+                ($ownerPid -eq 0 -and $age -gt 30)) {
+                Write-Host "  load lock: owner '$owner' is gone; taking it over"
+                Remove-Item $LoadLockFile -Force -ErrorAction SilentlyContinue
+                continue
+            }
+            if (-not $said) { Write-Host "  waiting for the load lock (held by '$owner') ..."; $said = $true }
+            if (((Get-Date) - $since).TotalMinutes -gt 20) {
+                Write-Warning "load lock still held after 20 min; loading without it"
+                return
+            }
+            Start-Sleep -Milliseconds 1000
+        }
+    }
+}
+function Exit-LoadLock {
+    if (-not $script:loadLockHeld) { return }
+    Remove-Item $LoadLockFile -Force -ErrorAction SilentlyContinue
+    $script:loadLockHeld = $false
+}
+# A terminating error (launcher failure, ...) must not strand the lock until
+# takeover. A trap covers its whole scope, including lines before it, so it
+# must not depend on the functions above being defined yet.
+trap { if ($script:loadLockHeld) { Remove-Item $LoadLockFile -Force -ErrorAction SilentlyContinue }; break }
+Enter-LoadLock
 
 Write-Host "Launching HOST (and clicking through the launcher) ..."
 Set-CoopEnv -Mode "host" -Log $hostLog
@@ -439,6 +514,19 @@ $joinPid = Start-PastLauncher -Exe $joinExe -WorkDir $JoinDir
 if ($joinPid -eq 0) { Write-Warning "Join failed to get past the launcher; continuing with host only." }
 
 Write-Host "Host game PID=$hostPid  Join game PID=$joinPid"
+
+if ($loadLockHeld) {
+    # Keep the lock until the join is in gameplay too (or has died / timed out).
+    $lockDeadline = (Get-Date).AddSeconds([Math]::Max(240, $StartTimeoutSec))
+    while ($joinPid -ne 0 -and (Get-Date) -lt $lockDeadline -and
+           $null -ne (Get-Process -Id $joinPid -ErrorAction SilentlyContinue)) {
+        if ((Test-Path $joinLog) -and
+            $null -ne (Select-String -Path $joinLog -Pattern "gameplay started" -ErrorAction SilentlyContinue | Select-Object -First 1)) { break }
+        Start-Sleep -Milliseconds 1000
+    }
+    Exit-LoadLock
+    Write-Host "Load lock released."
+}
 
 # Auto-arrange the windows side by side (background, re-pinned through load).
 if (-not $NoArrange -and $hostPid -ne 0) {

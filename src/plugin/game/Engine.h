@@ -710,6 +710,25 @@ int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const cha
 // needs to assert they are both present before it can assert where their contents landed.
 int nestedContainerCount(GameWorld* gw, const unsigned int cHand[5]);
 
+// SEH-guarded, test-only (inv_bigstack): grow the biggest loose grid section of the
+// character at cHand (not a worn slot, not a container slot) to at least w x h cells via
+// Inventory::resizeSection, keeping its content. A real character's grid holds far fewer than
+// 65 distinct stacks, so this is how a test builds a snapshot past the old wire cap; run it on
+// BOTH clients' copies so the receiver has room for what the owner holds. Returns the grid's
+// cell count afterwards (-1 when unresolved) and the section's name and itemsLimit.
+int growLooseGrid(GameWorld* gw, const unsigned int cHand[5], int w, int h, char* outName,
+                  unsigned int nameLen, int* outItemsLimit);
+
+// SEH-guarded, test-only (inv_bigstack): add ONE unit of each ITEM template the character at
+// cHand does not hold yet - into its own grid, else into a carried container with room -
+// until its snapshot read (top level + carried containers, the read the inventory publish
+// sends) reaches wantEntries entries or the templates run out. Distinct templates never merge
+// into an existing stack, so each accepted add is one more entry. Room is checked before an
+// item is minted. Returns the entry count reached (-1 when cHand does not resolve) and the
+// number of items added via outAdded.
+int fillDistinctStacks(GameWorld* gw, const unsigned int cHand[5], unsigned int wantEntries,
+                       int* outAdded);
+
 // 'inventory' setup scene (Phase 4a bake): spawn a save-stable storage container in
 // front of the leader and seed it with a couple of items, so both clients load an
 // identical container with a resolvable hand. Falls back to seeding the leader's own
@@ -886,6 +905,7 @@ struct WorldItemRaw {
     unsigned short quality;     // quality*100 (0 if n/a)
     float          x, y, z;     // world position
     unsigned int   hash;        // content+pos fingerprint
+    unsigned char  severed;     // Item::itemFunction == ITEM_SEVERED_LIMB
 };
 
 // SEH-guarded (host): enumerate free GROUND items within `radius` of the local leader
@@ -1723,8 +1743,10 @@ int applyLimbStates(GameWorld* gw, Character* c, const unsigned char states[4],
 // HOST's copy (spawned by its event-apply) is the canonical one - it streams
 // back as a world-item proxy. Destroy the local free severed-limb item(s)
 // (Item::itemFunction == ITEM_SEVERED_LIMB) within 'radius' of the body at
-// cHand. Returns the number destroyed.
-int destroySeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float radius);
+// cHand, except the nKeep objects in keep[] (the host's streamed severed limbs,
+// which this side holds as world-item proxies). Returns the number destroyed.
+int destroySeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float radius,
+                            RootObject* const* keep, unsigned int nKeep);
 
 // limb_loss oracle read: count FREE severed-limb ground items (itemFunction ==
 // ITEM_SEVERED_LIMB, not in any inventory) within 'radius' of the body at cHand.

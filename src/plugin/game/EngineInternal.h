@@ -331,6 +331,9 @@ typedef Item* (__fastcall* CreateItemFn)(
     GameData* matData, int levelOverride, Faction* flagUniform);
 typedef bool (__fastcall* EquipItemFn)(Inventory* self, Item* item);
 typedef lektor<InventorySection*>* (__fastcall* GetAllSectionsFn)(Inventory* self);
+// Inventory::resizeSection (non-virtual): test lever only (inv_bigstack grows a grid).
+typedef void (__fastcall* ResizeSectionFn)(Inventory* self, InventorySection* sect, int w, int h,
+                                           bool clearContent);
 typedef Item* (__fastcall* GetWeaponFn)(Inventory* self);
 typedef Faction*  (__fastcall* FacBySidFn)(FactionManager* self, const std::string* sid);
 typedef GameData* (__fastcall* FacGetDataFn)(const Faction* self);
@@ -581,6 +584,7 @@ extern GetDataOfTypeFn  g_getDataOfTypeFn;
 extern CreateItemFn     g_createItemFn;
 extern EquipItemFn      g_equipItemFn;
 extern GetAllSectionsFn g_getSectionsFn;
+extern ResizeSectionFn  g_resizeSectionFn;
 extern GetWeaponFn      g_getPrimaryWeaponFn;
 extern GetWeaponFn      g_getSecondaryWeaponFn;
 extern FacBySidFn       g_facBySidFn;

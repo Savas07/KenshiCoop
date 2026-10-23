@@ -29,6 +29,7 @@
 #include "CoopLog.h"
 #include "core/Config.h"
 #include "core/CrashDump.h"
+#include "core/FocusGuard.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
 #include "core/Version.h"
@@ -2394,6 +2395,7 @@ void tickScenarioTick(GameWorld* gw) {
 void mainLoop_hook(GameWorld* gw, float dt) {
     ++g_tick;
     g_lastGw = gw; // cache for the argument-less F2 UI callbacks
+    coop::focusguard::tick(); // no-op unless KENSHICOOP_NO_FOCUS (automated runs)
 
 #ifdef KENSHICOOP_HARNESS
     // TEST-ONLY (KENSHICOOP_TEST_CRASH=<seconds>): fault on purpose, to prove the
@@ -2636,6 +2638,7 @@ void coopPanelDriveSeh() {
 
 void titleUpdate_hook(TitleScreen* self) {
     g_titleUpdate_orig(self);
+    coop::focusguard::tick(); // no-op unless KENSHICOOP_NO_FOCUS (automated runs)
 
     // Bring-up trace: log once on the first title tick, then only when the
     // online state flips (the moment the user toggles ONLINE via F2), so the log
@@ -3135,7 +3138,7 @@ void installEngineDetours() {
         if (!g_cfg.isHost) coop::engine::setVendorRefreshGate(&vendorRefreshGate);
     }
 
-    // Cross-owner trade veto (KENSHICOOP_BLOCK_XFER, default ON in real sessions):
+    // Cross-owner trade veto (KENSHICOOP_BLOCK_XFER, opt-in, OFF by default - see Config.cpp):
     // refuse a UI inventory drag whose source + destination squad characters are
     // owned by different clients (item stays in the source bag) so ground drops
     // are the only cross-client transfer path. Retires Protocol 37 (Config forces
@@ -3325,6 +3328,9 @@ __declspec(dllexport) void startPlugin() {
         dir = (cut == std::string::npos) ? std::string(".") : dir.substr(0, cut);
         coop::crashdump::install(dir.c_str(), g_cfg.isHost ? "host" : "join");
     }
+
+    // Automated test runs: keep this instance from taking the user's desktop.
+    coop::focusguard::install(g_cfg.noFocus);
 
     logStartupBanner();
 

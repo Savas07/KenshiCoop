@@ -2616,6 +2616,102 @@ private:
     char          sid_[48], bagSid_[48], soldSid_[48];
 };
 
+// inv_bigstack (protocol 66): a character whose snapshot holds MORE than 64 entries. Through
+// protocol 65 the wire carried 64 and flagged the rest truncated, so the peer reconciled
+// additive-only and the tail never reached it. Bag contents come last in the read, so for a
+// JOIN character that was the host's save - the one the next session loads - losing the end
+// of a full backpack. Both clients first grow that body's loose grid (no stock grid holds 65
+// distinct stacks), then the JOIN fills its own (rank 1) tab leader with distinct one-unit
+// stacks until the read holds WANT entries; both clients sample that body's full read (top
+// level + carried containers, the read the publish sends) every second. The host's copy must
+// converge on the join's: same entry count and content hash (the oracle pairs the verdicts),
+// past 64 entries, with neither read truncated.
+class InvBigStackScenario : public Scenario {
+public:
+    InvBigStackScenario()
+        : passed_(false), isHost_(false), have_(false), filled_(false), fill_(-1), added_(0),
+          lastLogMs_(0), count_(0), hash_(0), trunc_(0) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+    }
+
+    virtual const char* name() const { return "inv_bigstack"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        EntityState sq[32];
+        unsigned int n = engine::captureSquad(ctx.gw, /*leaderOnly*/ false, sq, 32);
+        int idx = tabLeaderIdx(sq, n, 1);
+        have_ = (idx >= 0);
+        if (have_) handFromEntity(sq[idx], hand_);
+        // Both copies get the room: the owner's to hold WANT stacks, the host's to receive them.
+        char sec[32]; int limit = -1;
+        int cells = have_ ? engine::growLooseGrid(ctx.gw, hand_, GRID_W, GRID_H, sec, sizeof(sec), &limit)
+                          : -1;
+        if (cells < 0) sec[0] = '\0';
+        sample(ctx.gw);
+        char b[240];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO BIGINV anchor host=%d have=%d hand=%u,%u base=%u grid=%d section=%s limit=%d",
+                  isHost_ ? 1 : 0, have_ ? 1 : 0, hand_[3], hand_[4], count_, cells, sec, limit);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!isHost_ && have_ && !filled_ && ctx.elapsedMs >= FILL_MS) {
+            filled_ = true;
+            fill_ = engine::fillDistinctStacks(ctx.gw, hand_, WANT, &added_);
+            char b[160];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO BIGINV fill entries=%d added=%d want=%u",
+                      fill_, added_, WANT);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            sample(ctx.gw);
+            char b[160];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO BIGINV %s t=%lu count=%u hash=%u trunc=%d",
+                      isHost_ ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs, count_, hash_, trunc_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs < dur) return false;
+        sample(ctx.gw);
+        // Each side proves its own half; the cross-client match is the oracle's.
+        passed_ = have_ && count_ > 64 && trunc_ == 0 && (isHost_ || fill_ > 64);
+        char b[220];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO BIGINV verdict role=%s pass=%d count=%u hash=%u trunc=%d fill=%d added=%d",
+            isHost_ ? "host" : "join", passed_ ? 1 : 0, count_, hash_, trunc_, fill_, added_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return true;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned int  WANT             = 100;
+    static const int           GRID_W           = 24;
+    static const int           GRID_H           = 24;
+    static const unsigned long FILL_MS          = 6000;
+    static const unsigned long HOST_DURATION_MS = 34000;
+    static const unsigned long JOIN_DURATION_MS = 32000;
+
+    void sample(GameWorld* gw) {
+        static InvItemEntry ent[INV_ITEMS_MAX]; // main thread; too big for a tick's frame
+        bool t = false; unsigned int h = 0;
+        count_ = have_ ? engine::captureContainerContents(gw, hand_, ent, INV_ITEMS_MAX, &h, &t,
+                                                          /*includeNested=*/true) : 0;
+        hash_ = h; trunc_ = t ? 1 : 0;
+    }
+
+    bool          passed_, isHost_, have_, filled_;
+    int           fill_, added_;
+    unsigned long lastLogMs_;
+    unsigned int  count_, hash_;
+    int           trunc_;
+    unsigned int  hand_[5];
+};
+
 // inv_dump_all: the player's ACTUAL workflow, which is a burst rather than the one-item round
 // trip every other gear gate exercises - dump a character's ENTIRE kit on the ground at once and
 // hoover all of it up with a second character. That difference is what the previous gates missed,
@@ -3182,6 +3278,8 @@ Scenario* makeInventoryScenario(const std::string& name) {
     // The join-authored direction of inv_nested_bag, plus a backpack the join newly acquires:
     // the host's copy is what the next session loads ("backpacks vanish for everyone but the host").
     if (name == "inv_join_bag")   return new InvJoinBagScenario();
+    // A join character past the old 64-entry wire cap must reach the host's copy whole.
+    if (name == "inv_bigstack")   return new InvBigStackScenario();
     // The burst the one-item gates above cannot express: a whole kit dumped at once and hoovered
     // up by a single character, which is how the player drives it and where the tick-denominated
     // track retirement and the top-level-only drop mirror both showed.
