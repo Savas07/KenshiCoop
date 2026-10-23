@@ -822,6 +822,43 @@
             Advisory = @('mint_aggro', 'smoothness', 'anim_truth', 'march', 'combat_snap_rate', 'lifecycle', 'mint_dist')
             Tier = 'full'; WanVariant = $false
         }
+        # bandit_chase: the field report "a pack of mobs showed up twice" and "a
+        # dust bandit downed me and followed me into town; the guards fought it,
+        # but it never appeared in my friend's game". The players stand in
+        # DIFFERENT cells (runfar1, Bad Teeth): the mate in town, the victim one
+        # cell boundary out. The victim's own engine spawns a Dust Bandits pack
+        # (real templates, AI intact) and the victim runs into the town the
+        # other client authors. At 70 s each side splits one pack body it
+        # simulates into a squad of its own (the re-container Kenshi does when a
+        # fight starts): the body lives on under a new hand and the peer must go
+        # on showing one copy of it. Both sides count the pack near the victim
+        # every second; the gate fails a pack that doubles on either screen or
+        # stands on one screen only, and a run whose split renamed nothing.
+        # bandit_chase: the JOIN is the victim (the pack crosses from
+        # join-authored ground into the host's town);
+        # bandit_chase_host: the HOST is the victim (the town flips to the host
+        # as it arrives). cellAuth is pinned ON - the shipped default, and the
+        # only regime in which the two players author different cells.
+        bandit_chase = @{
+            Save = 'runfar1'; Setup = ''; Tolerance = 18.0
+            Seconds = 240; KillGraceSec = 215
+            PrimaryGate = 'bandit_chase'
+            Gating   = @('bandit_chase', 'clock_sync')
+            Advisory = @('existence_parity', 'lifecycle', 'suppress_churn',
+                         'anti_zombie', 'mint_dist', 'smoothness')
+            DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1' }
+            Tier = 'full'; WanVariant = $false
+        }
+        bandit_chase_host = @{
+            Save = 'runfar1'; Setup = ''; Tolerance = 18.0
+            Seconds = 240; KillGraceSec = 215
+            PrimaryGate = 'bandit_chase_host'
+            Gating   = @('bandit_chase_host', 'clock_sync')
+            Advisory = @('existence_parity', 'lifecycle', 'suppress_churn',
+                         'anti_zombie', 'mint_dist', 'smoothness')
+            DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1' }
+            Tier = 'full'; WanVariant = $false
+        }
         # player_ko: players as VICTIMS both directions - scaffold KO + revive on
         # each side's OWN member; edges must cross as reliable EVT_KNOCKOUT/EVT_REVIVE
         # and the peer's driven copy must lie down / stand up.
@@ -2543,6 +2580,18 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $false
         }
+        # inv_join_bag: the JOIN-authored direction of inv_nested_bag, plus a backpack a join
+        # character newly acquires. The host's copy is what the next session loads, so a bag or
+        # bagged item missing there is the "backpacks vanish for everyone but the host" report.
+        inv_join_bag = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'
+                         KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'join_bag'
+            Gating   = @('join_bag', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
         # The player's actual workflow: dump a character's ENTIRE kit at once and hoover all of it
         # up with a second character. The one-item gates above pass on a trickle and cannot see
         # what a burst does - a ground track retired ~25 ms after its own drop (the read budget was
@@ -2636,6 +2685,51 @@
             Gating   = @()
             Advisory = @()
             Tier = 'none'; WanVariant = $false   # local [recon] trace diagnostic
+        }
+        # Field-report measurement makers (v0.55-v0.57.4 test builds). They log
+        # evidence series and have no oracle of their own: the run's verdict is
+        # the always-on health/result gates, the series are read by hand.
+        # carry_walk: the host carries the join's KO'd leader, drops it, the join
+        # revives it and walks a square ("SCENARIO TRACK", 76 s window).
+        carry_walk = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            KillGraceSec = 120
+            PrimaryGate = ''
+            Gating   = @()
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+        }
+        # carry_swap: host carries the join's leader, then the join carries the
+        # host's; both models must stay on their nameplates ("SCENARIO MESH",
+        # 74 s window; KENSHICOOP_CS_KO / KENSHICOOP_CS_CARRY_LEG variants).
+        carry_swap = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            KillGraceSec = 120
+            PrimaryGate = ''
+            Gating   = @()
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+        }
+        # far_run: the join's leader runs KENSHICOOP_FAR_U (3000 u) out and back
+        # while the host stands; the host's copy must keep animating at range
+        # ("SCENARIO MESH", 123 s window).
+        far_run = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            Seconds = 200; KillGraceSec = 170
+            PrimaryGate = ''
+            Gating   = @()
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+        }
+        # move_legs: both leaders run 200 u legs with mid-leg halts; the evidence
+        # is the [interp] / squadTrail counters on both logs (90 s window).
+        move_legs = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            KillGraceSec = 135
+            PrimaryGate = ''
+            Gating   = @()
+            Advisory = @('smoothness', 'snap_rate_squad')
+            Tier = 'none'; WanVariant = $false
         }
         # xfer_block: cross-owner trade VETO exercise (manual/diagnostic, not in a
         # tier). Blocks direct squad-to-squad drags and forces ground drops; needs

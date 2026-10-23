@@ -713,5 +713,165 @@ bool installCraftDoneTrace() {
     return g_craftTraceOn;
 }
 
+// ---- bandit_chase scene levers (EngineProbe.h) ---------------------------------
+namespace {
+
+// ASCII case-insensitive equality; the vanilla records spell the same names
+// with mixed case ("Dust bandit" vs "Dust Bandits").
+bool nameEqI(const char* a, const char* b) {
+    if (!a || !b) return false;
+    for (; *a && *b; ++a, ++b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return *a == *b;
+}
+
+// First record of category 'cat' whose display name is 'name'.
+GameData* dataByNameGuarded(GameWorld* gw, const char* name, itemType cat) {
+    if (!gw || !g_getDataOfTypeFn || !name || !name[0]) return 0;
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, cat);
+        unsigned int n = g_dataScratch.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && nameEqI(gd->name.c_str(), name)) return gd;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
+bool sidOfGuarded(GameData* gd, char* out, unsigned int len) {
+    if (!gd || !out || len == 0) return false;
+    out[0] = '\0';
+    __try {
+        _snprintf(out, len - 1, "%s", gd->stringID.c_str());
+        out[len - 1] = '\0';
+        return out[0] != '\0';
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = '\0';
+        return false;
+    }
+}
+
+bool pinRelationGuarded(GameWorld* gw, Faction* fac, float relation) {
+    __try {
+        Faction* pf = (gw && gw->player) ? gw->player->getFaction() : 0;
+        if (!pf || !fac || !g_relSetFn) return false;
+        if (pf->relations)  g_relSetFn(pf->relations, fac, relation);
+        if (fac->relations) g_relSetFn(fac->relations, pf, relation);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+Character* spawnAtGuarded(GameWorld* gw, Faction* fac, GameData* tmpl,
+                          float x, float y, float z) {
+    if (!gw || !gw->theFactory || !g_createCharFn || !fac || !tmpl) return 0;
+    __try {
+        Ogre::Vector3 pos(x, y, z);
+        RootObject* r = g_createCharFn(gw->theFactory, fac, pos, 0, tmpl, 0, 25.0f);
+        return r ? static_cast<Character*>(r) : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+bool chaseBodyGuarded(GameWorld* gw, RootObject* ro, const char* sid,
+                      float x, float y, float z, float radius, ChaseBody* out) {
+    __try {
+        if (!ro || isPlayerSquad(gw, ro)) return false;
+        Character* c = static_cast<Character*>(ro);
+        GameData* gd = c->getGameData();
+        if (!gd || strcmp(gd->stringID.c_str(), sid) != 0) return false;
+        Ogre::Vector3 p = c->getPosition();
+        float dx = p.x - x, dy = p.y - y, dz = p.z - z;
+        float d = (float)sqrt((double)(dx * dx + dy * dy + dz * dz));
+        if (d > radius) return false;
+        out->c = c;
+        if (!readObjectHand(ro, out->hand)) return false;
+        out->x = p.x; out->y = p.y; out->z = p.z;
+        out->dist = d;
+        out->visible = ro->getVisible() ? 1 : 0;
+        out->dead = (g_isDeadCharFn && g_isDeadCharFn(c)) ? 1 : 0;
+        out->down = (g_isDownFn && g_isDownFn(c)) ? 1 : 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+} // namespace
+
+bool chaseTemplateSid(GameWorld* gw, const char* charName, char* outSid, unsigned int len) {
+    return sidOfGuarded(dataByNameGuarded(gw, charName, CHARACTER), outSid, len);
+}
+
+namespace {
+// The live Faction* of the FACTION record named facName (0 when absent here).
+Faction* chaseFaction(GameWorld* gw, const char* facName) {
+    char fsid[96];
+    if (!sidOfGuarded(dataByNameGuarded(gw, facName, FACTION), fsid, sizeof(fsid)))
+        return 0;
+    std::string facSid(fsid);
+    return factionBySidGuarded(gw, &facSid);
+}
+} // namespace
+
+bool pinChaseRelation(GameWorld* gw, const char* facName, float relation) {
+    return pinRelationGuarded(gw, chaseFaction(gw, facName), relation);
+}
+
+unsigned int spawnNamedPack(GameWorld* gw, const char* charName, const char* facName,
+                            unsigned int count, float x, float y, float z,
+                            float relation, unsigned int (*outHands)[5]) {
+    GameData* tmpl = dataByNameGuarded(gw, charName, CHARACTER);
+    Faction* fac = chaseFaction(gw, facName);
+    if (!tmpl || !fac) {
+        char b[192];
+        _snprintf(b, sizeof(b) - 1, "[chase] pack data MISS char='%s'(%d) fac='%s'(%d)",
+                  charName, tmpl ? 1 : 0, facName, fac ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return 0;
+    }
+    pinRelationGuarded(gw, fac, relation);
+    unsigned int made = 0;
+    for (unsigned int i = 0; i < count; ++i) {
+        // A tight ring: a pack, not a line, so every member starts the same
+        // distance from whoever it is about to chase.
+        float a = 6.2831853f * (float)i / (float)(count ? count : 1);
+        Character* c = spawnAtGuarded(gw, fac, tmpl, x + 5.0f * (float)cos(a), y,
+                                      z + 5.0f * (float)sin(a));
+        if (!c) continue;
+        if (outHands && !readObjectHand(c, outHands[made])) continue;
+        ++made;
+    }
+    return made;
+}
+
+unsigned int listChaseBodies(GameWorld* gw, const char* sid, float x, float y, float z,
+                             float radius, ChaseBody* out, unsigned int maxOut) {
+    if (!gw || !g_getCharsFn || !sid || !sid[0] || !out || maxOut == 0) return 0;
+    unsigned int n = 0, w = 0;
+    __try {
+        g_npcQuery.clear();
+        Ogre::Vector3 center(x, y, z);
+        g_getCharsFn(gw, &g_npcQuery, &center, radius, radius, radius, 512, 512, 0);
+        n = g_npcQuery.size();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    for (unsigned int i = 0; i < n && w < maxOut; ++i) {
+        RootObject* ro = 0;
+        __try { ro = g_npcQuery[i]; } __except (EXCEPTION_EXECUTE_HANDLER) { ro = 0; }
+        if (chaseBodyGuarded(gw, ro, sid, x, y, z, radius, &out[w])) ++w;
+    }
+    return w;
+}
+
 } // namespace engine
 } // namespace coop

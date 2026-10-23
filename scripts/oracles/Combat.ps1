@@ -484,7 +484,8 @@ function Test-AssaultTravel {
 # sweep (one line per proxy per second).
 function Test-ProxyDrift {
     param([string]$JoinFile, [double]$MaxDrift = 130.0, [int]$MinSamples = 10,
-          [double]$MaxHostStep = 40.0, [double]$RunawayDrift = 300.0)
+          [double]$MaxHostStep = 40.0, [double]$RunawayDrift = 300.0,
+          [int]$RunawayRun = 3)
     $pat = '\[proxy\] drift hand=(\d+),(\d+) d=([\d\.]+) .*streamed=(\d) fight=(\d) hstep=(-?[\d\.]+)'
     $all = @(Select-String -Path $JoinFile -Pattern $pat -ErrorAction SilentlyContinue |
               ForEach-Object {
@@ -527,7 +528,31 @@ function Test-ProxyDrift {
     # runs, against 661 u with reconciliation off. What separates the two is not
     # the peak: it is whether the copy is FIGHTING out there, and whether the
     # distance keeps growing instead of being pulled back.
-    $runaway = @($rows | Where-Object { $_.d -gt $RunawayDrift })
+    #
+    # "Not pulled back" is a DURATION, so a runaway is a proxy over the limit on
+    # RunawayRun consecutive judged sweeps of that proxy, not on one. A first
+    # park is immediate and the census is 1 Hz, so a copy that is reconciled
+    # spends at most two sweeps over the line: the one that sees the gap and
+    # the one the park lands in. mint_aggro / assault_mint mint at the census
+    # spot 450 u from where the host SPAWNED the squad, then apply the one
+    # stream sample the host sent before its own park moved it there - one
+    # sweep at 450 u, parked back by the next (20261022_123528), which the
+    # single-sample rule read as "nothing is pulling it back". A copy that is
+    # genuinely loose stays out for the whole fight (run 20260806_091951:
+    # 350 -> 484 -> 561 u), and a body launched into the air stays out for
+    # its whole flight (the same run's dropped Jakku: five sweeps at 443-687 u).
+    $runaway = @()
+    $streak = @{}
+    foreach ($r in $rows) {
+        if ($r.d -gt $RunawayDrift) {
+            if ($streak.ContainsKey($r.hand)) { $streak[$r.hand] += , $r }
+            else { $streak[$r.hand] = @(, $r) }
+            if ($streak[$r.hand].Count -eq $RunawayRun) { $runaway += $streak[$r.hand] }
+            elseif ($streak[$r.hand].Count -gt $RunawayRun) { $runaway += , $r }
+        } else {
+            $streak.Remove($r.hand)
+        }
+    }
     $worst = ($rows | Sort-Object d -Descending | Select-Object -First 1)
     $m = @{ samples = $rows.Count; lagged = $lagged; maxDrift = $max; medDrift = $med
             over = $over.Count; overFighting = $overFighting.Count
@@ -541,8 +566,9 @@ function Test-ProxyDrift {
                  "the fight is happening")
     }
     if ($runaway.Count -gt 0) {
-        $bad += ("proxy $($worst.hand) reached $([int]$max) u from its owner's copy " +
-                 "(runaway limit $RunawayDrift): nothing is pulling it back")
+        $rw = ($runaway | Sort-Object d -Descending | Select-Object -First 1)
+        $bad += ("proxy $($rw.hand) stayed over $RunawayDrift u from its owner's copy for " +
+                 ">= $RunawayRun consecutive sweeps (peak $([int]$rw.d) u): nothing is pulling it back")
     }
     if ($bad.Count -gt 0) {
         $d = $bad -join '; '
@@ -609,6 +635,122 @@ function Test-MintAggro {
                 "fight parity $($par.agree)/$($par.pairs) agree " +
                 "(join-only $($par.joinOnly), host-only $($par.hostOnly))")
     return (Add-GateResult -Name 'mint_aggro' -Status PASS -Metrics $m)
+}
+
+# bandit_chase / bandit_chase_host: the field report "a pack of mobs showed up
+# twice" and "a dust bandit followed me into town and never appeared in my
+# friend's game". The victim's owner spawns a hostile pack only its own engine
+# has, then the victim runs into the town cell the OTHER client authors. Every
+# second both sides log how many bodies of the pack's template stand near the
+# victim (SCENARIO CHASE: vis = shown, i.e. alive and not hidden by our
+# existence judgment; keys/dupKeys = canonical identities among them).
+#   1. spawned   - the victim's owner put the pack out (scenario marker)
+#   2. crossed   - the victim entered the town cell, so the chase crossed from
+#                  one client's cell into the other's
+#   3. no dupes  - neither side shows more of the pack than was spawned, nor a
+#                  canonical key on two shown bodies, for longer than
+#                  MaxDupeRunS consecutive samples
+#   4. one-sided - one side shows pack bodies near the victim while the other
+#                  shows none, for longer than MaxOneSidedRunS consecutive pairs
+#   5. parity    - past the mint latency (GraceMs after the spawn) the shown
+#                  counts agree within one body in >= MinAgreeFrac of the pairs
+#   6. rekey     - mid-chase a side split a pack body it simulates into a squad
+#                  of its own, so the body lives on under a new local hand
+#                  (SCENARIO CHASE rekey moved=1); 3-5 then judge the peer's
+#                  view of the renamed body
+function Test-BanditChase {
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = 'bandit_chase',
+          [int]$GraceMs = 8000, [int]$TolMs = 1200, [int]$MaxDupeRunS = 3,
+          [int]$MaxOneSidedRunS = 5, [double]$MinAgreeFrac = 0.8, [int]$MinPairs = 30)
+    $stamp   = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]'
+    $spawnRx = $stamp + '.*SCENARIO CHASE spawned side=(host|join) n=(\d+)'
+    $rowRx   = $stamp + '.*SCENARIO CHASE side=(host|join) t=\d+ spawned=\d .* vis=(\d+) hid=(\d+) dead=(\d+) keys=(\d+) dupKeys=(\d+)'
+    $spawnT = -1; $nPack = 0; $owner = ''
+    $series = @{ host = (New-Object System.Collections.ArrayList); join = (New-Object System.Collections.ArrayList) }
+    $crossed = 0; $rekeyed = 0
+    foreach ($file in @($HostFile, $JoinFile)) {
+        $off = Get-LogClockOffsetMs -File $file
+        foreach ($m in (Select-String -Path $file -Pattern $spawnRx -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            $spawnT = Convert-StampToMs -Groups $g -OffsetMs $off
+            $owner = $g[5].Value; $nPack = [int]$g[6].Value
+        }
+        $crossed += @(Select-String -Path $file -Pattern 'SCENARIO CHASE crossed side=' -ErrorAction SilentlyContinue).Count
+        $rekeyed += @(Select-String -Path $file -Pattern 'SCENARIO CHASE rekey side=\w+ .* moved=1' -ErrorAction SilentlyContinue).Count
+        foreach ($m in (Select-String -Path $file -Pattern $rowRx -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            [void]$series[$g[5].Value].Add([pscustomobject]@{
+                t = (Convert-StampToMs -Groups $g -OffsetMs $off); vis = [int]$g[6].Value
+                hid = [int]$g[7].Value; keys = [int]$g[9].Value; dup = [int]$g[10].Value })
+        }
+    }
+    $m = @{ owner = $owner; pack = $nPack; crossed = $crossed; rekeyed = $rekeyed; pairs = 0
+            agree = 0; exact = 0; agreeFrac = 0; hostDupeRun = 0; joinDupeRun = 0
+            hostMaxVis = 0; joinMaxVis = 0; oneSidedRun = 0; hostOnly = 0; joinOnly = 0 }
+    $bad = @()
+    if ($spawnT -lt 0 -or $nPack -lt 1) {
+        $bad += "the victim's owner never spawned the pack (link 1)"
+    } else {
+        if ($crossed -lt 1) { $bad += "the victim never entered the town cell, so the chase never crossed cells (link 2)" }
+        if ($rekeyed -lt 1) { $bad += "no pack body was renamed mid-chase (no 'SCENARIO CHASE rekey ... moved=1'; link 6)" }
+        $from = $spawnT + $GraceMs
+        # 3. duplicates, judged on each side's own series.
+        foreach ($side in @('host', 'join')) {
+            $run = 0; $worst = 0; $maxVis = 0
+            foreach ($r in @($series[$side] | Where-Object { $_.t -ge $from } | Sort-Object t)) {
+                if ($r.vis -gt $maxVis) { $maxVis = $r.vis }
+                if ($r.vis -gt $nPack -or $r.dup -gt 0) { $run++; if ($run -gt $worst) { $worst = $run } }
+                else { $run = 0 }
+            }
+            $m["${side}DupeRun"] = $worst; $m["${side}MaxVis"] = $maxVis
+            if ($worst -gt $MaxDupeRunS) {
+                $bad += ("the $side shows the pack DUPLICATED for $worst consecutive samples " +
+                         "(max $maxVis visible of $nPack spawned; link 3)")
+            }
+        }
+        # 4./5. paired by wall time, join rows against their nearest host row.
+        $hRows = @($series['host'] | Where-Object { $_.t -ge $from } | Sort-Object t)
+        $run = 0; $worstRun = 0
+        foreach ($jr in @($series['join'] | Where-Object { $_.t -ge $from } | Sort-Object t)) {
+            $best = $null; $bd = [int]::MaxValue
+            foreach ($hr in $hRows) {
+                $dd = [Math]::Abs([int]$hr.t - [int]$jr.t)
+                if ($dd -lt $bd) { $bd = $dd; $best = $hr }
+            }
+            if ($null -eq $best -or $bd -gt $TolMs) { continue }
+            $m.pairs++
+            if ([Math]::Abs($best.vis - $jr.vis) -le 1) { $m.agree++ }
+            if ($best.vis -eq $jr.vis) { $m.exact++ }
+            $oneSided = $false
+            if ($best.vis -ge 1 -and $jr.vis -eq 0) { $m.hostOnly++; $oneSided = $true }
+            elseif ($jr.vis -ge 1 -and $best.vis -eq 0) { $m.joinOnly++; $oneSided = $true }
+            if ($oneSided) { $run++; if ($run -gt $worstRun) { $worstRun = $run } } else { $run = 0 }
+        }
+        $m.oneSidedRun = $worstRun
+        if ($m.pairs -gt 0) { $m.agreeFrac = [Math]::Round($m.agree / $m.pairs, 3) }
+        if ($m.pairs -lt $MinPairs) {
+            $bad += "only $($m.pairs) paired samples (need >= $MinPairs)"
+        } else {
+            if ($worstRun -gt $MaxOneSidedRunS) {
+                $bad += ("the pack stood near the victim on ONE side only for $worstRun consecutive " +
+                         "pairs (host-only $($m.hostOnly), join-only $($m.joinOnly); link 4)")
+            }
+            if ($m.agreeFrac -lt $MinAgreeFrac) {
+                $bad += ("visible pack counts disagree by more than one body in " +
+                         "$($m.pairs - $m.agree)/$($m.pairs) pairs (agree $($m.agreeFrac) < $MinAgreeFrac; link 5)")
+            }
+        }
+    }
+    $summary = ("owner=$owner pack=$nPack crossed=$crossed rekeyed=$rekeyed pairs=$($m.pairs) agree=$($m.agree) " +
+                "exact=$($m.exact) dupeRun=$($m.hostDupeRun)/$($m.joinDupeRun) " +
+                "maxVis=$($m.hostMaxVis)/$($m.joinMaxVis) oneSidedRun=$($m.oneSidedRun) " +
+                "hostOnly=$($m.hostOnly) joinOnly=$($m.joinOnly)")
+    if ($bad.Count -gt 0) {
+        Write-Host ("  BANDIT-CHASE FAIL - " + ($bad -join "; ") + " [$summary]")
+        return (Add-GateResult -Name $GateName -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host "  BANDIT-CHASE PASS - one pack on both screens through the chase [$summary]"
+    return (Add-GateResult -Name $GateName -Status PASS -Metrics $m)
 }
 
 # The largest "moved=<u>" the travel series reported in one log (cumulative path

@@ -1,6 +1,7 @@
 // ScenarioCombat.cpp - combat scenarios (monolith split from Scenario.cpp,
 // 2026-07-12): combat_probe, combat_order, combat_kill, player_combat,
-// assault_town, assault_travel, player_ko, combat_crowd, host_pc_fight. Classes are
+// assault_town, assault_travel, player_ko, combat_crowd, host_pc_fight,
+// bandit_chase. Classes are
 // TU-private (anonymous namespace); only makeCombatScenario (ScenarioSupport.h) is
 // exported.
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
@@ -2548,6 +2549,484 @@ const float HostPcFightScenario::MINT_FIGHT_DIST = 40.0f;
 // Past pickCombatVictim's 30 u pick radius plus a melee lunge: the victim is running.
 const float HostPcFightScenario::FLEE_DIST = 45.0f;
 
+// ===========================================================================
+// bandit_chase / bandit_chase_host (field report, cellAuth ON as shipped): "a
+// pack of mobs showed up twice" and "a dust bandit downed me and followed me
+// into town; the guards fought it, but it never appeared in my friend's game".
+//
+// What the report needs is the two players in DIFFERENT zone cells, a hostile
+// pack that only the victim's engine spawned (a roaming squad activating near
+// one player is exactly that), and a chase that carries the pack out of the
+// cell the victim's client authors into the town cell the other client
+// authors. Both clients must then agree, every second, on how many of that
+// pack stand near the victim.
+//
+// Geometry (runfar1, the town_arrive fixture): Bad Teeth's centre T and the
+// approach line toward the town_arrive park point - the line town_arrive walks
+// in HOP_D hops with no sidestep. The escape point X sits ESCAPE_PAST beyond
+// the first cell boundary on that line, probed with engine::cellAt, so X and T
+// land in different cells without a cell-size constant. The mate parks its
+// own tab at T; the victim's owner parks its own tab at X.
+//
+// bandit_chase: the JOIN's tab is the victim - the pack crosses from a
+// join-authored cell into the host-authored town. bandit_chase_host swaps the
+// roles: the host's tab is the victim and the join stands in town, so the town
+// cell flips to the host when the victim arrives (the lower id wins a
+// contested cell).
+//
+// The pack's pursuit stands in for its AI and is issued the way the AI runs:
+// each side orders only the pack bodies its OWN engine simulates (alive, not
+// hidden by our existence judgment, not driven, AI not suspended). While the
+// victim's client authors the pack that is its natives; once authorship
+// moves, it is whatever the new author holds - and if both clients end up
+// simulating a copy, both chase, exactly as both engines' AI would.
+//
+// Timeline (armed clock): park at 0; at SPAWN_MS, once the victim's ground is
+// loaded, the victim's owner spawns PACK_N "Dust bandit" in "Dust Bandits"
+// PACK_AHEAD from the victim on the side away from town; FLEE_AFTER_MS later
+// the victim's tab runs for T in HOP_D hops. From REKEY_MS each side splits ONE
+// pack body it simulates into a squad of its own (separateIntoMyOwnSquad, the
+// split Kenshi does itself when a fight starts; a KO'd body carried into a cell
+// is the same shape): the body lives on under a new local hand, and the peer
+// must go on showing one copy of it. The run ends at END_MS.
+//
+// Evidence, both sides, 1 Hz from SPAWN_MS: "SCENARIO CHASE" counts the bodies
+// of the pack's template within COUNT_R of the victim - shown (vis), hidden by
+// our existence judgment (hid), dead - and the distinct canonical keys the
+// shown ones carry (a key on two shown bodies is a duplicate on that client);
+// "SCENARIO CHASEBODY" is one row per such body. The engine's own render flag
+// is logged (engVis) but not judged: the engine hides bodies far from its
+// camera by itself, and a body the player would see by looking is shown.
+// Test-BanditChase pairs the two sides by wall time.
+// ===========================================================================
+class BanditChaseScenario : public TimedScenario {
+public:
+    BanditChaseScenario(const char* name, bool victimIsJoin)
+        : TimedScenario(name, 1000), victimIsJoin_(victimIsJoin), haveGeo_(false),
+          haveSid_(false), haveTabs_(false), parked_(0), buffed_(0), spawned_(false),
+          nPack_(0), spawnMs_(0), fleeLogged_(false), crossed_(false), arrived_(false),
+          rekeyed_(false),
+          crossMs_(0), arriveMs_(0), camMs_(0), pursueMs_(0), samples_(0),
+          tx_(TOWN_X), tz_(TOWN_Z), ex_(0.0f), ez_(0.0f), edgeD_(-1.0f),
+          tcx_(0), tcz_(0), nSims_(0), nearestPack_(-1.0f), holds_(0) {
+        sid_[0] = '\0';
+        memset(pack_, 0, sizeof(pack_));
+        memset(vicHand_, 0, sizeof(vicHand_));
+        memset(vicPos_, 0, sizeof(vicPos_));
+        memset(sims_, 0, sizeof(sims_));
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        pickGeometry(ctx);
+        haveSid_ = engine::chaseTemplateSid(ctx.gw, PACK_CHAR, sid_, sizeof(sid_));
+        // Both sides: the same hostility on both engines, so a copy that ends
+        // up simulated on either side behaves like the original.
+        bool pinned = engine::pinChaseRelation(ctx.gw, PACK_FACTION, -100.0f);
+
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        haveTabs_ = tabLeaderIdx(sq, n, 0) >= 0 && tabLeaderIdx(sq, n, 1) >= 0;
+        if (haveTabs_ && haveGeo_) {
+            // Park the OWN tab only: each side authors its own tab, so the peer's
+            // copy follows through the normal channel (town_arrive precedent).
+            const int ownRank = ctx.isHost ? 0 : 1;
+            const float px = victimOwner(ctx) ? ex_ : tx_;
+            const float pz = victimOwner(ctx) ? ez_ : tz_;
+            float gy = 0.0f;
+            bool ground = engine::terrainHeightAt(px, pz, &gy);
+            for (unsigned int i = 0; i < n; ++i) {
+                if (tabRankOf(sq, n, i) != ownRank) continue;
+                Character* c = engine::resolve(sq[i]);
+                if (!c) continue;
+                if (engine::park(c, px + (float)parked_ * 4.0f, ground ? gy : sq[i].y,
+                                 pz, 0.0f))
+                    ++parked_;
+                // The victim has to live through the chase: a body knocked out
+                // on open ground never carries the pack into town.
+                if (victimOwner(ctx)) {
+                    unsigned int h[5]; handFromEntity(sq[i], h);
+                    if (engine::raiseAllStats(ctx.gw, h, VICTIM_STATS) > 0) ++buffed_;
+                }
+            }
+        }
+        int ecx = 0, ecz = 0;
+        engine::cellAt(ctx.gw, ex_, ez_, &ecx, &ecz);
+        char b[352];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO CHASE start side=%s victim=%s owner=%d geo=%d tabs=%d "
+                  "town=%.0f,%.0f escape=%.0f,%.0f edge=%.0f cells=%d,%d/%d,%d "
+                  "sid='%s' pinned=%d parked=%u buffed=%u packN=%u countR=%.0f",
+                  ctx.isHost ? "host" : "join", victimIsJoin_ ? "join" : "host",
+                  victimOwner(ctx) ? 1 : 0, haveGeo_ ? 1 : 0, haveTabs_ ? 1 : 0,
+                  tx_, tz_, ex_, ez_, edgeD_, tcx_, tcz_, ecx, ecz, sid_, pinned ? 1 : 0,
+                  parked_, buffed_, PACK_N, COUNT_R);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!haveTabs_) coop::logLine("SCENARIO CHASE needs a 2-tab save (rank-0/rank-1 member missing)");
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveTabs_ || !haveGeo_ || !haveSid_) {
+            if (ctx.elapsedMs >= END_MS) { passed_ = false; return true; }
+            return false;
+        }
+        if (evidenceDue(ctx.elapsedMs)) {
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            int own = tabLeaderIdx(sq, n, ctx.isHost ? 0 : 1);
+            int vic = tabLeaderIdx(sq, n, victimIsJoin_ ? 1 : 0);
+            if (own >= 0 && (camMs_ == 0 || ctx.elapsedMs - camMs_ >= CAM_REFOCUS_MS)) {
+                camMs_ = ctx.elapsedMs;
+                Character* oc = engine::resolve(sq[own]);
+                if (oc) engine::cameraFocusOn(ctx.gw, oc);
+            }
+            if (vic >= 0) {
+                handFromEntity(sq[vic], vicHand_);
+                vicPos_[0] = sq[vic].x; vicPos_[1] = sq[vic].y; vicPos_[2] = sq[vic].z;
+                if (victimOwner(ctx)) {
+                    maybeSpawn(ctx, sq[vic]);
+                    flee(ctx, sq, n, sq[vic]);
+                }
+                if (ctx.elapsedMs >= SPAWN_MS) {
+                    sample(ctx, sq[vic]);
+                    maybeRekey(ctx);
+                    keepRunning(ctx);
+                }
+            }
+        }
+        pursue(ctx);
+        if (ctx.elapsedMs < END_MS) return false;
+        passed_ = samples_ >= MIN_SAMPLES && (!victimOwner(ctx) || (nPack_ > 0 && crossed_));
+        char b[256];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO CHASE end side=%s samples=%u pack=%u crossed=%d crossMs=%lu "
+                  "arrived=%d arriveMs=%lu spawnMs=%lu holds=%u pass=%d",
+                  ctx.isHost ? "host" : "join", samples_, nPack_, crossed_ ? 1 : 0,
+                  crossMs_, arrived_ ? 1 : 0, arriveMs_, spawnMs_, holds_,
+                  passed_ ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return true;
+    }
+
+private:
+    static const unsigned int  MAX_SQUAD      = 32;
+    static const unsigned int  PACK_N         = 3;
+    static const unsigned int  MAX_BODIES     = 24;
+    static const unsigned int  MAX_BODY_ROWS  = 12;
+    static const unsigned int  MIN_SAMPLES    = 30;
+    static const unsigned long SPAWN_MS       = 20000;  // claims dwelt, ground loaded
+    static const unsigned long FLEE_AFTER_MS  = 4000;   // the pack engages first
+    static const unsigned long PURSUE_EVERY_MS = 2000;
+    static const unsigned long CAM_REFOCUS_MS = 5000;
+    static const unsigned long END_MS         = 160000;
+    // The pack is on the victim's heels in town on both sides by then (runs
+    // 022815/024425: vis=3 on both, the author simulating all three).
+    static const unsigned long REKEY_MS       = 70000;
+    static const unsigned long REKEY_LAST_MS  = 130000;
+    static const float TOWN_X, TOWN_Z, TOWARD_X, TOWARD_Z;
+    static const float ESCAPE_PAST, PROBE_STEP, PROBE_MAX, PACK_AHEAD, HOP_D;
+    static const float ARRIVE_R, COUNT_R, SCAN_R, LEASH_R, PURSUE_R, VICTIM_STATS;
+    static const char* const PACK_CHAR;
+    static const char* const PACK_FACTION;
+
+    struct Sim {
+        unsigned int hand[5];
+        float        dist;
+    };
+
+    bool victimOwner(const ScenarioContext& ctx) const {
+        return victimIsJoin_ ? !ctx.isHost : ctx.isHost;
+    }
+
+    // X: ESCAPE_PAST beyond the first cell boundary on the line from T toward
+    // the town_arrive park point. Both clients compute the same point.
+    void pickGeometry(const ScenarioContext& ctx) {
+        if (!engine::cellAt(ctx.gw, tx_, tz_, &tcx_, &tcz_)) return;
+        float dx = TOWARD_X - tx_, dz = TOWARD_Z - tz_;
+        float len = (float)sqrt((double)(dx * dx + dz * dz));
+        if (len < 1.0f) return;
+        dx /= len; dz /= len;
+        for (float d = PROBE_STEP; d <= PROBE_MAX; d += PROBE_STEP) {
+            int cx = 0, cz = 0;
+            if (!engine::cellAt(ctx.gw, tx_ + dx * d, tz_ + dz * d, &cx, &cz)) return;
+            if (cx == tcx_ && cz == tcz_) continue;
+            edgeD_ = d;
+            ex_ = tx_ + dx * (d + ESCAPE_PAST);
+            ez_ = tz_ + dz * (d + ESCAPE_PAST);
+            haveGeo_ = true;
+            return;
+        }
+    }
+
+    void maybeSpawn(const ScenarioContext& ctx, const EntityState& v) {
+        if (spawned_ || ctx.elapsedMs < SPAWN_MS) return;
+        if (!engine::isZoneLoadedAt(ctx.gw, v.x, v.y, v.z)) return;
+        spawned_ = true;
+        // On the side away from town, so the chase runs toward it.
+        float ax = v.x - tx_, az = v.z - tz_;
+        float len = (float)sqrt((double)(ax * ax + az * az));
+        if (len < 1.0f) { ax = 1.0f; az = 0.0f; len = 1.0f; }
+        float sx = v.x + ax / len * PACK_AHEAD, sz = v.z + az / len * PACK_AHEAD;
+        float sy = v.y;
+        engine::terrainHeightAt(sx, sz, &sy);
+        nPack_ = engine::spawnNamedPack(ctx.gw, PACK_CHAR, PACK_FACTION, PACK_N,
+                                        sx, sy, sz, -100.0f, pack_);
+        spawnMs_ = ctx.elapsedMs;
+        char b[256];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO CHASE spawned side=%s n=%u sid='%s' at=%.0f,%.0f,%.0f "
+                  "vic=%u,%u",
+                  ctx.isHost ? "host" : "join", nPack_, sid_, sx, sy, sz,
+                  vicHand_[3], vicHand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        for (unsigned int i = 0; i < nPack_; ++i) {
+            Character* c = engine::resolveCharByHand(pack_[i][3], pack_[i][4], pack_[i][0],
+                                                     pack_[i][1], pack_[i][2]);
+            if (c) logScenarioLine("CHASEPACK", c);
+        }
+    }
+
+    // The victim runs for town in HOP_D hops along its own line to T, re-issued
+    // every beat so it never stands idle (an idle victim turns and fights) -
+    // but on a LEASH: while the nearest pack body this client shows trails by
+    // more than LEASH_R it holds its last hop, so the pack is still on its
+    // heels when it crosses (the buffed victim outran an unleashed pack in the
+    // second run and crossed alone).
+    void flee(const ScenarioContext& ctx, const EntityState* sq, unsigned int n,
+              const EntityState& v) {
+        if (!spawned_ || ctx.elapsedMs - spawnMs_ < FLEE_AFTER_MS) return;
+        float dx = tx_ - v.x, dz = tz_ - v.z;
+        float d = (float)sqrt((double)(dx * dx + dz * dz));
+        int cx = 0, cz = 0;
+        if (!crossed_ && engine::cellAt(ctx.gw, v.x, v.z, &cx, &cz) &&
+            cx == tcx_ && cz == tcz_) {
+            crossed_ = true; crossMs_ = ctx.elapsedMs;
+            char b[160];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO CHASE crossed side=%s atMs=%lu d=%.0f "
+                      "cell=%d,%d", ctx.isHost ? "host" : "join", ctx.elapsedMs, d, cx, cz);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (!arrived_ && d <= ARRIVE_R) {
+            arrived_ = true; arriveMs_ = ctx.elapsedMs;
+            char b[160];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO CHASE arrived side=%s atMs=%lu d=%.0f "
+                      "runMs=%lu", ctx.isHost ? "host" : "join", ctx.elapsedMs, d,
+                      ctx.elapsedMs - spawnMs_ - FLEE_AFTER_MS);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (arrived_) return;
+        if (nearestPack_ > LEASH_R) { ++holds_; return; }
+        float hx = tx_, hz = tz_;
+        if (d > HOP_D) { hx = v.x + dx / d * HOP_D; hz = v.z + dz / d * HOP_D; }
+        const int ownRank = ctx.isHost ? 0 : 1;
+        unsigned int k = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (tabRankOf(sq, n, i) != ownRank) continue;
+            Character* c = engine::resolve(sq[i]);
+            if (c) engine::orderMoveTo(c, hx + (float)k * 6.0f, v.y, hz);
+            ++k;
+        }
+        if (!fleeLogged_) {
+            fleeLogged_ = true;
+            char b[160];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO CHASE flee side=%s atMs=%lu d=%.0f "
+                      "members=%u", ctx.isHost ? "host" : "join", ctx.elapsedMs, d, k);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    // The pack's AI, modelled: every body THIS engine simulates closes on the
+    // victim and attacks it once in reach. Bodies the peer drives, bodies our
+    // existence judgment hid, and bodies whose AI the replicator suspended are
+    // not ours to move - their behaviour arrives over the wire.
+    void pursue(const ScenarioContext& ctx) {
+        if (nSims_ == 0) return;
+        if (pursueMs_ != 0 && ctx.elapsedMs - pursueMs_ < PURSUE_EVERY_MS) return;
+        pursueMs_ = ctx.elapsedMs;
+        unsigned int moved = 0, attacked = 0;
+        for (unsigned int i = 0; i < nSims_; ++i) {
+            const Sim& s = sims_[i];
+            Character* c = engine::resolveCharByHand(s.hand[3], s.hand[4], s.hand[0],
+                                                     s.hand[1], s.hand[2]);
+            if (!c) continue;
+            if (s.dist > PURSUE_R) {
+                if (engine::orderMoveTo(c, vicPos_[0], vicPos_[1], vicPos_[2])) ++moved;
+            } else if (engine::orderAttackByHand(ctx.gw, s.hand, vicHand_)) {
+                ++attacked;
+            }
+        }
+        char b[160];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CHASE pursue side=%s t=%lu sim=%u moved=%u "
+                  "attacked=%u", ctx.isHost ? "host" : "join", ctx.elapsedMs, nSims_,
+                  moved, attacked);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Re-container the nearest body this engine simulates, once, and read its
+    // hand back: moved=0 means the split did not rename it and the run proves
+    // nothing about a renamed body (Test-BanditChase fails it, link 6).
+    void maybeRekey(const ScenarioContext& ctx) {
+        if (rekeyed_ || nSims_ == 0 || ctx.elapsedMs < REKEY_MS ||
+            ctx.elapsedMs > REKEY_LAST_MS) return;
+        rekeyed_ = true;
+        const Sim* s = &sims_[0];
+        for (unsigned int i = 1; i < nSims_; ++i)
+            if (sims_[i].dist < s->dist) s = &sims_[i];
+        Character* c = engine::resolveCharByHand(s->hand[3], s->hand[4], s->hand[0],
+                                                 s->hand[1], s->hand[2]);
+        const bool ok = c && engine::detachFromTownAI(c);
+        unsigned int nh[5] = { 0, 0, 0, 0, 0 };
+        if (c) engine::readObjectHand(c, nh);
+        const int moved = (ok && memcmp(nh, s->hand, sizeof(nh)) != 0) ? 1 : 0;
+        char b[256];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO CHASE rekey side=%s t=%lu old=%u,%u,%u,%u,%u "
+                  "new=%u,%u,%u,%u,%u ok=%d moved=%d d=%.0f",
+                  ctx.isHost ? "host" : "join", ctx.elapsedMs, s->hand[0], s->hand[1],
+                  s->hand[2], s->hand[3], s->hand[4], nh[0], nh[1], nh[2], nh[3], nh[4],
+                  ok ? 1 : 0, moved, s->dist);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // A town dialog used to pause one client's game, and the arbitrated pause
+    // then froze both worlds mid-chase (run 030538: the join's own pause intent
+    // at 85 s, never lifted - 76 frozen samples straddling COUNT_R). The plugin
+    // no longer votes a dialogue's auto-pause ([speed] DIALOG auto-pause
+    // ignored), so while a dialogue is open the scenario does not click: if that
+    // pause ever sticks again the run shows it as frozen samples instead of
+    // hiding it. Any other pause is clicked away the way a player would (the
+    // loud path, so it is this side's vote), once per evidence tick while paused.
+    void keepRunning(const ScenarioContext& ctx) {
+        if (engine::inDialogue()) return;
+        float mult = 0.0f; bool paused = false;
+        if (!engine::readGameSpeed(ctx.gw, &mult, &paused) || !paused) return;
+        const bool ok = engine::writeGameSpeed(ctx.gw, mult > 0.0f ? mult : 1.0f, false);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CHASE unpause side=%s t=%lu mult=%.2f ok=%d",
+                  ctx.isHost ? "host" : "join", ctx.elapsedMs, mult, ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void sample(const ScenarioContext& ctx, const EntityState& v) {
+        static engine::ChaseBody bodies[MAX_BODIES]; // main-thread only
+        static unsigned int keys[MAX_BODIES][5];
+        unsigned int nb = engine::listChaseBodies(ctx.gw, sid_, v.x, v.y, v.z, SCAN_R,
+                                                  bodies, MAX_BODIES);
+        unsigned int vis = 0, hid = 0, dead = 0, nk = 0, dupKeys = 0, proxies = 0;
+        unsigned int engHid = 0;
+        const unsigned long t = ctx.elapsedMs;
+        nSims_ = 0;
+        nearestPack_ = -1.0f;
+        for (unsigned int i = 0; i < nb; ++i) {
+            BodyRoleView r; memset(&r, 0, sizeof(r));
+            bool ok = ctx.bodyRole && ctx.bodyRole(bodies[i].c, &r);
+            bool bound = ok && (r.wire[0] | r.wire[1] | r.wire[2] | r.wire[3] | r.wire[4]) != 0;
+            unsigned int canon[5];
+            memcpy(canon, bound ? r.wire : bodies[i].hand, sizeof(canon));
+            const int sup = ok ? r.suppressed : 0;
+            const bool counted = bodies[i].dist <= COUNT_R;
+            if (!bodies[i].dead && !sup &&
+                (nearestPack_ < 0.0f || bodies[i].dist < nearestPack_))
+                nearestPack_ = bodies[i].dist;
+            // Ours to simulate: what pursue() moves on this side, at any range
+            // the scan reaches - a straggler is still chasing.
+            if (!bodies[i].dead && !sup && ok && !r.driven && !r.aiSusp &&
+                !bodies[i].down) {
+                memcpy(sims_[nSims_].hand, bodies[i].hand, sizeof(sims_[0].hand));
+                sims_[nSims_].dist = bodies[i].dist;
+                ++nSims_;
+            }
+            // Stragglers beyond COUNT_R are evidence (rows), not part of the count.
+            if (counted && bodies[i].dead) ++dead;
+            else if (counted && sup) ++hid;
+            else if (counted) {
+                ++vis;
+                if (!bodies[i].visible) ++engHid;
+                if (ok && r.proxy) ++proxies;
+                bool seen = false;
+                for (unsigned int k = 0; k < nk && !seen; ++k)
+                    seen = memcmp(keys[k], canon, sizeof(keys[k])) == 0;
+                if (seen) ++dupKeys;
+                else memcpy(keys[nk++], canon, sizeof(keys[0]));
+            }
+            if (i >= MAX_BODY_ROWS) continue;
+            char rb[320];
+            _snprintf(rb, sizeof(rb) - 1,
+                      "SCENARIO CHASEBODY side=%s t=%lu key=%u,%u,%u,%u,%u "
+                      "local=%u,%u,%u,%u,%u proxy=%d minted=%d driven=%d aiSusp=%d "
+                      "sup=%d engVis=%d dead=%d down=%d d=%.0f pos=%.0f,%.0f,%.0f",
+                      ctx.isHost ? "host" : "join", t, canon[0], canon[1], canon[2],
+                      canon[3], canon[4], bodies[i].hand[0], bodies[i].hand[1],
+                      bodies[i].hand[2], bodies[i].hand[3], bodies[i].hand[4],
+                      ok ? r.proxy : -1, ok ? r.minted : -1, ok ? r.driven : -1,
+                      ok ? r.aiSusp : -1, sup, bodies[i].visible, bodies[i].dead,
+                      bodies[i].down, bodies[i].dist, bodies[i].x, bodies[i].y,
+                      bodies[i].z);
+            rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+        }
+        float dx = v.x - tx_, dz = v.z - tz_;
+        int cx = 0, cz = 0;
+        engine::cellAt(ctx.gw, v.x, v.z, &cx, &cz);
+        char b[320];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO CHASE side=%s t=%lu spawned=%d vic=%u,%u vpos=%.0f,%.0f "
+                  "vcell=%d,%d dTown=%.0f vis=%u hid=%u dead=%u keys=%u dupKeys=%u "
+                  "proxies=%u engHid=%u sim=%u nearest=%.0f",
+                  ctx.isHost ? "host" : "join", t, spawned_ ? 1 : 0, vicHand_[3],
+                  vicHand_[4], v.x, v.z, cx, cz, (float)sqrt((double)(dx * dx + dz * dz)),
+                  vis, hid, dead, nk, dupKeys, proxies, engHid, nSims_, nearestPack_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        ++samples_;
+    }
+
+    bool          victimIsJoin_;
+    bool          haveGeo_, haveSid_, haveTabs_;
+    unsigned int  parked_, buffed_;
+    bool          spawned_;
+    unsigned int  nPack_;
+    unsigned long spawnMs_;
+    bool          fleeLogged_, crossed_, arrived_, rekeyed_;
+    unsigned long crossMs_, arriveMs_, camMs_, pursueMs_;
+    unsigned int  samples_;
+    float         tx_, tz_, ex_, ez_, edgeD_;
+    int           tcx_, tcz_;
+    unsigned int  nSims_;
+    float         nearestPack_;   // nearest shown pack body (-1 = none)
+    unsigned int  holds_;
+    char          sid_[96];
+    unsigned int  pack_[PACK_N][5];
+    unsigned int  vicHand_[5];
+    float         vicPos_[3];
+    Sim           sims_[MAX_BODIES];
+};
+
+// Bad Teeth's centre and the town_arrive park point (runfar1, ScenarioMovement.cpp).
+const float BanditChaseScenario::TOWN_X   = -32899.0f;
+const float BanditChaseScenario::TOWN_Z   = -20539.0f;
+const float BanditChaseScenario::TOWARD_X = -35747.0f;
+const float BanditChaseScenario::TOWARD_Z = -14509.0f;
+// Far enough past the boundary that a claim-side dwell sample cannot land back
+// in the town cell, close enough that the chase is one cell crossing.
+const float BanditChaseScenario::ESCAPE_PAST = 600.0f;
+const float BanditChaseScenario::PROBE_STEP  = 50.0f;
+const float BanditChaseScenario::PROBE_MAX   = 8000.0f;
+// Inside the 200 u stream bubble around the victim: the pack is what the
+// victim's client streams, not a far census row.
+const float BanditChaseScenario::PACK_AHEAD  = 90.0f;
+// town_arrive's hop: one long move order at the town centre stalled at the
+// wall in the first run (1,201 u short, never moved again).
+const float BanditChaseScenario::HOP_D       = 500.0f;
+const float BanditChaseScenario::ARRIVE_R    = 250.0f;
+const float BanditChaseScenario::COUNT_R     = 700.0f;
+// Pursuit reaches stragglers well past the count: a pack body left behind is
+// still chasing, and the victim's leash waits for it.
+const float BanditChaseScenario::SCAN_R      = 3000.0f;
+const float BanditChaseScenario::LEASH_R     = 300.0f;
+// Melee reach plus a lunge: closer than this, pursuit becomes an attack order.
+const float BanditChaseScenario::PURSUE_R    = 60.0f;
+const float BanditChaseScenario::VICTIM_STATS = 120.0f;
+const char* const BanditChaseScenario::PACK_CHAR    = "Dust bandit";
+const char* const BanditChaseScenario::PACK_FACTION = "Dust Bandits";
+
 } // namespace
 
 Scenario* makeCombatScenario(const std::string& name) {
@@ -2566,6 +3045,8 @@ Scenario* makeCombatScenario(const std::string& name) {
     if (name == "pc_assault")   return new PcAssaultScenario();
     if (name == "host_pc_fight")      return new HostPcFightScenario(false);
     if (name == "host_pc_fight_mint") return new HostPcFightScenario(true);
+    if (name == "bandit_chase")      return new BanditChaseScenario("bandit_chase", true);
+    if (name == "bandit_chase_host") return new BanditChaseScenario("bandit_chase_host", false);
     return 0;
 }
 

@@ -2454,6 +2454,168 @@ private:
 };
 const int InvNestedBagScenario::WANT[2] = { 2, 1 };
 
+// inv_join_bag: the player report "backpacks and items disappear from everyone but the host".
+// The host's save is the only one that persists (a join loads the host's world), so the host's
+// copy of a JOIN-owned character is what that character will own next session. inv_nested_bag
+// only ever filled a HOST-owned bag; this is the opposite direction, in two steps:
+//   A) @8s  the JOIN puts PROBE_A probe items into a bag its own (rank 1) character already wears;
+//   B) @12s the JOIN gives a bag-less rank 1 member a NEW backpack (a purchase / loot / pickup
+//      arrives exactly like this on the owner's side), and @16s puts PROBE_B items inside it.
+// The HOST must end up holding all of it, in the right place: bag counts and per-bag contents of
+// its copies of both characters are measured as deltas against its own baseline.
+class InvJoinBagScenario : public Scenario {
+public:
+    InvJoinBagScenario()
+        : passed_(false), isHost_(false), haveCarrier_(false), haveBare_(false), sellFirst_(false),
+          type_(0), bagType_(0), soldType_(0), step_(0), addA_(0), addB_(0), mintB_(0), sold_(0),
+          lastLogMs_(0), baseA_(-1), baseBagsB_(-1), curA_(-1), curBagsB_(-1), curB_(-1) {
+        for (int i = 0; i < 5; ++i) { carrier_[i] = 0; bare_[i] = 0; }
+        sid_[0] = '\0'; bagSid_[0] = '\0'; soldSid_[0] = '\0';
+    }
+
+    virtual const char* name() const { return "inv_join_bag"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        engine::commonTestItemSid(ctx.gw, sid_, sizeof(sid_), &type_);
+        EntityState sq[32];
+        unsigned int n = engine::captureSquad(ctx.gw, /*leaderOnly*/ false, sq, 32);
+        // Rank-1 members in a save-stable order, so both clients pick the same two bodies.
+        int order[32]; int no = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (tabRankOf(sq, n, i) != 1) continue;
+            int at = no++;
+            while (at > 0 && tabHandLess(sq[i], sq[order[at - 1]])) { order[at] = order[at - 1]; --at; }
+            order[at] = (int)i;
+        }
+        for (int o = 0; o < no; ++o) {
+            unsigned int h[5]; handFromEntity(sq[order[o]], h);
+            char bs[48]; unsigned int bt = 0;
+            bool bag = bagOf(ctx.gw, h, bs, sizeof(bs), &bt);
+            if (bag && !haveCarrier_) {
+                haveCarrier_ = true; for (int j = 0; j < 5; ++j) carrier_[j] = h[j];
+                strncpy(bagSid_, bs, sizeof(bagSid_) - 1); bagSid_[sizeof(bagSid_) - 1] = '\0';
+                bagType_ = bt;
+            } else if (!haveBare_) {
+                // The second rank-1 member. Bag-less: it simply acquires one. Already wearing
+                // one: it SELLS that one first (destroyed on the owner, as a trader sale does),
+                // then buys a fresh bag - the same "new backpack" edge, reachable on any fixture.
+                haveBare_ = true; for (int j = 0; j < 5; ++j) bare_[j] = h[j];
+                sellFirst_ = bag;
+                if (bag) { strncpy(soldSid_, bs, sizeof(soldSid_) - 1); soldSid_[sizeof(soldSid_) - 1] = '\0'; soldType_ = bt; }
+            }
+        }
+        // No rank-1 bag to copy the template from: any squad member's will do.
+        for (unsigned int i = 0; i < n && !bagSid_[0]; ++i) {
+            unsigned int h[5]; handFromEntity(sq[i], h);
+            bagOf(ctx.gw, h, bagSid_, sizeof(bagSid_), &bagType_);
+        }
+        baseA_     = haveCarrier_ ? engine::countInNestedContainer(ctx.gw, carrier_, sid_, type_) : -1;
+        baseBagsB_ = haveBare_ ? engine::nestedContainerCount(ctx.gw, bare_) : -1;
+        char b[360];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO JBAG anchor host=%d rank1=%d carrier=%d,%u,%u bare=%d,%u,%u sid='%s' type=%u "
+            "bag='%s' bagType=%u baseA=%d baseBagsB=%d",
+            isHost_ ? 1 : 0, no, haveCarrier_ ? 1 : 0, carrier_[3], carrier_[4],
+            haveBare_ ? 1 : 0, bare_[3], bare_[4], sid_[0] ? sid_ : "(none)", type_,
+            bagSid_[0] ? bagSid_ : "(none)", bagType_, baseA_, baseBagsB_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!isHost_ && sid_[0]) {
+            if (step_ == 0 && ctx.elapsedMs >= 8000) {
+                step_ = 1;
+                addA_ = haveCarrier_ ? engine::addItemToNestedContainer(ctx.gw, carrier_, sid_, type_, PROBE_A) : -1;
+                logStep("A-ADD", addA_);
+            }
+            if (step_ == 1 && ctx.elapsedMs >= 12000) {
+                step_ = 2;
+                sold_ = (haveBare_ && sellFirst_)
+                    ? engine::removeItemsFromContainerBySid(ctx.gw, bare_, soldSid_, soldType_, 1) : 0;
+                logStep("B-SELL", sold_);
+            }
+            if (step_ == 2 && ctx.elapsedMs >= 16000) {
+                step_ = 3;
+                mintB_ = (haveBare_ && bagSid_[0])
+                    ? engine::addItemsToContainerBySid(ctx.gw, bare_, bagSid_, bagType_, 1, 0, "", "") : -1;
+                logStep("B-BAG", mintB_);
+            }
+            if (step_ == 3 && ctx.elapsedMs >= 20000) {
+                step_ = 4;
+                addB_ = haveBare_ ? engine::addItemToNestedContainer(ctx.gw, bare_, sid_, type_, PROBE_B) : -1;
+                logStep("B-ADD", addB_);
+            }
+        }
+        if (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            sample(ctx.gw);
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO JBAG %s t=%lu inA=%d bagsB=%d inB=%d",
+                      isHost_ ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs, curA_, curBagsB_, curB_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs < dur) return false;
+        sample(ctx.gw);
+        int dA = (curA_ >= 0 && baseA_ >= 0) ? curA_ - baseA_ : -999;
+        int dBags = (curBagsB_ >= 0 && baseBagsB_ >= 0) ? curBagsB_ - baseBagsB_ : -999;
+        // Sold one, bought one: the count is back to its base. Bought onto a bag-less body: +1.
+        int wantDBags = sellFirst_ ? 0 : 1;
+        bool okA = haveCarrier_ && dA == PROBE_A;
+        bool okB = haveBare_ && dBags == wantDBags && curB_ == PROBE_B;
+        passed_ = okA && okB;
+        char b[300];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO JBAG verdict role=%s pass=%d okA=%d okB=%d dA=%d wantA=%d dBagsB=%d inB=%d "
+            "wantB=%d addA=%d mintB=%d addB=%d sold=%d wantDBags=%d",
+            isHost_ ? "host" : "join", passed_ ? 1 : 0, okA ? 1 : 0, okB ? 1 : 0, dA, PROBE_A,
+            dBags, curB_, PROBE_B, addA_, mintB_, addB_, sold_, wantDBags);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return true;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    enum { PROBE_A = 3, PROBE_B = 2 };
+    static const unsigned long HOST_DURATION_MS = 40000;
+    static const unsigned long JOIN_DURATION_MS = 38000;
+
+    void sample(GameWorld* gw) {
+        curA_     = haveCarrier_ ? engine::countInNestedContainer(gw, carrier_, sid_, type_) : -1;
+        curBagsB_ = haveBare_ ? engine::nestedContainerCount(gw, bare_) : -1;
+        curB_     = haveBare_ ? engine::countInNestedContainer(gw, bare_, sid_, type_) : -1;
+    }
+
+    void logStep(const char* what, int rc) const {
+        char b[160]; _snprintf(b, sizeof(b) - 1, "SCENARIO JBAG %s rc=%d", what, rc);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The first CONTAINER the character at h carries (top-level read), if any.
+    static bool bagOf(GameWorld* gw, const unsigned int h[5], char* outSid,
+                      unsigned int outLen, unsigned int* outType) {
+        InvItemEntry ent[INV_ITEMS_MAX];
+        unsigned int ni = engine::captureContainerContents(gw, h, ent, INV_ITEMS_MAX, 0);
+        for (unsigned int k = 0; k < ni; ++k) {
+            if (!engine::isContainerItemType(ent[k].itemType)) continue;
+            strncpy(outSid, ent[k].stringID, outLen - 1); outSid[outLen - 1] = '\0';
+            if (outType) *outType = ent[k].itemType;
+            return true;
+        }
+        return false;
+    }
+
+    bool          passed_, isHost_, haveCarrier_, haveBare_, sellFirst_;
+    unsigned int  type_, bagType_, soldType_;
+    int           step_, addA_, addB_, mintB_, sold_;
+    unsigned long lastLogMs_;
+    int           baseA_, baseBagsB_, curA_, curBagsB_, curB_;
+    unsigned int  carrier_[5], bare_[5];
+    char          sid_[48], bagSid_[48], soldSid_[48];
+};
+
 // inv_dump_all: the player's ACTUAL workflow, which is a burst rather than the one-item round
 // trip every other gear gate exercises - dump a character's ENTIRE kit on the ground at once and
 // hoover all of it up with a second character. That difference is what the previous gates missed,
@@ -3017,6 +3179,9 @@ Scenario* makeInventoryScenario(const std::string& name) {
     // (manual T8: stale old-spot position, worn drop never mirrored).
     if (name == "gear_redrop")            return new GearRedropScenario();
     if (name == "inv_nested_bag") return new InvNestedBagScenario();
+    // The join-authored direction of inv_nested_bag, plus a backpack the join newly acquires:
+    // the host's copy is what the next session loads ("backpacks vanish for everyone but the host").
+    if (name == "inv_join_bag")   return new InvJoinBagScenario();
     // The burst the one-item gates above cannot express: a whole kit dumped at once and hoovered
     // up by a single character, which is how the player drives it and where the tick-denominated
     // track retirement and the top-level-only drop mirror both showed.

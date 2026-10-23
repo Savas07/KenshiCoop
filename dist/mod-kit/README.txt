@@ -1,4 +1,4 @@
-﻿KenshiCoop v0.58.0 - co-op mod
+﻿KenshiCoop v0.58.1 - co-op mod
 ==============================
 
 This zip contains ONE folder: "KenshiCoop". That folder IS the mod.

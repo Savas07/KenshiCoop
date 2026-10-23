@@ -314,8 +314,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v64: join-authored squad/faction names + permanent jobs)",
-             (int)PROTOCOL_VERSION, 64);
+    CHECK_EQ("PROTOCOL_VERSION (v65: trader lock + shop hand-over)",
+             (int)PROTOCOL_VERSION, 65);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap

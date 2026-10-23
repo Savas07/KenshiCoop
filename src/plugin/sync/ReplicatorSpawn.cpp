@@ -136,7 +136,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.hType = rq.hType; pkt.hContainer = rq.hContainer;
             pkt.hContainerSerial = rq.hContainerSerial;
             pkt.hIndex = rq.hIndex; pkt.hSerial = rq.hSerial;
-            Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            // The REQ names a key we PUBLISHED, and publishing names a body by
+            // its wire key (publishKeyFor): a proxy we now author, or a body
+            // the engine re-containered, resolves only through its binding.
+            Character* c = bodyForKey(k, 0, 0);
             bool dead = false;
             float age = 0.0f;
             bool found = c && engine::describeCharacter(
@@ -387,7 +390,34 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             Character* twin = engine::adoptCandidateNear(gw, p.charSid, p.facSid,
                                                          p.x, p.y, p.z, probeR,
                                                          aExcl, ane, &adoptD);
-            if (twin && adoptD > adoptRadius_) {
+            // UNIQUE templates (named world NPCs: Griffin, the Bard). The factory
+            // makes at most one body per unique template per world, so the mint
+            // below cannot succeed - createChar returns 0 while our own instance
+            // lives (bandit_chase 20261022_131736: 8 'proxy FAILED' on two such
+            // sids, retried every 30 s, the twin 688-978 u away). And there being
+            // only one, the body this world already has IS the one the host's row
+            // means: the template is the identity, so distance and faction (a
+            // world event can move either) prove nothing either way. Search the
+            // whole loaded world for it and bind it wherever it stands; the park
+            // below lands it on the host's transform.
+            bool uniqueTmpl = false;
+            if (!twin || adoptD > adoptRadius_) {
+                uniqueTmpl = engine::isUniqueTemplate(gw, p.charSid);
+                if (uniqueTmpl) {
+                    const float UNIQUE_ADOPT_RADIUS = 30000.0f;
+                    float ud = -1.0f;
+                    Character* u = engine::adoptCandidateNear(gw, p.charSid, 0,
+                                                              p.x, p.y, p.z,
+                                                              UNIQUE_ADOPT_RADIUS,
+                                                              aExcl, ane, &ud);
+                    char b[208]; _snprintf(b, sizeof(b) - 1,
+                        "[spawn] adopt UNIQUE hand=%u,%u,%u,%u,%u sid='%s' d=%.0f found=%d",
+                        k.t, k.c, k.cs, k.i, k.s, p.charSid, ud, u ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    if (u) { twin = u; adoptD = ud; }
+                }
+            }
+            if (twin && adoptD > adoptRadius_ && !uniqueTmpl) {
                 // A twin exists but is further out than we trust. Say so, with the
                 // distance, and fall through to the mint.
                 char b[208]; _snprintf(b, sizeof(b) - 1,
@@ -787,8 +817,12 @@ bool Replicator::bodyRoleOf(GameWorld* gw, Character* c, BodyRoleRead* out) cons
     out->squad   = engine::isLocalPlayerChar(gw, c);
     std::pair<u32, u32> tab((u32)lk.c, (u32)lk.cs);
     out->tabOwn  = out->squad && ownsTab(tab, tabRankFor(tab, lastCtnrs_));
-    const Key* wire = 0;
+    // Hidden under the key the existence passes judge it by (identityKeyOf).
     std::map<Character*, Key>::const_iterator ct = canonicalOf_.find(c);
+    std::map<Key, Character*>::const_iterator sp =
+        suppressed_.find(ct != canonicalOf_.end() ? ct->second : lk);
+    out->suppressed = sp != suppressed_.end() && sp->second == c;
+    const Key* wire = 0;
     if (ct != canonicalOf_.end()) { out->canon = true; wire = &ct->second; }
     for (std::map<Key, Character*>::const_iterator pt = proxyByKey_.begin();
          pt != proxyByKey_.end(); ++pt) {
@@ -860,7 +894,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if (ownHands_.find(k) != ownHands_.end()) break;
                 int limb = (int)ev.arg;
                 if (limb < 0 || limb > 3) break;
-                Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                Character* c = bodyForKey(k, 0, 0);
                 if (!c) break; // not loaded here; the medical stream self-heals later
                 unsigned char states[4] = { LIMB_STATE_UNKNOWN, LIMB_STATE_UNKNOWN,
                                             LIMB_STATE_UNKNOWN, LIMB_STATE_UNKNOWN };
@@ -884,11 +918,17 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // Works for own-tab, cross-tab, and either direction: each
                 // machine mirrors the relationship between its own instances.
                 if (!carrySync_) break;
-                Character* carrier = engine::resolveCharByHand(
-                    ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
-                unsigned int ch[5] = { ev.sType, ev.sContainer, ev.sContainerSerial,
-                                       ev.sIndex, ev.sSerial };
-                bool ok = carrier && engine::applyPickup(0, carrier, ch);
+                // Both hands are WIRE keys, and either body may be one we hold
+                // as a proxy: map each to its local body, then hand the engine
+                // the carried body's LOCAL hand.
+                Key ak; ak.t = ev.aType; ak.c = ev.aContainer;
+                ak.cs = ev.aContainerSerial; ak.i = ev.aIndex; ak.s = ev.aSerial;
+                Character* carrier = bodyForKey(ak, 0, 0);
+                Character* carried = bodyForKey(k, 0, 0);
+                unsigned int ch[5];
+                bool ok = carrier && carried &&
+                          engine::readObjectHand(reinterpret_cast<RootObject*>(carried), ch) &&
+                          engine::applyPickup(0, carrier, ch);
                 char cb[160]; _snprintf(cb, sizeof(cb) - 1,
                     "[carry] RECV PICKUP id=%u carrier=%u,%u carried=%u,%u ok=%d",
                     ev.eventId, ev.aIndex, ev.aSerial, ev.sIndex, ev.sSerial,
@@ -901,8 +941,9 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // ragdoll flag). Idempotent - a carrier that never picked up
                 // locally (lost/late pickup) is a no-op success.
                 if (!carrySync_) break;
-                Character* carrier = engine::resolveCharByHand(
-                    ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
+                Key ak; ak.t = ev.aType; ak.c = ev.aContainer;
+                ak.cs = ev.aContainerSerial; ak.i = ev.aIndex; ak.s = ev.aSerial;
+                Character* carrier = bodyForKey(ak, 0, 0);
                 bool ok = carrier && engine::applyDrop(carrier, ev.arg != 0.0f);
                 char cb[160]; _snprintf(cb, sizeof(cb) - 1,
                     "[carry] RECV DROP id=%u carrier=%u,%u carried=%u,%u ok=%d",
@@ -945,7 +986,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                         break;
                     }
                 }
-                Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                Character* occ = bodyForKey(k, 0, 0);
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
@@ -962,7 +1003,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // that never entered locally (lost/late enter) is a no-op success.
                 if (!furnSync_) break;
                 if (ownHands_.find(k) != ownHands_.end()) break;
-                Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                Character* occ = bodyForKey(k, 0, 0);
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;

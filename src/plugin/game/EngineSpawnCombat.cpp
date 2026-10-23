@@ -93,6 +93,15 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
     }
 }
 
+const void* templateOf(Character* c) {
+    if (!c) return 0;
+    __try {
+        return c->getGameData();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 // SEH-guarded (join, mint duplicate guard 2026-07-11): return a world NPC with
 // the SAME template stringID standing within 'radius' of (x,y,z), or 0. The
 // census-missing hand may be THAT body under a hand we cannot correlate
@@ -236,6 +245,30 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
     detachFromTownAI(c);
     clearGoals(c);
     return c;
+}
+
+namespace {
+// Plain helper (std::string key): the __try frame below stays POD-only.
+bool uniqueFlagOf(GameData* t) {
+    std::string k("unique");
+    if (t->bdata.find(k) == t->bdata.end()) return false;
+    return t->bdata[k];
+}
+bool uniqueFlagGuarded(GameData* t) {
+    __try {
+        return uniqueFlagOf(t);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+} // namespace
+
+bool isUniqueTemplate(GameWorld* gw, const char* charSid) {
+    if (!gw || !charSid || !charSid[0]) return false;
+    GameData* tmpl = findItemTemplateImpl(gw, charSid, (unsigned int)CHARACTER);
+    if (!tmpl)
+        tmpl = findItemTemplateImpl(gw, charSid, (unsigned int)ANIMAL_CHARACTER);
+    return tmpl && uniqueFlagGuarded(tmpl);
 }
 
 bool despawnProxyNpc(GameWorld* gw, Character* proxy) {

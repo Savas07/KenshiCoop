@@ -1384,6 +1384,49 @@ function Test-NestedBag {
                             nestedSkip = $skip; topLevelChurn = $churn })
 }
 
+# inv_join_bag: what the JOIN does to its own characters' bags must reach the HOST's copy - the
+# host's save is the one the next session loads, so anything missing there is lost for good
+# ("backpacks and items disappear from everyone but the host"). A = items into a bag the join's
+# character already wears; B = a backpack the join's bag-less character newly acquires, then
+# items inside it. The host verdict is the gate; the join verdict proves the edges were authored.
+function Test-JoinBag {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = "JBAG verdict role=(host|join) pass=(\d+) okA=(\d+) okB=(\d+) dA=(-?\d+) wantA=(\d+) dBagsB=(-?\d+) inB=(-?\d+) wantB=(\d+) addA=(-?\d+) mintB=(-?\d+) addB=(-?\d+)"
+    $read = {
+        param($file, $role)
+        if (-not (Test-Path $file)) { return $null }
+        $m = Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue |
+             Where-Object { $_.Matches[0].Groups[1].Value -eq $role } | Select-Object -Last 1
+        if ($null -eq $m) { return $null }
+        $g = $m.Matches[0].Groups
+        return [pscustomobject]@{ pass = ([int]$g[2].Value -eq 1); okA = ([int]$g[3].Value -eq 1)
+                                  okB = ([int]$g[4].Value -eq 1); dA = [int]$g[5].Value
+                                  dBags = [int]$g[7].Value; inB = [int]$g[8].Value
+                                  addA = [int]$g[10].Value; mintB = [int]$g[11].Value; addB = [int]$g[12].Value }
+    }
+    $h = & $read $HostFile 'host'
+    $j = & $read $JoinFile 'join'
+    $ok = $true
+    foreach ($side in @(@('host', $h), @('join', $j))) {
+        $role = $side[0]; $s = $side[1]
+        if ($null -eq $s) { Write-Host "  JOIN-BAG [$role] FAIL - no JBAG verdict"; $ok = $false; continue }
+        Write-Host ("  JOIN-BAG [$role] " + $(if ($s.pass) { "PASS" } else { "FAIL" }) +
+                    " - A: worn-bag gain=$($s.dA) ok=$($s.okA); B: new bags=$($s.dBags) inside=$($s.inB) ok=$($s.okB)")
+        if (-not $s.pass) { $ok = $false }
+    }
+    if ($null -ne $j -and ($j.addA -le 0 -or $j.mintB -le 0 -or $j.addB -le 0)) {
+        Write-Host "    NOTE: the join did not author every edge (addA=$($j.addA) mintB=$($j.mintB) addB=$($j.addB)); the fixture cannot exercise this path"
+    }
+    $skipC = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern 'CREATE-SKIP-CONTAINER' -Quiet)
+    $skipN = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[recon\] NESTED-SKIP' -Quiet)
+    Write-Host "  JOIN-BAG trace: host refused to create a container=$skipC, skipped a nested apply=$skipN"
+    Write-Host ("  JOIN-BAG " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "join_bag" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostA = $(if ($h) { $h.dA } else { $null }); hostBagsB = $(if ($h) { $h.dBags } else { $null })
+                            hostInB = $(if ($h) { $h.inB } else { $null }); createSkipContainer = $skipC
+                            nestedSkip = $skipN })
+}
+
 function Test-DumpAll {
     param([string]$HostFile, [string]$JoinFile)
     $rxH = "WDMP verdict role=host pass=(\d+) kit=(-?\d+) want=(-?\d+) dropped=(-?\d+) grndPeak=(-?\d+) grndFinal=(-?\d+) heldR1=(-?\d+) conserved=(\d+) dist='([^']*)'"

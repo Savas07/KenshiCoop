@@ -133,7 +133,9 @@ void Replicator::publishMedical(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned long minSendMs = isNpc ? NPC_MIN_SEND_MS : MIN_SEND_MS;
         unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
         engine::MedicalRead mr;
-        if (!engine::readMedicalByHand(hand, &mr) || !mr.valid) continue;
+        // medNpc_ is keyed by the stream rows, i.e. by WIRE keys (publishKeyFor),
+        // so a proxy we author resolves only through its binding.
+        if (!engine::readMedical(bodyForKey(k, 0, 0), &mr) || !mr.valid) continue;
         // Protocol 29 A/B hatch: with hungerSync off the fields go out as -1
         // (not carried) and drop out of the fingerprint, so the medical
         // channel behaves exactly as pre-29.
@@ -232,8 +234,8 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
         k.i = p.sIndex; k.s = p.sSerial;
         if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
-        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
-        Character* c = engine::resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+        // A wire key: the peer's hand for a body we may only hold as a proxy.
+        Character* c = bodyForKey(k, 0, 0);
         if (!c) continue;
         engine::MedicalRead w;
         memset(&w, 0, sizeof(w));
@@ -313,9 +315,8 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         MedRecv&   r = it->second;
         if (!r.have || (now - r.lastFwdMs) < FWD_THROTTLE_MS) continue;
         if (ownHands_.find(k) != ownHands_.end()) continue;
-        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
         engine::MedicalRead mr;
-        if (!engine::readMedicalByHand(hand, &mr) || !mr.valid) continue;
+        if (!engine::readMedical(bodyForKey(k, 0, 0), &mr) || !mr.valid) continue;
         TreatmentPacket tp;
         memset(&tp, 0, sizeof(tp));
         bool rise = false;
@@ -365,7 +366,7 @@ void Replicator::applyTreatments(GameWorld* gw, Inbound& in) {
                          (streamNpcs_ && medNpc_.find(k) != medNpc_.end() &&
                           allSquad_.find(k) == allSquad_.end());
         if (!authority) continue;
-        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        Character* c = bodyForKey(k, 0, 0);   // our wire key: proxies included
         if (!c) continue;
         int n = engine::applyBandageParts(c, p.partBand);
         char b[160]; _snprintf(b, sizeof(b) - 1,
@@ -436,8 +437,13 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             continue;
         }
+        // The report names our WIRE key for the body, and a proxy we author
+        // answers to it only through its binding: wound the body the key maps
+        // to, by its local hand.
+        Character* hc = bodyForKey(k, 0, 0);
         unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
-        bool applied = engine::applyReportedDamage(gw, hand, p.flesh, p.blood);
+        if (hc) engine::readObjectHand(reinterpret_cast<RootObject*>(hc), hand);
+        bool applied = hc && engine::applyReportedDamage(gw, hand, p.flesh, p.blood);
         // A wounded world NPC is definitionally combat-scoped: mark it so the NPC
         // vitals stream (publishMedical, Phase B) mirrors the authoritative drop
         // back to the join's cosmetic copy (link 6 - "damage reached the join").
@@ -2292,17 +2298,6 @@ void Replicator::applyBuildDoors(const SyncContext& ctx) {
     }
 }
 
-bool Replicator::recruitWireKeyOf(Character* c, Key* out) const {
-    if (!c || !out) return false;
-    std::map<Character*, Key>::const_iterator ct = canonicalOf_.find(c);
-    if (ct != canonicalOf_.end()) { *out = ct->second; return true; }
-    for (std::map<Key, Character*>::const_iterator pt = proxyByKey_.begin();
-         pt != proxyByKey_.end(); ++pt) {
-        if (pt->second == c) { *out = pt->first; return true; }
-    }
-    return false;
-}
-
 void Replicator::releaseRecruitDrive(Character* c, const Key& wire) {
     for (std::map<Key, Character*>::iterator pt = proxyByKey_.begin();
          pt != proxyByKey_.end(); ) {
@@ -2365,7 +2360,8 @@ void Replicator::publishRecruits(GameWorld* gw, NetLink& net, u32 ownerId) {
         Key sk; sk.t = edges[i].before[0]; sk.c = edges[i].before[1];
         sk.cs = edges[i].before[2]; sk.i = edges[i].before[3]; sk.s = edges[i].before[4];
         Key wire;
-        const bool peerBound = recruitWireKeyOf(c, &wire);
+        indexProxies(); // releaseRecruitDrive below unbinds, so per edge
+        const bool peerBound = wireKeyOf(c, &wire);
         if (peerBound) {
             sk = wire;
             // It is ours now: drop the drive we held for it (the CONTROL-FLIP
@@ -2735,9 +2731,38 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
     // requested multiplier survives a pause (the engine's own model), so
     // unpausing restores the player's request, not the arbitrated effective.
     bool userActed = false;
+    // A dialogue's auto-pause is the engine's, not a vote (Replicator.h,
+    // speedDlgOpen_). bandit_chase 20261022_134931: the Holy Sentinel's search
+    // opened on the join, its pause became the join's vote, nobody answered,
+    // and both worlds stood still for the remaining 80 s of the run. The engine
+    // pauses once, as the dialogue opens (134020: unpaused under an open
+    // dialogue, it stayed unpaused for the 3.7 s the dialogue lasted), so only
+    // a pause inside that window is dropped; one the player presses later,
+    // dialogue or not, is a vote. Enforcement below puts the arbitrated speed
+    // back the same tick.
+    const unsigned long DLG_PAUSE_MS = 1000;
+    const bool dlg = engine::inDialogue();
+    if (dlg != speedDlgOpen_) {
+        speedDlgOpen_ = dlg;
+        if (dlg) speedDlgOpenMs_ = now;
+        char b[64]; _snprintf(b, sizeof(b) - 1, "[speed] DIALOG open=%d", dlg ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    const bool dlgEdge = dlg && (now - speedDlgOpenMs_) < DLG_PAUSE_MS;
     {
         float im = 0.0f; bool ip = false;
         while (engine::consumeSpeedIntent(gw, &im, &ip)) {
+            if (ip && dlgEdge) {
+                static unsigned long s_loggedOpenMs = 0; // main-thread only
+                if (s_loggedOpenMs != speedDlgOpenMs_ + 1) {
+                    s_loggedOpenMs = speedDlgOpenMs_ + 1;
+                    char b[112]; _snprintf(b, sizeof(b) - 1,
+                        "[speed] DIALOG auto-pause ignored (not a vote; request stays %.2f)",
+                        speedMyReq_);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                continue;
+            }
             speedMyReq_ = ip ? 0.0f : im;
             userActed = true;
         }

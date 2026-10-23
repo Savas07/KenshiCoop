@@ -75,6 +75,7 @@ Replicator::Replicator()
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedSeqOut_(1), speedSeqSeen_(0),
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
+      speedDlgOpen_(false), speedDlgOpenMs_(0),
       spawnSync_(false), spawnPosLogMs_(0),
       spawnMintRadius_(0.0f), adoptRadius_(0.0f), censusAdopts_(0),
       censusScanMs_(0),
@@ -196,6 +197,8 @@ void Replicator::resetSession() {
     pinNpcSkipLogged_.clear(); // [recruit] NPC-SKIP once-per-hand log
     jailObs_.clear();          // jail-observe spike per-captive last sample
     proxyByKey_.clear();
+    proxyRev_.clear();         // its inverse (rebuilt every publish pass)
+    lastHand_.clear();         // publishKeyFor's pointer-keyed hand memory
     suppressed_.clear();
     midBand_.clear();          // host mid-band round-robin (rebuilt by next census)
     midCursor_ = 0; midSliceMs_ = 0;
@@ -340,6 +343,8 @@ void Replicator::resetSession() {
     speedLastSendMs_  = 0;
     speedCombatSampleMs_ = 0;
     speedCombatHoldMs_ = 0;
+    speedDlgOpen_      = false;
+    speedDlgOpenMs_    = 0;
     timeSlew_         = 1.0f;
     timeSeqSeen_      = 0;
     timeLastSendMs_   = 0;
@@ -606,7 +611,7 @@ void Replicator::ingestInv(Inbound& in) {
         }
         bool fresh = invRecv_.count(k) == 0;
         InvRecv& r = invRecv_[k];
-        if (fresh) r.bench = BENCH_UNKNOWN; // explicit: never trust value-init here
+        if (fresh) { r.bench = BENCH_UNKNOWN; r.bagShortMs = 0; } // explicit: never trust value-init here
         r.ownerId   = it->ownerId;
         r.items     = it->items; // latest snapshot supersedes
         r.dirty     = true;

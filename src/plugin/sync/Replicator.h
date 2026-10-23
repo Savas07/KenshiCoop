@@ -137,12 +137,13 @@ public:
     // Scenario support (recruit_join): this client's ownership/drive view of ONE
     // local body - owned (local hand streamed this tick), the pins on its local
     // hand, whether this tick drove / AI-suspended it, whether it is minted, a
-    // player-squad member, or in a tab we own, and the peer key it is bound
-    // under (canonicalOf_ stamp first, else its proxyByKey_ binding; zeros when
-    // neither). Pointer lookups plus one SEH-guarded hand read. False when the
-    // body's hand is unreadable.
+    // player-squad member, in a tab we own, or hidden by our existence judgment
+    // (suppressed_), and the peer key it is bound under (canonicalOf_ stamp
+    // first, else its proxyByKey_ binding; zeros when neither). Pointer lookups
+    // plus one SEH-guarded hand read. False when the body's hand is unreadable.
     struct BodyRoleRead {
         bool owned, pinOwn, pinPeer, driven, aiSusp, canon, proxy, minted, squad, tabOwn;
+        bool suppressed;
         unsigned int local[5];
         unsigned int wire[5];
     };
@@ -980,6 +981,10 @@ private:
         Key k; k.t = e.hType; k.c = e.hContainer; k.cs = e.hContainerSerial;
         k.i = e.hIndex; k.s = e.hSerial; return k;
     }
+    static void setKey(EntityState& e, const Key& k) {
+        e.hType = k.t; e.hContainer = k.c; e.hContainerSerial = k.cs;
+        e.hIndex = k.i; e.hSerial = k.s;
+    }
 
     struct Driven {
         EntityInterp interp;
@@ -1219,6 +1224,47 @@ private:
     // loop, which owns the binding, unbinds it). Read-only. Either out-param may
     // be 0.
     Character* bodyForKey(const Key& k, bool* viaProxy, bool* staleProxy) const;
+    // Its reverse, the ONE local-body -> wire-key translation, for everything we
+    // PUBLISH: the key the peer knows `c` by. A body we drive answers to the
+    // stream key we drive it under (canonicalOf_); a proxy we minted or adopted
+    // answers to the key it is bound to (proxyByKey_). Returns false when `c` is
+    // neither, and its own hand is its wire identity. A proxy's local hand is
+    // one only THIS client has ever seen, so a channel that publishes it hands
+    // the peer a body it cannot resolve: it REQs, mints a second copy beside the
+    // native it already has, and the identity forks. bandit_chase measured
+    // exactly that - the join's three bandits chased its victim into the
+    // host's cell, the host (now their author) streamed its proxies under
+    // their local hands, and the join stood up two more beside its own.
+    // Reads proxyRev_: run indexProxies() first in the same pass.
+    bool wireKeyOf(Character* c, Key* out) const;
+    // Rebuild proxyRev_ from proxyByKey_. One pass and a sort; the vector keeps
+    // its capacity, so the per-frame publish allocates nothing in steady state.
+    void indexProxies();
+    // The key a body we PUBLISH goes out under, held fixed for the body's
+    // lifetime. wireKeyOf when the body is bound or driven; otherwise its own
+    // hand - unless the engine re-containered it since we last named it (a KO'd
+    // bandit carried into a cell, a town NPC split into a fresh combat squad:
+    // same object, same type and serial, new container/index). Then the key the
+    // peer already knows is bound to the body (proxyByKey_) and stays its name,
+    // so the peer keeps driving the copy it has instead of REQing a hand it has
+    // never seen and minting a second one beside it (bandit_chase_host: the
+    // host's KO'd bandit was carried to the jail under a fresh hand and the
+    // join stood up a second copy there). `local` is c's hand as captured.
+    // Publish passes only; run indexProxies() first.
+    Key publishKeyFor(Character* c, const Key& local);
+    // Age out publishKeyFor's memory of bodies no publish pass has named lately.
+    void pruneLastHands(unsigned long now);
+    // Rewrite the combat/carry SUBJECT of rows[from, to) - a body named by its
+    // local hand at capture - to the key the peer knows that body by.
+    void xlateSubjects(EntityState* rows, unsigned int from, unsigned int to);
+    // The key the EXISTENCE judgment asks the census about for a local body: the
+    // stream key we drive it under when there is one (canonicalOf_), else its
+    // own hand. A native our engine re-containered keeps answering to the key
+    // the peer's census lists it by; judged by its new local hand it read as a
+    // ghost every time the mid tier released it between samples, and flipped
+    // cull -> restore twice a second (bandit_chase_host: a seated Holy Citizen,
+    // 11 suppressions). Proxies never get here: they are judged by binding.
+    Key identityKeyOf(Character* c, const EntityState& st) const;
 
     // Drive-tick epilogue (Phase 7 Workstream C): the self-contained post-loop
     // passes split out of applyTargets. Each reads/writes only Replicator members
@@ -1309,6 +1355,18 @@ private:
     // (r=1 forever - the fight only renders on the attacker's client).
     // Refilled every drive tick; pruned alongside drivenSeen_.
     std::map<Character*, Key> canonicalOf_;
+    // proxyByKey_ inverted (body -> bound key), sorted by body, for wireKeyOf.
+    // Rebuilt by indexProxies() at the head of each publish pass; pointers are
+    // compared, never dereferenced.
+    std::vector<std::pair<Character*, Key> > proxyRev_;
+    // publishKeyFor's memory: the hand each body we publish was last captured
+    // under, the key it went out as, and its template. A new hand is the same
+    // body when the old hand still resolves to it (a squad split renumbers index
+    // and serial but leaves the old hand resolving) or keeps type, serial and
+    // template (a carry into a cell); a body reusing the address passes neither.
+    // Pointers are compared, never dereferenced.
+    struct SeenHand { Key local; Key wire; unsigned long ms; const void* tmpl; };
+    std::map<Character*, SeenHand> lastHand_;
     // Last LOCAL hand reported for each wire key, so the [rekey] translation
     // line is emitted on change rather than every drive tick.
     std::map<Key, Key>        rekeyLogged_;
@@ -1398,7 +1456,9 @@ private:
     // "zombie NPC" report). Keys only (no Character*): each publish resolves
     // the hand fresh, so a despawn between census walks degrades to a skip.
     struct MidBandEntry {
-        Key k; float dist;
+        Key k;   // LOCAL hand: what captureNpcByHand resolves
+        Key w;   // wire key (publishKeyFor): what the row is published under
+        float dist;
         bool operator<(const MidBandEntry& o) const { return dist < o.dist; }
     };
     std::vector<MidBandEntry> midBand_;
@@ -1577,6 +1637,10 @@ private:
     enum {
         CELL_OWNER_HOST   = 0,    // NetLink gives the host id 0
         CELL_DWELL_N      = 3,    // samples at 1 Hz
+        // Spatial hysteresis: a tab keeps its claimed cell while its leader
+        // stands within this many units of it. The dwell alone is temporal,
+        // and a leader pacing a border clears it every crossing.
+        CELL_HYST_U       = 300,
         CELL_ASSERT_MS    = 5000  // re-assert cadence (reconnect insurance)
     };
     // Phase B attach measurement. A dormant -> observed transition forces a
@@ -1694,8 +1758,11 @@ private:
     // bench (protocol 63): BENCH_UNKNOWN until the local hand resolves, then
     // BENCH_RESEARCH / BENCH_OTHER (classifyBench; std::map value-init = unknown).
     enum { BENCH_UNKNOWN = 0, BENCH_RESEARCH = 1, BENCH_OTHER = 2 };
+    // bagShortMs: when a container (backpack) shortfall was first left unfilled for this
+    // snapshot's container, 0 = none. Survives newer snapshots; see applyInventories.
     struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; bool truncated;
-                     bool shop; bool corpse; unsigned long recvMs; unsigned char bench; };
+                     bool shop; bool corpse; unsigned long recvMs; unsigned char bench;
+                     unsigned long bagShortMs; };
     std::set<Key>          ownedContainers_;
     std::map<Key, InvPub>  invPub_;
     std::map<Key, InvRecv> invRecv_;
@@ -2752,14 +2819,6 @@ private:
     // recruit ok=1 path, the ok=0 post-mint drain, and the control-flip transfer.
     void insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
                           const char* tag, u32 author, bool ownIt = false);
-    // Recruiter half of protocol 23 (publishRecruits). The body we just recruited
-    // may be one we were DRIVING from a peer's stream (every NPC near a shared
-    // cell is host-authored), whose LOCAL hand can differ from the key the peer
-    // streams it by (combat/sitter detach re-containered our copy). Return that
-    // peer key - canonicalOf_ first, else the proxyByKey_ binding - so the
-    // EVT_RECRUIT subject resolves on the peer (false = not peer-bound; the
-    // local hand is the subject).
-    bool recruitWireKeyOf(Character* c, Key* out) const;
     // Drop every DRIVE artifact this side holds for a body it now owns - the
     // CONTROL-FLIP teardown, for the recruiter: proxy bindings, the peer
     // stream state under 'wire', the per-pointer drive stamps, the mint mark -
@@ -3094,6 +3153,15 @@ private:
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
     unsigned long speedCombatHoldMs_;  // last time own-squad combat read TRUE (cap hysteresis)
+    // Dialogue auto-pause (Phase 3 item 5). A dialogue pauses the engine once,
+    // as it opens, on the client that shows it; the poll read that as the
+    // player's pause vote, and with min() arbitration only that client's player
+    // could ever lift it - a town conversation nobody answered froze both
+    // worlds for good. A pause landing within DLG_PAUSE_MS of the open edge is
+    // the engine's and is not a vote; enforcement re-applies the arbitrated
+    // speed, and the dialogue stays up to be answered with the world running.
+    bool          speedDlgOpen_;       // GUI in a dialogue at the last sample
+    unsigned long speedDlgOpenMs_;     // when it last opened
     // Protocol 56, HOST: one vote per join (keyed by ownerId; each join has its
     // own REQ seq space). speedPeerReq_/speedPeerCombat_ above are the fold over
     // this map (min request / OR combat), recomputed by refreshPeerSpeedVotes.

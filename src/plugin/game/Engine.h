@@ -135,6 +135,10 @@ bool charHandOf(Character* c, ObjectHand& out);
 // unresolvable / faulted.
 Character* resolveChar(const ObjectHand& h);
 RootObject* resolveObject(const ObjectHand& h);
+// SEH-guarded: the body's template (its GameData record) as an opaque identity.
+// Stable for the session and untouched by re-containering, so it tells a renamed
+// body from a different one that inherited its address. 0 if unreadable.
+const void* templateOf(Character* c);
 
 // SEH-guarded RAW apply: teleport the body to the entity transform via the
 // movement controller (no interpolation). Stage 1 apply path.
@@ -262,8 +266,11 @@ unsigned int interestAnchors(GameWorld* gw, float out[3 * MAX_INTEREST_ANCHORS],
 // that is NOT a member of the local player squad (i.e. host-authoritative world
 // NPCs) into 'out' (up to maxOut), filling hand + transform + locomotion. Returns
 // the number written. The same EntityState shape used for squad members, so the
-// receiver drives them through the identical resolve/walk-drive path.
-unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut);
+// receiver drives them through the identical resolve/walk-drive path. outChars
+// (optional, maxOut entries) receives the captured Character* parallel to out,
+// for callers that must name a row by its body rather than its local hand.
+unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut,
+                         Character** outChars = 0);
 
 // SEH-guarded (Phase 2 mid-band tier): resolve a hand (i,s,t,c,cs order like
 // resolveCharByHand) and capture it into an EntityState. Returns false when
@@ -499,6 +506,14 @@ Character* adoptCandidateNear(GameWorld* gw, const char* charSid,
                               Character* const* excl, unsigned int exclCount,
                               float* outDist);
 
+// SEH-guarded: does the CHARACTER / ANIMAL_CHARACTER template 'charSid' carry
+// the editor's "unique" flag (named world NPCs: Griffin '19643-Dialogue.mod',
+// the Bard '41325-Dialogue.mod')? The factory creates at most one body per
+// unique template per world, so a second one cannot be minted - and the one
+// this world already has IS the body the peer means, wherever it stands.
+// False when the template is unknown here.
+bool isUniqueTemplate(GameWorld* gw, const char* charSid);
+
 // spawn_probe / spawn_sync scenario scaffold (SEH-guarded): reproduce a runtime
 // squad spawn locally - 'count' world characters in a nearby NON-PLAYER faction
 // (findNearbyNonPlayerFaction; leader-faction fallback on a blank save), spread
@@ -658,10 +673,15 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
 // When `truncated` is true the desired list is known to be an INCOMPLETE description
 // of the author's container, so the reconcile is ADDITIVE-ONLY: shortfalls are still
 // filled but nothing is ever destroyed (an absent entry means "unknown", not "gone").
+// Containers (backpacks) are never fabricated unless `allowContainerCreate`: the real bag
+// should arrive over the conservation channel with its nesting intact, so the caller only
+// sets it once a shortfall has outlived that channel. *outContainerShort (optional) reports
+// a container shortfall that was left unfilled.
 // Returns true if anything changed.
 bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
                             const InvItemEntry* items, unsigned int count,
-                            bool truncated = false);
+                            bool truncated = false, bool allowContainerCreate = false,
+                            bool* outContainerShort = 0);
 
 // SEH-guarded (protocol 48): create `qty` of (sid,type) INSIDE the container the character at
 // cHand carries - a worn backpack's own private inventory, which is a different Inventory from
@@ -2489,6 +2509,11 @@ bool writeGameSpeedQuiet(GameWorld* gw, float mult, bool paused);
 // requested state (intent pause preserves the requested multiplier,
 // mirroring the engine's model).
 bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused);
+
+// SEH-guarded: is a dialogue open on this client's GUI (ForgottenGUI::
+// inDialogue)? A dialogue auto-pauses the engine, and that pause is the
+// engine's, not the player's vote. False when the GUI is not up.
+bool inDialogue();
 
 // Install the three intent detours (setGameSpeed / userPause / togglePause)
 // and seed the intent state from the live engine so the first vote reflects

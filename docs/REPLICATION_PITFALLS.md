@@ -556,9 +556,9 @@ brawl (within 5 s); same-body parity is reported beside it.
 **Rule.** Any field that carries a peer's key — a subject, a target, a carrier —
 has to go through the same key-to-body translation as the body itself, and any
 comparison is made between local bodies. A hand compared with a key is a
-coincidence check that holds only until the first re-key or mint. (Still open:
-the carry self-heal, `applyPickup` on the streamed carried hand, resolves the
-raw key.)
+coincidence check that holds only until the first re-key or mint. The send side
+is the mirror image (§22): every key we publish goes through one body-to-key
+translation.
 
 ## 21. Reproducing an action reproduces its side effects
 
@@ -619,3 +619,249 @@ diagnostic.
 action DOES. Anything that mints, consumes or moves state must run on exactly one
 client, and the gate has to count units, not poses: `mine_pose` was green the
 whole time, because the pose was exactly what was wrong.
+
+## 22. A body has one name on the wire, whoever holds it and whatever the engine calls it
+
+Two reports from one session: a pack of hostile NPCs showed up twice, and a dust
+bandit that knocked one player down and followed them into town was fought by
+that client's town guards but never existed on the other client. Both were one
+fault: a body was published under a name the receiver did not know it by.
+
+**Authority moved; the names stayed local.** NPC rows, census rows and mid-band
+rows went out under the author's LOCAL hand. That is the peer's name for a body
+the author simulates natively, and nobody's name for a proxy, which is exactly
+what an author holds once cell authority moves to it (§17): a pack that chases a
+player out of one client's cell into the other's is from then on published by the
+client that only ever had copies. The receiver could not resolve the copy's local
+hand and minted a second body beside its own original. `bandit_chase` (the join's
+pack chases the join's tab into the host's town) before the fix: the join showed
+up to 5 bodies of a 3-body pack, for 13 consecutive seconds, and the two clients
+showed the same count in 26 of 132 paired samples.
+
+**The engine renamed the body; the stream followed the new name.** Kenshi
+re-containers bodies on its own. A knocked-out bandit carried into a cell keeps
+its index and serial and changes container (`1,121,310546880,2,141601568` ->
+`1,159,564819328,2,141601568`); a squad split, which the engine does to an NPC
+when a fight starts, renumbers index and serial as well (`1,119,..,1,344726560`
+-> `1,150,..,1,2764404224`), and the old hand still resolves to the body
+afterwards. The author published the new hand, the receiver had never heard of
+it and minted another copy, and its first copy stayed where it was last driven.
+`bandit_chase_host` showed both: the natural carry into a cell (the join showed 4
+of 3 for 13 consecutive seconds, 81 of 132 samples exact), and a forced split
+mid-chase that fires on every run (the join minted `1,150,1078857472,1,2764404224`
+2.3 s after the host's split and showed 4 of 3 for the remaining 87 samples; 36
+of 132 exact).
+
+The "never appeared" half had a third piece: the subjects in an NPC row (whom a
+guard attacks, whom it carries) were the author's local hands too, so the peer
+resolved a guard's target to nothing and the fight existed on one screen only.
+
+The fix is one naming function for everything we send, the mirror of §20's one
+lookup for everything we receive. No protocol change.
+
+- `Replicator::wireKeyOf(c)` is the key we drive the body under (`canonicalOf_`),
+  else the key it is bound to as a proxy (`proxyByKey_`, inverted once per publish
+  pass by `indexProxies`).
+- `publishKeyFor(c, local)` returns `wireKeyOf`, else the body's own hand. When the
+  same body turns up under a new hand (its old hand still resolves to it, or type,
+  serial and template all match) it keeps the old name by binding it to the body:
+  `[spawn] REKEY-SELF old=... new=... (kept old)`. Not when another body now
+  answers to the old hand, the old key is bound elsewhere, or the hand is pinned
+  by a squad edge. Serials alone do not identify a body: two runfar1 town squads
+  share `1,2856811520`.
+- NPC rows, census rows, mid-band rows and the subjects in them (`xlateSubjects`,
+  `[carry] CAP xlate`) take their key from it. On the receiving side every peer
+  key goes through `bodyForKey`: pickup, drop, furniture, amputation and crush
+  events, INFO answers, medical rows, treatments, combat hits and the carry
+  self-heal.
+- The existence judgment uses the same name (`identityKeyOf`): a native we drive
+  under the peer's key is judged against the peer's census by that key, not by the
+  local hand the engine gave it. The first post-fix `bandit_chase_host` run hid
+  and re-showed a renamed seated Holy Citizen 11 times, once each time the mid
+  tier released it between samples; judged by its wire name it is hidden at most
+  once.
+
+After, same scenarios and save: `bandit_chase` 126 of 131 samples exact,
+`bandit_chase_host` with the forced split 124 of 132; on neither client did the
+pack ever show more bodies than were spawned. The host's split logs `REKEY-SELF
+... (kept old)` 46 ms later and the join binds nothing new. Both scenarios run the
+split as link 6 of `Test-BanditChase`: a run in which no side's split renamed a
+body proved nothing about renames, and fails. Both also click unpause when a
+client is paused mid-chase, as a player would, but not while a dialogue is open
+(§26); otherwise the arbitrated pause freezes both worlds and the verdict judges
+a still frame.
+
+**The memory that recognises a rename was wiped every second.** `publishKeyFor`
+remembers each body's last hand in `lastHand_`, and `pruneLastHands` ages it out
+after 20 s. The census passed the `now` it read *before* its naming loop, every
+body that loop named was stamped a few ms later, and the unsigned `now - ms`
+wrapped to ~4e9: the prune erased exactly the entries just refreshed (a
+diagnostic build logged the same body re-created 2-3 times a minute, the map
+down to 1-3 entries after a wipe). A split was caught only when the body had
+been re-named between the last wipe and the split. Otherwise its first sighting
+was already the new hand, it went out as a stranger with no `REKEY-*` line at
+all, and the join minted a second copy: in 4 of 14 `bandit_chase_host` runs the
+join showed 4 of 3 for 4-61 consecutive samples. With a signed age,
+8 of 8 chase runs passed (6 `bandit_chase_host`, 2 `bandit_chase`), every host
+split logged `REKEY-SELF` 0.2-0.65 s later, and no side ever showed more than 3.
+`REKEY-NEW` (the old hand no longer resolves) and `REKEY-UNBOUND` (another body
+or a pin owns the old name) now name the two remaining ways a rename reaches the
+peer as a new body; neither fired in those runs. Age a stamp with a signed
+difference whenever it can postdate the clock it is compared against.
+
+**Rule.** A body has one name on the wire, chosen in one place and used by every
+channel that mentions it: rows, census, subjects, events. The name the peer knows
+outlives authority moves and engine renames, so keep it across a re-container and
+judge the body's existence by it. A local hand is a name only while nobody else
+holds the body and the engine has not moved it.
+
+## 23. A correction defers to whoever already moves the body
+
+The census reconciliation (`parkDivergedCopy` and the divergence freeze) pulls a
+local copy toward where its author's census says it is. The near and wide passes
+have always run it only on bodies the stream is NOT driving (`!streamed`,
+`!driven`). Minted proxies take a separate path, `reconcileProxy`, and that path
+skipped the check: a proxy the host was streaming got the drive's walk orders
+and, every tick of the same frame, the census code's AI suspend and
+`haltMovement`. `mint_aggro` 20261022_123528 logged 153 `[census] FREEZE` lines
+on proxies whose own drift sweep said `streamed=1`.
+
+The same code also ran on bodies attached to a shoulder. The drive already
+steps back for them (`DR_CARRIED`): the carry attach owns their transform. The
+census path halted them every tick, and both carried proxies in that run were
+launched when their carrier dropped them, Jakku +690 u and Streak +120 u, while
+the host's copies lay on the ground.
+
+`reconcileProxy` now returns when the body is in `drivenChars_`, and
+`parkDivergedCopy` returns -1 (no park, no freeze) for a locally carried body,
+which covers all three callers. After: FREEZE on streamed proxies 0, proxy drift
+max 46 and 59 u against 687 u, and a carried-and-dropped proxy settled within
+18 u of the ground.
+
+`proxy_drift`'s runaway check changed with it. It condemned one sweep over
+300 u, and these scenarios produce one by construction: the host spawns the
+squad beside the players and parks it 450 u away in the same tick, so its single
+pre-park stream sample drags the new proxy over until the census parks it back a
+second later. "Nothing is pulling it back" is a duration, so a runaway is now
+`RunawayRun` (3) consecutive sweeps over the limit. The launched Jakku was over
+for five sweeps and still fails it.
+
+**Rule.** Each body has one thing moving it at a time: the attach while it is
+carried or seated, else the stream while it is driven, else the census
+correction. A corrector that does not check the first two becomes a second
+driver.
+
+## 24. An authority boundary needs room, and a handover is not a disappearance
+
+A tab claims the cell its leader stands in, after a 3 s dwell (`CELL_DWELL_N`).
+In `cell_auth_together` 20261022_125313 the join's leader paced
+x = -50703..-50565 across the 20,32 / 21,32 line. Each crossing cleared the
+dwell, so the claim moved 13 times in three minutes. Each move flipped the
+collapse (§17), and with it the author of every body in 21,32, so the two
+clients corrected the same bandits in alternate ~6 s windows (`dual_drive`: two
+bodies, 23 s and 14 s). A dwell is temporal; a body that oscillates slower than
+the dwell defeats it. Claims now also have a spatial margin: a tab keeps its
+claimed cell while its leader is within `CELL_HYST_U` (300 u) of it, checked
+with eight `cellAt` probes, so no grid geometry is needed. The margin is applied
+where the claim is made, so both clients still read one claim. After: three
+claim moves (only the scenario's intentional ones) and `dual_drive` widest
+overlap 0 s.
+
+Each of those flips also played out a carry tug-of-war. A carrier stops being in
+our stream when its cell's authorship moves to the peer, and the "carrier left
+stream" debounce then sent a DROP for it after 3 s. That drop was written for
+carriers that despawn or walk out of interest. Here the carrier was still
+present and still carrying, the peer now authored it, and the DROP made the new
+author release the body. Its carrier's AI picked it straight back up and edged a
+PICKUP: 59 PICKUP/DROP edges between the two clients for six carriers, 15 of
+them left-stream drops. A carrier the peer's stream now drives gets
+`[carry] HANDOVER ... (no DROP)`: we forget our carry record and the new
+author's own edges take over. Duplicate PICKUPs on handover are harmless
+(`applyPickup` is idempotent for the same pair). After: 8 edges, one direction.
+
+**Rule.** An authority line needs a spatial margin as well as a dwell, or a
+player standing on it hands the region back and forth. When a body changes
+author, the old author's "it left my stream" logic must tell a handover apart
+from a disappearance: a body the peer now drives is still there and is theirs,
+and an end-of-life edge for it undoes whatever it is doing.
+
+## 25. A unique template is an identity, not a recipe
+
+Census adoption pairs a host row with a local body by template, faction and
+distance, and mints a proxy when no candidate is close enough. For most
+templates the template is a recipe: a town has many guards off one template,
+so distance is the only thing that tells them apart. Two templates in
+`bandit_chase` were not like that: Griffin (`19643-Dialogue.mod`) and the Bard
+(`41325-Dialogue.mod`) carry the editor's `unique` flag. The factory makes at
+most one body per unique template per world, so `createChar` returned 0 while
+the join's own Griffin lived (`[spawn] proxy create FAILED`, then
+`proxy FAILED` every 30 s, 2 to 8 per run). The join's Griffin stood 688 to
+978 u from the host's, outside the 250 u adoption radius. The engines had
+placed the same NPC differently, and adoption kept looking for a closer one
+that cannot exist.
+
+For a unique template the template is the identity. `engine::isUniqueTemplate`
+reads the flag. When the normal search misses, adoption searches the whole
+loaded world for the template, ignoring faction, binds what it finds wherever
+it stands (`[spawn] adopt UNIQUE ... found=1`), and parks it on the host's
+transform. After: 0 failed mints, and the Bard bound at 918 u.
+
+**Rule.** Before pairing by proximity, ask whether the thing can exist twice.
+If it cannot, the local one is the peer's, however far apart the two worlds put
+it, and an attempt to create another is guaranteed to fail.
+
+## 26. The engine's own reaction is not the player's vote
+
+Speed is a vote: each client's request, `min()` across them. The intent poll
+counts any departure of the engine from our last quiet write as the player
+acting, because the MainBar writes the speed inline and a click never reaches
+a hook. A town dialogue departs from it too: Kenshi pauses the engine once, as
+the dialogue opens. The poll recorded that as the player's pause vote, and with
+`min()` arbitration only that client's player could ever lift it. In
+`bandit_chase` the Holy Sentinel stops the join's PC for a search. In run
+20261022_134931 nobody answered, and both worlds stood still for the remaining
+80 s. The host's player cannot unpause through it and sees no reason why. The
+chase scenarios had been hiding this by clicking unpause like a player.
+
+`engine::inDialogue()` (`ForgottenGUI::inDialogue`) marks the dialogue's open
+edge. A pause intent within `DLG_PAUSE_MS` (1 s) of it is dropped as a vote
+(`[speed] DIALOG auto-pause ignored`), and the existing enforcement writes the
+arbitrated speed back that tick. The dialogue stays on screen to be answered
+while both worlds run. Run 20261022_134020 had shown it was safe: unpaused under
+an open dialogue, the engine stayed unpaused for the 3.7 s the dialogue lasted.
+A pause the player presses later, with or without a dialogue, is still a vote.
+The chase scenarios no longer click while a dialogue is open, so a dialogue
+pause that sticks again shows up as frozen samples instead of being hidden.
+
+**Rule.** A consensus input must come only from the player. Anything the engine
+does on its own (auto-pause, a combat cap, a dehighlight) has to be told apart
+from a choice at the source, or one client's UI event becomes a decision for
+every client, which only that client can undo.
+
+## 27. The host's copy is the one that persists
+
+Players reported that backpacks and their contents disappear from everyone but
+the host. A join loads the host's world, and only the host's save survives the
+session, so the host's copy of a join-owned character is what that character
+owns next time. The reconcile never created a container: `applyToInventory`
+logged `CREATE-SKIP-CONTAINER`, because a fabricated bag used to arrive empty,
+and a real one should move over the W2 conservation channel with its nesting
+intact. But a bag the join bought, looted or crafted has no conservation event.
+The host skipped it forever, its nested entries hit `NESTED-SKIP`, and the next
+session loaded the character without the bag or anything in it.
+`inv_join_bag` reproduces it (run 20261023_132947): the join sells a worn bag,
+buys a new one and fills it; the join ends with bag + 2 items, the host with no
+bag.
+
+Since protocol 48 the snapshot describes the bag's contents, so a created bag is
+filled by the nested pass of the same apply. `applyInventories` now records when
+a container shortfall was first left unfilled (`InvRecv::bagShortMs`). After
+`WD_REHOME_MAX_MS` + 4 s, past every retry the conservation channel makes, it
+re-applies with `allowContainerCreate`, logs `[recon]   CREATE-CONTAINER`, and
+the bag and its contents land together (run 20261023_133502). A refused create
+waits a full grace again instead of retrying every tick.
+
+**Rule.** Gate every peer-to-host divergence on what the host will save, not only
+on what both screens show. A shortfall the reconcile deliberately leaves open for
+another channel needs a deadline, or an edge that channel never sees is lost for
+good.

@@ -110,6 +110,7 @@ static bool coopScenarioBodyRole(Character* c, coop::BodyRoleView* out) {
     out->aiSusp = r.aiSusp ? 1 : 0; out->canon = r.canon ? 1 : 0;
     out->proxy = r.proxy ? 1 : 0;   out->minted = r.minted ? 1 : 0;
     out->squad = r.squad ? 1 : 0;   out->tabOwn = r.tabOwn ? 1 : 0;
+    out->suppressed = r.suppressed ? 1 : 0;
     memcpy(out->local, r.local, sizeof(out->local));
     memcpy(out->wire, r.wire, sizeof(out->wire));
     return true;

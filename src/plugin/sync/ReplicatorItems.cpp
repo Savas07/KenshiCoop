@@ -239,7 +239,19 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
 
 void Replicator::applyInventories(GameWorld* gw) {
     if (invRecv_.empty()) return;
+    // A backpack missing here is first left to the W2 conservation channel, which carries the
+    // REAL bag (its re-home retries for WD_REHOME_MAX_MS). Past this grace nothing will bring
+    // one: the author acquired it some other way (bought, looted, crafted), and it must be
+    // created - every bag a join's character gained used to be missing from the host's copy,
+    // so the host's save, which the next session loads, lost the bag and all it held.
+    const unsigned long BAG_CREATE_GRACE_MS = WD_REHOME_MAX_MS + 4000;
+    const unsigned long bagNow = nowMs();
     for (std::map<Key, InvRecv>::iterator it = invRecv_.begin(); it != invRecv_.end(); ++it) {
+        // Snapshots of a settled container are not re-sent for up to 30 s, so revisit one
+        // whose bag shortfall has waited out the grace instead of waiting for the next send.
+        if (!it->second.dirty && it->second.bagShortMs != 0 &&
+            bagNow - it->second.bagShortMs >= BAG_CREATE_GRACE_MS)
+            it->second.dirty = true;
         if (!it->second.dirty) continue;
         it->second.dirty = false;
         // Never reconcile a container we author (defense-in-depth on the partition):
@@ -392,7 +404,15 @@ void Replicator::applyInventories(GameWorld* gw) {
             items = adj.empty() ? 0 : &adj[0];
             n = (unsigned int)adj.size();
         }
-        engine::applyContainerContents(gw, cHand, items, n, it->second.truncated);
+        const bool bagCreate = it->second.bagShortMs != 0 &&
+                               bagNow - it->second.bagShortMs >= BAG_CREATE_GRACE_MS;
+        bool bagShort = false;
+        engine::applyContainerContents(gw, cHand, items, n, it->second.truncated,
+                                       bagCreate, &bagShort);
+        // Start the grace on the first unfilled shortfall; after a create attempt that still
+        // left one (the engine refused it), wait a full grace again rather than every tick.
+        if (!bagShort)                                    it->second.bagShortMs = 0;
+        else if (it->second.bagShortMs == 0 || bagCreate) it->second.bagShortMs = bagNow;
         // Keep the transfer detector (or, for a mirrored shop counter / research
         // bench, the vendor detector) blind to the reconcile we just performed.
         if (deltaMirror(it->second)) vendorRebase(gw, k, cHand);

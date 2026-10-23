@@ -1,10 +1,12 @@
 // ReplicatorPublish.cpp - the host/owner SEND half (monolith split from
 // Replicator.cpp, 2026-07-12): publishOwned (owned-squad + near-band NPC
-// entity states, the 2 Hz mid-band slice, combat-intent capture incl. the
-// canonical-hand translation) and publishNpcCensus (protocol 36 existence
-// broadcast).
+// entity states, the 2 Hz mid-band slice, combat/carry-subject capture incl.
+// the wire-key translation) and publishNpcCensus (protocol 36 existence
+// broadcast), plus the local-body -> wire-key translation every outgoing NPC
+// row goes through (wireKeyOf / publishKeyFor).
 //
-// Shared hubs: writes ownHands_/tabRank_ (per-tick owned set), midCursor_;
+// Shared hubs: writes ownHands_/tabRank_ (per-tick owned set), midCursor_,
+// proxyRev_/lastHand_ (and binds re-containered bodies into proxyByKey_);
 // reads canonicalOf_ (stamped by the drive TU), census_ (via censusVouches).
 // Must NOT: change any log string - log phrasing is the API consumed by the
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
@@ -13,8 +15,176 @@
 
 namespace coop {
 
+void Replicator::indexProxies() {
+    proxyRev_.clear();
+    for (std::map<Key, Character*>::const_iterator it = proxyByKey_.begin();
+         it != proxyByKey_.end(); ++it)
+        if (it->second) proxyRev_.push_back(std::make_pair(it->second, it->first));
+    std::sort(proxyRev_.begin(), proxyRev_.end());
+}
+
+bool Replicator::wireKeyOf(Character* c, Key* out) const {
+    if (!c) return false;
+    std::map<Character*, Key>::const_iterator ci = canonicalOf_.find(c);
+    if (ci != canonicalOf_.end()) {
+        if (out) *out = ci->second;
+        return true;
+    }
+    Key lo; lo.t = lo.c = lo.cs = lo.i = lo.s = 0;
+    std::vector<std::pair<Character*, Key> >::const_iterator pi =
+        std::lower_bound(proxyRev_.begin(), proxyRev_.end(), std::make_pair(c, lo));
+    if (pi == proxyRev_.end() || pi->first != c) return false;
+    if (out) *out = pi->second;
+    return true;
+}
+
+Replicator::Key Replicator::publishKeyFor(Character* c, const Key& local) {
+    if (!c) return local;
+    const unsigned long now = nowMs();
+    std::map<Character*, SeenHand>::iterator it = lastHand_.find(c);
+    if (it == lastHand_.end()) {
+        SeenHand fresh;
+        fresh.local = local; fresh.wire = local; fresh.ms = now;
+        fresh.tmpl = engine::templateOf(c);
+        it = lastHand_.insert(std::make_pair(c, fresh)).first;
+    }
+    SeenHand& sh = it->second;
+    Key w;
+    if (wireKeyOf(c, &w)) {
+        sh.local = local; sh.wire = w; sh.ms = now;
+        return w;
+    }
+    if (sh.local < local || local < sh.local) {
+        // The hand moved: the same object renamed, or a different body that
+        // inherited the address? A carry into a cell keeps type and serial; a
+        // squad split renumbers both index and serial, and then the engine still
+        // resolves the old hand to the body (bandit_chase_host's forced split:
+        // 1,119,..,1,344726560 -> 1,150,..,1,2764404224). Serials alone are not
+        // unique - two town squads in runfar1 share 1,2856811520 - so the serial
+        // match also needs the template.
+        const Key& p = sh.local;
+        const void* tmpl = engine::templateOf(c);
+        const bool same =
+            engine::resolveCharByHand(p.i, p.s, p.t, p.c, p.cs) == c ||
+            (p.t == local.t && p.s == local.s && sh.tmpl != 0 && tmpl == sh.tmpl);
+        if (!same) {
+            // Same type and template yet judged a different body: the one way a
+            // rename can still reach the peer as a stranger. Once per rename
+            // (the reset below makes the next naming a no-op).
+            if (p.t == local.t && sh.tmpl != 0 && tmpl == sh.tmpl) {
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] REKEY-NEW old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u "
+                    "(old hand no longer resolves here; published as a new body)",
+                    p.t, p.c, p.cs, p.i, p.s, local.t, local.c, local.cs, local.i, local.s);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            sh.local = local; sh.wire = local; sh.ms = now;
+            sh.tmpl = tmpl;
+            return local;
+        }
+    }
+    sh.local = local; sh.ms = now;
+    const Key old = sh.wire;
+    if (!(old < local) && !(local < old)) return local;
+    // The same object under a new hand: the engine re-containered it (KO'd and
+    // carried into a cell, split into a fresh combat squad) or the drive that
+    // named it lapsed after a LOCAL re-container. Keep the name the peer has.
+    // Not when the old hand now belongs to someone else (another body resolves
+    // under it here, or it is bound to one), and never for a squad move: a
+    // pinned hand is the recruit/move edge's to rename.
+    Character* holder = engine::resolveCharByHand(old.i, old.s, old.t, old.c, old.cs);
+    const bool bound = proxyByKey_.find(old) != proxyByKey_.end();
+    const bool pinned = pinPeer_.count(local) || pinOwned_.count(local);
+    if ((holder && holder != c) || bound || pinned) {
+        // Once per rename (sh.wire now equals local): the renamed body goes out
+        // under a name the peer has never had, so say which rule refused.
+        char b[224]; _snprintf(b, sizeof(b) - 1,
+            "[spawn] REKEY-UNBOUND old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u "
+            "holder=%s bound=%d pinned=%d (old name not kept)",
+            old.t, old.c, old.cs, old.i, old.s, local.t, local.c, local.cs, local.i, local.s,
+            holder ? (holder == c ? "self" : "other") : "none", bound ? 1 : 0, pinned ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        sh.wire = local;
+        return local;
+    }
+    proxyByKey_[old] = c;
+    const std::pair<Character*, Key> rev(c, old);
+    proxyRev_.insert(std::lower_bound(proxyRev_.begin(), proxyRev_.end(), rev), rev);
+    char b[176]; _snprintf(b, sizeof(b) - 1,
+        "[spawn] REKEY-SELF old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u (kept old)",
+        old.t, old.c, old.cs, old.i, old.s,
+        local.t, local.c, local.cs, local.i, local.s);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return old;
+}
+
+void Replicator::pruneLastHands(unsigned long now) {
+    // Every pass names its bodies again (near band per frame, census walk at
+    // 1 Hz), so an entry this old belongs to a body that left both walks.
+    const long LASTHAND_KEEP_MS = 20000;
+    for (std::map<Character*, SeenHand>::iterator it = lastHand_.begin();
+         it != lastHand_.end(); ) {
+        // Signed age. The census passes the 'now' it read BEFORE its naming
+        // loop, and every body that loop names is stamped a few ms later, so
+        // the unsigned 'now - ms' wrapped to ~4e9 and erased exactly the
+        // entries just refreshed: the map emptied every second, and a squad
+        // split was caught (REKEY-SELF) only when the body had been re-named
+        // since the last wipe. Otherwise its first sighting was already the
+        // new hand, it went out as a stranger and the join minted a second
+        // copy (bandit_chase_host 164414/165908/174934: 4 of 3 for 30-61 s).
+        if ((long)(now - it->second.ms) > LASTHAND_KEEP_MS) lastHand_.erase(it++);
+        else ++it;
+    }
+}
+
+void Replicator::xlateSubjects(EntityState* rows, unsigned int from, unsigned int to) {
+    // Combat-subject CANONICAL translation (join-initiated town combat, run
+    // 20260712_180913): the capture reads the target's LOCAL hand, but a body
+    // this client is DRIVING can live in a local runtime container that the
+    // peer has never heard of (the engine separateIntoMyOwnSquad's a town NPC
+    // when a fight starts; a minted proxy never had the peer's hand at all).
+    // Publish the SUBJECT under the key the peer knows it by (wireKeyOf) or the
+    // peer's applyCombat resolves nothing (r=1 forever) and the fight renders on
+    // one client only. Every row, world NPCs included: a town guard fighting a
+    // bandit we hold as a proxy aimed the peer's guard at a hand the peer has
+    // never seen, so the guards fought on one screen only. A CARRIED body is a
+    // subject the same way (TASK_CARRY_BODY), and a guard hauling a KO'd proxy
+    // to the cells named a body the peer could not pick up.
+    for (unsigned int i = from; i < to; ++i) {
+        EntityState& e = rows[i];
+        const bool combat = coop::taskIsCombat(e.task);
+        if (!combat && !coop::taskIsCarry(e.task)) continue;
+        Character* tc = engine::resolveCharByHand(e.sIndex, e.sSerial, e.sType,
+                                                  e.sContainer, e.sContainerSerial);
+        if (!tc) continue;
+        Key ck;
+        if (!wireKeyOf(tc, &ck)) continue;
+        if (ck.i == e.sIndex && ck.s == e.sSerial && ck.t == e.sType &&
+            ck.c == e.sContainer && ck.cs == e.sContainerSerial)
+            continue;
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            combat ? "[combat] CAP xlate hand=%u,%u tgt local=%u,%u,%u,%u,%u -> wire=%u,%u,%u,%u,%u"
+                   : "[carry] CAP xlate hand=%u,%u body local=%u,%u,%u,%u,%u -> wire=%u,%u,%u,%u,%u",
+            e.hIndex, e.hSerial,
+            e.sType, e.sContainer, e.sContainerSerial, e.sIndex, e.sSerial,
+            ck.t, ck.c, ck.cs, ck.i, ck.s);
+        b[sizeof(b) - 1] = '\0';
+        e.sType = ck.t; e.sContainer = ck.c; e.sContainerSerial = ck.cs;
+        e.sIndex = ck.i; e.sSerial = ck.s;
+        // Throttle the log per canonical victim (the rewrite itself runs every
+        // publish frame).
+        unsigned long xNow = nowMs();
+        std::map<Key, unsigned long>::iterator xt = combatCapMs_.find(ck);
+        if (xt == combatCapMs_.end() || (xNow - xt->second) >= 2000) {
+            combatCapMs_[ck] = xNow;
+            coop::logLine(b);
+        }
+    }
+}
+
 void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     localId_ = ownerId;   // the drive path reads it; see its refusal guard
+    indexProxies();       // wireKeyOf/publishKeyFor read it all pass long
     // Capture the OWNED squad subset first, then (Stage 4) the nearby world NPCs.
     // The net layer chunks the whole vector into datagram-sized batches, so the
     // count is only bounded by MAX_PUBLISH (a bar holds well under that).
@@ -128,43 +298,10 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             coop::logLine(b);
         }
     }
-    // Combat-subject CANONICAL translation (join-initiated town combat, run
-    // 20260712_180913): the capture reads the target's LOCAL hand, but a body
-    // this client is DRIVING can live in a local runtime container that the
-    // peer has never heard of (the engine separateIntoMyOwnSquad's a town NPC
-    // when a fight starts; a minted proxy never had the peer's hand at all).
-    // Publish the SUBJECT under the key the peer streams it by (canonicalOf_,
-    // stamped every drive tick) or the peer's applyCombat resolves nothing
-    // (r=1 forever) and the fight renders on one client only.
-    for (unsigned int i = 0; i < n; ++i) {
-        EntityState& e = buf[i];
-        if (!coop::taskIsCombat(e.task)) continue;
-        Character* tc = engine::resolveCharByHand(e.sIndex, e.sSerial, e.sType,
-                                                  e.sContainer, e.sContainerSerial);
-        if (!tc) continue;
-        std::map<Character*, Key>::const_iterator cit = canonicalOf_.find(tc);
-        if (cit == canonicalOf_.end()) continue;
-        const Key& ck = cit->second;
-        if (ck.i == e.sIndex && ck.s == e.sSerial && ck.t == e.sType &&
-            ck.c == e.sContainer && ck.cs == e.sContainerSerial)
-            continue;
-        char b[176]; _snprintf(b, sizeof(b) - 1,
-            "[combat] CAP xlate hand=%u,%u tgt local=%u,%u,%u,%u,%u -> wire=%u,%u,%u,%u,%u",
-            e.hIndex, e.hSerial,
-            e.sType, e.sContainer, e.sContainerSerial, e.sIndex, e.sSerial,
-            ck.t, ck.c, ck.cs, ck.i, ck.s);
-        b[sizeof(b) - 1] = '\0';
-        e.sType = ck.t; e.sContainer = ck.c; e.sContainerSerial = ck.cs;
-        e.sIndex = ck.i; e.sSerial = ck.s;
-        // Throttle the log per canonical victim (the rewrite itself runs every
-        // publish frame).
-        unsigned long xNow = nowMs();
-        std::map<Key, unsigned long>::iterator xt = combatCapMs_.find(ck);
-        if (xt == combatCapMs_.end() || (xNow - xt->second) >= 2000) {
-            combatCapMs_[ck] = xNow;
-            coop::logLine(b);
-        }
-    }
+    // Subjects name bodies too: publish them under their wire keys (see
+    // xlateSubjects). The NPC rows appended below get the same pass just
+    // before the snapshot is handed to the net layer.
+    xlateSubjects(buf, 0, n);
     // Build-site subject translation (2026-08-01 construction animation). Same
     // shape as the combat rewrite above and for the same underlying reason: the
     // capture reads the site's LOCAL hand, but a construction site is created at
@@ -223,8 +360,10 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // streamNpcs_ off, so on the join this publishes ONLY its owned squad subset.
     // Under presence authority BOTH sides stream, so each must keep to the cells
     // it actually owns or the two of us drive the same bodies.
+    const unsigned int nSquadRows = n;   // buf[nSquadRows..n) are world NPCs
     if (streamNpcs_ && n < MAX_PUBLISH) {
-        unsigned int got = engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
+        static Character* npcChars[MAX_PUBLISH]; // main-thread only, parallel to buf[n..)
+        unsigned int got = engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n, npcChars);
         // A hand pinned to a squad owner is a squad body, never a world NPC.
         // insertPeerMember re-containers a peer's recruit into our squad with
         // setFaction, and playerCharacters - captureNpcs' squad filter - only
@@ -246,11 +385,26 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                     }
                     continue;
                 }
-                if (keptPin != i) buf[n + keptPin] = buf[n + i];
+                if (keptPin != i) {
+                    buf[n + keptPin] = buf[n + i];
+                    npcChars[keptPin] = npcChars[i];
+                }
                 ++keptPin;
             }
             got = keptPin;
         }
+        // Name every row the way the PEER knows the body before any gate asks
+        // about it: the census, the yield and the attention state below are all
+        // keyed by the peer-facing key, and so is everything the peer does with
+        // the row. Captured hands are LOCAL, and for a proxy (or a body the
+        // engine re-containered) that hand is one only this client has seen.
+        // bandit_chase: the join's bandits chased its player into the host's
+        // cell, the host became their author and streamed its proxies under
+        // their local hands; the join REQ'd those, minted two more beside its
+        // own three, and the pack stood on its screen twice. The census already
+        // named proxies by their bound key; the stream never did.
+        for (unsigned int i = 0; i < got; ++i)
+            setKey(buf[n + i], publishKeyFor(npcChars[i], keyOf(buf[n + i])));
         // The attention gate lives HERE, not on the census. Streaming is the
         // expensive half - a transform per body per tick - and it is the half
         // that is genuinely pointless when the peer has no camera or squad near
@@ -403,10 +557,13 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned int szc = (unsigned int)midBand_.size();
         unsigned int nFast = 0;
         for (unsigned int i = 0; i < szc && n < MAX_PUBLISH; ++i) {
+            // Captured by its LOCAL hand, published and deduped by its wire key
+            // (MidBandEntry): the near rows above already carry wire keys.
             const Key mk = midBand_[i].k;
+            const Key mw = midBand_[i].w;
             bool dup = false;
             for (unsigned int j = 0; j < nearEnd0 && !dup; ++j)
-                dup = buf[j].hIndex == mk.i && buf[j].hSerial == mk.s;
+                dup = buf[j].hIndex == mw.i && buf[j].hSerial == mw.s;
             if (dup) continue;
             // captureOne stamps TASK_CARRY_BODY whenever the body carries, so
             // the captured row identifies a carrier without a second read. A
@@ -414,6 +571,7 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (!engine::captureNpcByHand(gw, mk.i, mk.s, mk.t, mk.c, mk.cs,
                                           &buf[n]))
                 continue;
+            setKey(buf[n], mw);
             // Re-check authorship against the position we just captured.
             // midBand_ membership was filtered by weAuthor when publishNpcCensus
             // last rebuilt the list, but that is 1 Hz: across a claim handover
@@ -452,14 +610,16 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         }
         unsigned int tried = 0, added = 0;
         while (tried < sz && added < quota && n < MAX_PUBLISH) {
-            const Key mk = midBand_[(midCursor_ + tried) % sz].k;
+            const MidBandEntry& me = midBand_[(midCursor_ + tried) % sz];
+            const Key mk = me.k, mw = me.w;
             ++tried;
             bool dup = false;
             for (unsigned int i = 0; i < nearEnd && !dup; ++i)
-                dup = buf[i].hIndex == mk.i && buf[i].hSerial == mk.s;
+                dup = buf[i].hIndex == mw.i && buf[i].hSerial == mw.s;
             if (dup) continue;
             if (engine::captureNpcByHand(gw, mk.i, mk.s, mk.t, mk.c, mk.cs,
                                          &buf[n])) {
+                setKey(buf[n], mw);
                 // Same 1 Hz staleness as the promotion loop above: re-check
                 // authorship against the freshly captured position.
                 if (cellAuth_ && !weAuthor(gw, ownerId, buf[n].x, buf[n].z)) continue;
@@ -476,6 +636,8 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             }
         }
     }
+    // Subjects of the world-NPC rows (the squad's were translated up top).
+    xlateSubjects(buf, nSquadRows, n);
     net.setOwnedEntities(ownerId, buf, n);
 
     // Refresh the (sticky) attacker map from this tick's combat intents: a captured
@@ -702,8 +864,9 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                     // Enter edge: the local occupant knows WHICH furniture (inWhat).
                     // An unreadable hand this frame leaves furnKind 0 so the edge
                     // re-attempts next publish (the bit is still streaming).
+                    // The row carries a WIRE key, so it resolves like one.
                     engine::FurnitureRead fr;
-                    Character* oc = engine::resolve(e);
+                    Character* oc = bodyForKey(k, 0, 0);
                     if (oc && engine::readFurniture(oc, &fr) && fr.valid &&
                         fr.kind == curKind) {
                         EventPacket ev; memset(&ev, 0, sizeof(ev));
@@ -748,6 +911,26 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (bufKeys.find(hit->first) != bufKeys.end()) continue;
             if (nowPub - hb.seenMs < CARRY_GONE_MS) continue;
             const Key& ck = hit->first;
+            // Handed over, not gone. Under cell authority a carrier also leaves
+            // our stream when its cell's authorship moves to the peer - and then
+            // it is still here, still carrying, and the peer now authors it. A
+            // DROP for it releases the body on the NEW author's screen, whose
+            // carrier AI picks it straight back up and edges a PICKUP: the carry
+            // tug-of-war (cell_auth_together 20261022_125313: 59 PICKUP/DROP
+            // edges between the two clients for six carriers, 15 of them 'left
+            // stream' DROPs on claim flips). A carrier the peer's stream drives
+            // is authored there, and so is its carry; forget ours without an
+            // edge. The vanished carrier this block exists for resolves to
+            // nothing, or to a body nobody drives, and still gets its DROP.
+            Character* cc = bodyForKey(ck, 0, 0);
+            if (cc && drivenChars_.find(cc) != drivenChars_.end()) {
+                hb.carrying = false;
+                char hbuf[176]; _snprintf(hbuf, sizeof(hbuf) - 1,
+                    "[carry] HANDOVER carrier=%u,%u carried=%u,%u (the peer drives the carrier now; no DROP)",
+                    ck.i, ck.s, hb.carried[3], hb.carried[4]);
+                hbuf[sizeof(hbuf) - 1] = '\0'; coop::logLine(hbuf);
+                continue;
+            }
             EventPacket ev; memset(&ev, 0, sizeof(ev));
             ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_DROP_BODY;
             ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
@@ -984,19 +1167,21 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // 2026-08-04 on hand 1,321,597290048,1,3427978496, which the host displayed as
     // a driven proxy while the join had the original culled, and it is why the pair
     // saw different populations after travelling together. The body a proxy STANDS
-    // FOR is the hand it was bound to, so that is the hand it is vouched for under.
-    std::map<Character*, Key> proxyKeyOf;
-    for (std::map<Key, Character*>::const_iterator pi = proxyByKey_.begin();
-         pi != proxyByKey_.end(); ++pi)
-        if (pi->second) proxyKeyOf[pi->second] = pi->first;
+    // FOR is the hand it was bound to, so that is the hand it is vouched for under -
+    // and the same goes for a body we drive, or one the engine re-containered:
+    // publishKeyFor, the name the stream uses too (census must cover the stream
+    // key for key, or the peer culls what we are streaming to it).
+    indexProxies();
+    static Key wireOf[NPC_CENSUS_MAX];   // main-thread only: rows' wire keys
     std::set<Key> censusKeys;
     unsigned int m = 0;          // rows that survived the gate
     unsigned int nNotMine = 0;   // omitted because another client authors them
     unsigned int nProxyRow = 0;  // rows published under a bound key, not a local one
     for (unsigned int i = 0; i < n; ++i) {
-        Key k = keyOf(states[i]);
-        std::map<Character*, Key>::const_iterator px = proxyKeyOf.find(chars[i]);
-        if (px != proxyKeyOf.end()) { k = px->second; ++nProxyRow; }
+        const Key lk = keyOf(states[i]);
+        const Key k = publishKeyFor(chars[i], lk);
+        wireOf[i] = k;
+        if (k < lk || lk < k) ++nProxyRow;
         censusKeys.insert(k);
         // The attention gate USED to sit here, and it was the wrong channel for
         // it. A census row is a statement that a body EXISTS, and existence
@@ -1052,6 +1237,7 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         ++m;
     }
     pruneAttention(censusKeys);
+    pruneLastHands(now);
     net.queueNpcCensus(ownerId, hands, poss, m);
 
     // Phase 2 mid-band tier: rebuild the round-robin list from this census
@@ -1084,14 +1270,11 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             // Same ownership rule as the near band: we drive what we author.
             if (cellAuth_ && !weAuthor(gw, ownerId, states[i].x, states[i].z)) continue;
             if (cellAuth_ && nPeerAnch > 0 &&
-                !observedByPeer(keyOf(states[i]), peerAnch, nPeerAnch,
+                !observedByPeer(wireOf[i], peerAnch, nPeerAnch,
                                 states[i].x, states[i].y, states[i].z)) continue;
             MidBandEntry e;
-            e.k.t  = states[i].hType;
-            e.k.c  = states[i].hContainer;
-            e.k.cs = states[i].hContainerSerial;
-            e.k.i  = states[i].hIndex;
-            e.k.s  = states[i].hSerial;
+            e.k = keyOf(states[i]);
+            e.w = wireOf[i];
             e.dist = best;
             midBand_.push_back(e);
         }

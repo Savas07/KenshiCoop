@@ -200,6 +200,11 @@ bool Replicator::censusVouches(const Key& k, unsigned long now) const {
     return false;
 }
 
+Replicator::Key Replicator::identityKeyOf(Character* c, const EntityState& st) const {
+    std::map<Character*, Key>::const_iterator ci = canonicalOf_.find(c);
+    return (ci != canonicalOf_.end()) ? ci->second : keyOf(st);
+}
+
 void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     if (!gw) return;
     // Hysteresis (step 5, spike 18): a hard streamed/unstreamed edge churned
@@ -387,9 +392,20 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     // Prune counters for hands the enumeration no longer sees (left interest),
     // preserving suppressed entries (a hidden body may drop out of the query but
     // must keep its counters so the restore dwell works when it returns).
+    // Keyed by each body's wire identity - its binding for a proxy, else
+    // identityKeyOf - which is what the passes below judge by and what the
+    // publish side's attention gate (observedByPeer) is keyed on, so neither
+    // prune wipes the other's state.
     std::set<Key> seen;
-    for (unsigned int i = 0; i < n; ++i) seen.insert(keyOf(states[i]));
-    for (unsigned int i = 0; i < wn; ++i) seen.insert(keyOf(wStates[i]));
+    for (int pass = 0; pass < 2; ++pass) {
+        const unsigned int cnt = (pass == 0) ? n : wn;
+        Character* const* cs = (pass == 0) ? chars : wChars;
+        const EntityState* sts = (pass == 0) ? states : wStates;
+        for (unsigned int i = 0; i < cnt; ++i) {
+            std::map<Character*, Key>::const_iterator pk = proxyKeyOf.find(cs[i]);
+            seen.insert(pk != proxyKeyOf.end() ? pk->second : identityKeyOf(cs[i], sts[i]));
+        }
+    }
     for (std::map<Key, AuthCount>::iterator it = authCount_.begin(); it != authCount_.end(); ) {
         if (seen.find(it->first) == seen.end() &&
             suppressed_.find(it->first) == suppressed_.end()) authCount_.erase(it++);
@@ -405,7 +421,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
             reconcileProxy(chars[i], states[i], proxyKeyOf);
             continue;
         }
-        Key k = keyOf(states[i]);
+        Key k = identityKeyOf(chars[i], states[i]);
         // Presence authority: not every body here answers to us.
         if (authorHoldsBody(gw, localId, k, chars[i], states[i].x, states[i].z)) {
             authCount_[k].unstreamed = 0;
@@ -554,7 +570,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
                     drivenSeen_.find(wChars[i]);
                 driven = ds != drivenSeen_.end() && (nowR - ds->second) < 8000;
             }
-            Key k = keyOf(wStates[i]);
+            Key k = identityKeyOf(wChars[i], wStates[i]);
             if (authorHoldsBody(gw, localId, k, wChars[i], wStates[i].x, wStates[i].z)) {
                 authCount_[k].unstreamed = 0;
                 ++authSkip;
@@ -675,6 +691,11 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
             }
             Key ck; ck.i = h[0]; ck.s = h[1]; ck.t = h[2];
             ck.c = h[3]; ck.cs = h[4];
+            // ...re-keyed to the key the passes judge it by (identityKeyOf): a
+            // body driven under a peer key is hidden under that key, and moving
+            // its entry to the local hand would strand it where no pass looks.
+            std::map<Character*, Key>::const_iterator cn = canonicalOf_.find(it->second);
+            if (cn != canonicalOf_.end()) ck = cn->second;
             if (ck < it->first || it->first < ck) {
                 migrated[ck] = it->second;
                 authCount_.erase(it->first);
@@ -785,7 +806,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
             EntityState* sts = (pass == 0) ? states : wStates;
             for (unsigned int i = 0; i < cnt; ++i) {
                 if (!counted.insert(cs[i]).second) continue;
-                Key k = keyOf(sts[i]);
+                Key k = identityKeyOf(cs[i], sts[i]);
                 const char* cls;
                 if (proxyChars.find(cs[i]) != proxyChars.end() ||
                     keep.find(k) != keep.end() ||
@@ -1373,6 +1394,30 @@ void Replicator::syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ow
             if (!engine::cellAt(gw, lead->x, lead->z, &cx, &cz)) continue;
             std::pair<u32, u32> slot(ownerId, (u32)rank);
             std::map<std::pair<u32, u32>, CellClaim>::iterator cur = claimSlots_.find(slot);
+            // Spatial hysteresis: keep the claimed cell while the leader is
+            // still within CELL_HYST_U of it. cell_auth_together 20261022_125313:
+            // the join's leader paced x=-50703..-50565 across the 20,32 / 21,32
+            // line, cleared the 3 s dwell on every crossing, and moved its claim
+            // 13 times in 3 minutes - each move flipped the collapse, and with it
+            // the author of every body in 21,32, so both clients took turns
+            // following the same bandits ~6 s apart (dual_drive: 2 bodies,
+            // 23 s and 14 s). Probing the claimed cell from the leader's
+            // position needs no grid geometry, only cellAt; cells are thousands
+            // of units wide, so eight probes at the margin cover the approach.
+            if (cur != claimSlots_.end() &&
+                (cur->second.cx != cx || cur->second.cz != cz)) {
+                static const float PX[8] = { 1, -1, 0, 0, 0.7071f, 0.7071f, -0.7071f, -0.7071f };
+                static const float PZ[8] = { 0, 0, 1, -1, 0.7071f, -0.7071f, 0.7071f, -0.7071f };
+                const float H = (float)CELL_HYST_U;
+                for (int pi = 0; pi < 8; ++pi) {
+                    int px = 0, pz = 0;
+                    if (engine::cellAt(gw, lead->x + PX[pi] * H, lead->z + PZ[pi] * H, &px, &pz) &&
+                        px == cur->second.cx && pz == cur->second.cz) {
+                        cx = px; cz = pz;
+                        break;
+                    }
+                }
+            }
             bool same = (cur != claimSlots_.end()) &&
                         cur->second.cx == cx && cur->second.cz == cz;
             // Dwell: a boundary walker must settle before authority moves.
@@ -1557,6 +1602,15 @@ void Replicator::reconcileProxy(Character* c, const EntityState& st,
     if (pk == keyOf.end()) return;
     // st carries the LOCAL enumeration's hand; the census row answers to the
     // stream key, so the drift is measured and the park keyed by that.
+    //
+    // ...and only while the stream is NOT driving it, the same rule the near
+    // pass (!streamed) and the wide pass (!driven) apply to every other body.
+    // A proxy the host streams this tick belongs to applyTargets; correcting it
+    // here as well put two controllers on one body (mint_aggro 20261022_123528:
+    // [census] FREEZE - AI suspend + haltMovement every tick - on proxies that
+    // were streamed=1 and being walked by the drive the whole fight). The
+    // exemption this exists for is the UNSTREAMED proxy, which still lands here.
+    if (drivenChars_.find(c) != drivenChars_.end()) return;
     float drift = parkDivergedCopy(c, st, pk->second);
     if (censusFreezeAi_ && drift >= 0.0f)
         censusFreezeDivergedAi(c, pk->second, drift);
@@ -1573,6 +1627,16 @@ float Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Ke
     // seating the same bar NPC ~50 u apart - run 185524), so only genuinely
     // divergent wanderers (measured 500-900 u) trip it.
     if (censusParkDist_ <= 0.0f) return -1.0f;
+    // A body on someone's shoulder is transform-owned by its local carry
+    // attach - the drive's DR_CARRIED carve-out, for the same reason. Parking
+    // it teleports it off the shoulder, and halting it every tick under the
+    // divergence freeze left both of mint_aggro 20261022_123528's carried
+    // proxies to be LAUNCHED by their drop (Jakku +690 u, Streak +120 u, while
+    // the host's copies lay on the ground). -1 skips the freeze as well.
+    {
+        engine::CarryRead cr;
+        if (engine::readCarry(c, &cr) && cr.valid && cr.beingCarried) return -1.0f;
+    }
     std::map<Key, CensusPos>::iterator it = censusPos_.find(k);
     if (it == censusPos_.end()) return -1.0f;
     // HORIZONTAL divergence only (2026-08-06). This was dist3, and height is the

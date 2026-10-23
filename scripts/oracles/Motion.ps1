@@ -256,18 +256,46 @@ function Test-SnapRate {
 # hand hidden more than once is churn. Zero suppression activity passes - the
 # invariant holds vacuously (ghost culls of join-only spawns stay legitimate,
 # each firing once per hand).
+#
+# Keyed by the FULL five-component hand. The suppress/cull lines print only
+# index,serial, and that pair is not unique: bandit_chase_host 025835 failed on
+# '1,2856811520', which named a Human Mercenary (1,39,2255981568,1,2856811520)
+# and a High Paladin (1,42,3403076096,1,2856811520), each hidden once. Every
+# suppress/cull is logged right after its lifeSet edge ("[life] hand=t,c,cs,i,s
+# ... to=CULLED reason=suppress|cull-wide"), so the line takes that edge's full
+# key when the index,serial agree. Without a matching edge (a re-hide of a hand
+# still CULLED logs no edge) it takes the one full key already counted under
+# that index,serial, and only when there is none or several does it fall back
+# to index,serial itself.
 function Test-SuppressChurn {
     param([string]$File, [string]$Label = "join", [int]$MaxPerHand = 1)
     if (-not (Test-Path $File)) {
         return (Add-GateResult -Name "suppress_churn" -Status SKIP -Detail "no log")
     }
+    $lifePat = '\[life\] hand=(\d+,\d+,\d+,(\d+),(\d+)) from=\w+ to=CULLED reason=(?:suppress|cull-wide)'
+    $hidePat = '\[(?:authority\] suppress|census\] cull) NPC hand=(\d+,\d+)'
     $counts = @{}
-    foreach ($p in @('\[authority\] suppress NPC hand=(\d+,\d+)',
-                     '\[census\] cull NPC hand=(\d+,\d+)')) {
-        foreach ($m in @(Select-String -Path $File -Pattern $p -ErrorAction SilentlyContinue)) {
-            $h = $m.Matches[0].Groups[1].Value
-            if ($counts.ContainsKey($h)) { $counts[$h]++ } else { $counts[$h] = 1 }
+    $fullByIs = @{}   # index,serial -> full keys counted under it
+    $edge = $null
+    foreach ($m in @(Select-String -Path $File -Pattern @($lifePat, $hidePat) -ErrorAction SilentlyContinue)) {
+        $line = $m.Line
+        if ($line -match $lifePat) {
+            $edge = @{ key = $Matches[1]; is = "$($Matches[2]),$($Matches[3])" }
+            continue
         }
+        if ($line -notmatch $hidePat) { continue }
+        $is = $Matches[1]
+        if ($null -ne $edge -and $edge.is -eq $is) {
+            $h = $edge.key
+            if (-not $fullByIs.ContainsKey($is)) { $fullByIs[$is] = @{} }
+            $fullByIs[$is][$h] = $true
+        } elseif ($fullByIs.ContainsKey($is) -and $fullByIs[$is].Count -eq 1) {
+            $h = @($fullByIs[$is].Keys)[0]
+        } else {
+            $h = $is
+        }
+        $edge = $null
+        if ($counts.ContainsKey($h)) { $counts[$h]++ } else { $counts[$h] = 1 }
     }
     $restores = @(Select-String -Path $File -Pattern '\[(?:authority|census)\] restore NPC hand=' -ErrorAction SilentlyContinue).Count
     $worst = 0; $churned = @()

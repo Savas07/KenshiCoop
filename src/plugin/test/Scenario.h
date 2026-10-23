@@ -21,12 +21,14 @@ namespace coop {
 // recruit_join: the replicator's per-body view of ONE local character - who
 // streams it (owned = its local hand is in this tick's owned set), the
 // ownership pins on its local hand, whether this tick drove / AI-suspended it,
-// and the peer key it is bound under (canonical drive stamp or proxy binding).
-// Flags are 0/1. wire[] is zero when the body has no peer binding; local[] is
-// the live readObjectHand. Same [t,c,cs,i,s] layout as every hand here.
+// whether our existence judgment has it hidden (suppressed), and the peer key
+// it is bound under (canonical drive stamp or proxy binding). Flags are 0/1.
+// wire[] is zero when the body has no peer binding; local[] is the live
+// readObjectHand. Same [t,c,cs,i,s] layout as every hand here.
 struct BodyRoleView {
     int          owned, pinOwn, pinPeer, driven, aiSusp;
     int          canon, proxy, minted, squad, tabOwn;
+    int          suppressed;
     unsigned int local[5];
     unsigned int wire[5];
 };

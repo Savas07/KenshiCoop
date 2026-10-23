@@ -13,9 +13,20 @@ pushd "%REPO%" >nul
 set "REPO=%CD%"
 popd >nul
 
+REM Toolchain: the standard install paths, else the portable copy beside the
+REM repo (..\kc_tc\vs10 and ..\kc_tc\sdk71, what this PC has), and
+REM KENSHICOOP_VS10 / KENSHICOOP_SDK71 override both.
 set "VS10=C:\Program Files (x86)\Microsoft Visual Studio 10.0"
-set "VC=%VS10%\VC"
+if not exist "%VS10%\VC\bin\amd64\cl.exe" set "VS10=%REPO%\..\kc_tc\vs10"
+if defined KENSHICOOP_VS10 set "VS10=%KENSHICOOP_VS10%"
 set "SDK=C:\Program Files\Microsoft SDKs\Windows\v7.1"
+if not exist "%SDK%\Include\windows.h" set "SDK=%REPO%\..\kc_tc\sdk71"
+if defined KENSHICOOP_SDK71 set "SDK=%KENSHICOOP_SDK71%"
+set "VC=%VS10%\VC"
+if not exist "%VC%\bin\amd64\cl.exe" (
+    echo prototest build FAILED: no v100 x64 cl.exe under "%VS10%" - set KENSHICOOP_VS10
+    exit /b 1
+)
 
 set "PATH=%VC%\bin\amd64;%VC%\bin;%VS10%\Common7\IDE;%SDK%\Bin\x64;%SDK%\Bin;%PATH%"
 set "INCLUDE=%VC%\include;%SDK%\Include;%REPO%\third_party\vc10_compat"

@@ -593,7 +593,8 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
 // rather than merely somewhere on the character. Nothing in here needs the owner's hand.
 static bool applyToInventory(GameWorld* gw, Inventory* inv,
                              const InvItemEntry* items, unsigned int count,
-                             bool truncated) {
+                             bool truncated, bool allowContainerCreate = false,
+                             bool* outContainerShort = 0) {
     if (!gw || !inv) return false;
 
     // Snapshot current contents (with parallel Item* for removal). If OUR OWN read
@@ -730,18 +731,28 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
                 g[k].sid, createLoose); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             createLoose = 0;
         }
-        //    NEVER fabricate a CONTAINER (a backpack). createItemAndAdd would mint an EMPTY
-        //    one, and the wire snapshot describes the bag itself, not what is nested inside
-        //    it - so the "restored" backpack silently swallows its own contents. Containers
-        //    move only through the W2 conservation channel, which relocates the real object
-        //    with its nesting intact; leaving the shortfall unfilled keeps the two sides
-        //    diverged until that channel lands the real bag.
+        //    Fabricate a CONTAINER (a backpack) only when the caller allows it. A real bag
+        //    should move through the W2 conservation channel, which relocates the object with
+        //    its nesting intact, so the shortfall is left open while that channel can still
+        //    land it. But a bag the author simply ACQUIRED (bought, looted, crafted) has no
+        //    such channel: skipping it forever left the peer - and the host's save, which is
+        //    what the next session loads - without the bag or anything in it. The snapshot
+        //    carries the bag's contents as nested entries (protocol 48), so a created bag is
+        //    filled by the nested pass of the same apply rather than staying empty.
         if (createLoose > 0 && isContainerItemType(g[k].type)) {
-            char b[180]; _snprintf(b, sizeof(b) - 1,
-                "[recon]   CREATE-SKIP-CONTAINER sid='%s' type=%u shortfall=%d (a fabricated "
-                "backpack would be empty)", g[k].sid, g[k].type, createLoose);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            createLoose = 0;
+            if (allowContainerCreate) {
+                char b[180]; _snprintf(b, sizeof(b) - 1,
+                    "[recon]   CREATE-CONTAINER sid='%s' type=%u shortfall=%d (outlived the "
+                    "conservation channel; nested entries fill it)", g[k].sid, g[k].type, createLoose);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                char b[180]; _snprintf(b, sizeof(b) - 1,
+                    "[recon]   CREATE-SKIP-CONTAINER sid='%s' type=%u shortfall=%d (a fabricated "
+                    "backpack would be empty)", g[k].sid, g[k].type, createLoose);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                if (outContainerShort) *outContainerShort = true;
+                createLoose = 0;
+            }
         }
         if (createLoose > 0) {
             bool fromEq = (g[k].desiredEq > g[k].curEq);
@@ -939,7 +950,8 @@ bool applyInventoryItems(GameWorld* gw, Inventory* inv, const InvItemEntry* item
 
 bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
                             const InvItemEntry* items, unsigned int count,
-                            bool truncated) {
+                            bool truncated, bool allowContainerCreate,
+                            bool* outContainerShort) {
     if (!gw) return false;
     RootObject* ro = resolveObjectByHand(cHand);
     if (!ro) return false;
@@ -960,7 +972,8 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         topSrcIdx[nTop] = (unsigned char)i;
         top[nTop++] = items[i];
     }
-    bool changed = applyToInventory(gw, inv, nTop ? top : 0, nTop, truncated);
+    bool changed = applyToInventory(gw, inv, nTop ? top : 0, nTop, truncated,
+                                    allowContainerCreate, outContainerShort);
     if (nNested == 0) return changed;
 
     // Re-read AFTER the top-level pass: it may have created or moved the very bag we are about

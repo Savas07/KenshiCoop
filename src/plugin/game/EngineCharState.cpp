@@ -780,6 +780,16 @@ bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused) {
     return true;
 }
 
+bool inDialogue() {
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return false;
+    __try {
+        return g->inDialogue();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool installSpeedIntentHooks(GameWorld* gw) {
     // Seed the intent state from the live engine BEFORE hooking, so the first
     // consume reflects the save's starting speed instead of the defaults.

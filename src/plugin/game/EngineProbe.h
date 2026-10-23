@@ -14,6 +14,7 @@
 #define KENSHICOOP_ENGINE_PROBE_H
 
 class GameWorld;
+class Character;
 
 namespace coop {
 namespace engine {
@@ -122,6 +123,46 @@ bool probeReadCraft(const unsigned int bHand[5], CraftRead* out);
 // benches. First call also logs the live bytes of the bench's work functions
 // ("[craftspy] code ...") for offline disassembly. Idempotent.
 bool installCraftDoneTrace();
+
+// ---- bandit_chase scene levers ------------------------------------------------
+// A roaming hostile pack built from REAL game data rather than the leader's own
+// template, so the bodies the harness counts are what a player meets in the
+// world: a CHARACTER template and a FACTION looked up by display name (ASCII
+// case-insensitive, first match). Both clients resolve the same names to the
+// same records when their data matches, which is what lets each side count the
+// pack by template on its own.
+//
+// SEH-guarded: the CHARACTER template named charName, its stringID written to
+// outSid. False when no such template is loaded.
+bool chaseTemplateSid(GameWorld* gw, const char* charName, char* outSid, unsigned int len);
+// SEH-guarded: spawn 'count' characters of template charName in faction facName
+// on a small ring around (x,y,z), AI intact (NOT detached from their platoon),
+// and pin the player faction and the pack's faction at 'relation' both ways.
+// Fills outHands (readObjectHand layout) up to 'count'; returns the number
+// spawned. Their hands are runtime hands of THIS client only.
+unsigned int spawnNamedPack(GameWorld* gw, const char* charName, const char* facName,
+                            unsigned int count, float x, float y, float z,
+                            float relation, unsigned int (*outHands)[5]);
+// SEH-guarded: pin the player faction and facName's faction at 'relation' both
+// ways on THIS client - the side that did not spawn the pack needs the same
+// hostility for its own copies to behave alike. False when the faction is not
+// live here.
+bool pinChaseRelation(GameWorld* gw, const char* facName, float relation);
+// One world (non-player-squad) body of a given template near a point.
+struct ChaseBody {
+    Character*   c;
+    unsigned int hand[5];   // readObjectHand layout
+    float        x, y, z;
+    float        dist;      // to the query point, 3-D
+    int          visible;   // RootObject::getVisible
+    int          dead;
+    int          down;
+};
+// SEH-guarded: every non-player-squad character whose template stringID is sid
+// within 'radius' of (x,y,z), hidden ones included (a suppressed twin is still
+// a body in the world). Returns the count written to out (<= maxOut).
+unsigned int listChaseBodies(GameWorld* gw, const char* sid, float x, float y, float z,
+                             float radius, ChaseBody* out, unsigned int maxOut);
 
 } // namespace engine
 } // namespace coop

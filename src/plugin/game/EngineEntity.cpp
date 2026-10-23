@@ -842,7 +842,8 @@ unsigned int interestAnchors(GameWorld* gw, float out[3 * MAX_INTEREST_ANCHORS],
     return nc;
 }
 
-unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
+unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut,
+                         Character** outChars) {
     if (!g_getCharsFn || !gw || !out || maxOut == 0) return 0;
     unsigned int n = 0;
     // Capture-bubble hysteresis (2026-07-11 choppiness fix): a hard 200 u
@@ -904,6 +905,7 @@ unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
                         newKeys[newN][1] = out[n].hSerial;
                         ++newN;
                     }
+                    if (outChars) outChars[n] = static_cast<Character*>(obj);
                     ++n;
                 }
             }

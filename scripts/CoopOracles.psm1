@@ -207,6 +207,8 @@ function Invoke-OneOracle {
         "assault_travel" { return (Test-AssaultTravel  -HostFile $HostLog -JoinFile $JoinLog) }
         "assault_mint"  { return (Test-AssaultTravel  -HostFile $HostLog -JoinFile $JoinLog -GateName 'assault_mint' -RequireMint) }
         "mint_aggro"    { return (Test-MintAggro      -HostFile $HostLog -JoinFile $JoinLog) }
+        "bandit_chase"  { return (Test-BanditChase    -HostFile $HostLog -JoinFile $JoinLog) }
+        "bandit_chase_host" { return (Test-BanditChase -HostFile $HostLog -JoinFile $JoinLog -GateName 'bandit_chase_host') }
         "proxy_drift"   { return (Test-ProxyDrift     -JoinFile $JoinLog) }
         "pc_assault"    { return (Test-PcAssault       -HostFile $HostLog -JoinFile $JoinLog) }
         "host_pc_fight" { return (Test-HostPcFight     -HostFile $HostLog -JoinFile $JoinLog) }
@@ -260,6 +262,7 @@ function Invoke-OneOracle {
         "world_item_burst" { return (Test-WorldItemBurst -HostFile $HostLog -JoinFile $JoinLog) }
         "world_item_stale" { return (Test-WorldItemStale -HostFile $HostLog -JoinFile $JoinLog) }
         "nested_bag"    { return (Test-NestedBag       -HostFile $HostLog -JoinFile $JoinLog) }
+        "join_bag"      { return (Test-JoinBag         -HostFile $HostLog -JoinFile $JoinLog) }
         "dump_all"      { return (Test-DumpAll         -HostFile $HostLog -JoinFile $JoinLog) }
         "no_phantom_pickups" { return (Test-NoPhantomPickups -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_loot"   { return (Test-WeaponLoot      -HostFile $HostLog -JoinFile $JoinLog) }
@@ -519,7 +522,7 @@ Export-ModuleMember -Function @(
     "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
     "Test-WorldItemSync", "Test-RejoinItems", "Test-WpnRelocate", "Test-WeaponDrop",
     "Test-WorldPickupMirror", "Test-NativePickup", "Test-CorpseLoot", "Test-CorpseLootRace", "Test-GearRepickup", "Test-GearRedrop", "Test-NoPhantomPickups", "Test-WorldItemBurst",
-    "Test-NestedBag", "Test-DumpAll",
+    "Test-NestedBag", "Test-JoinBag", "Test-DumpAll",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",

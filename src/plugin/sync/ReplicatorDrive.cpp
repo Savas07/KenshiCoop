@@ -1466,15 +1466,26 @@ void Replicator::applyTargets(GameWorld* gw) {
                 d.carryNoSeeTick = 0;
                 engine::CarryRead lcr;
                 bool haveCr = engine::readCarry(c, &lcr);
+                // The streamed subject is a WIRE key, and the carried body may
+                // be one we hold as a proxy (or under a re-containered hand):
+                // compare and pick up by the LOCAL hand of the body it maps to.
+                unsigned int ch[5] = { out.sType, out.sContainer,
+                                       out.sContainerSerial,
+                                       out.sIndex, out.sSerial };
+                {
+                    Key sk; sk.t = out.sType; sk.c = out.sContainer;
+                    sk.cs = out.sContainerSerial; sk.i = out.sIndex; sk.s = out.sSerial;
+                    Character* sb = bodyForKey(sk, 0, 0);
+                    unsigned int lh[5];
+                    if (sb && engine::readObjectHand(reinterpret_cast<RootObject*>(sb), lh))
+                        for (int hi = 0; hi < 5; ++hi) ch[hi] = lh[hi];
+                }
                 bool carryingRight = haveCr && lcr.carrying &&
-                                     lcr.carried[3] == out.sIndex &&
-                                     lcr.carried[4] == out.sSerial;
+                                     lcr.carried[3] == ch[3] &&
+                                     lcr.carried[4] == ch[4];
                 if (haveCr && !carryingRight &&
                     (now - d.carryHealTick) >= CARRY_HEAL_MS) {
                     d.carryHealTick = now;
-                    unsigned int ch[5] = { out.sType, out.sContainer,
-                                           out.sContainerSerial,
-                                           out.sIndex, out.sSerial };
                     bool ok = engine::applyPickup(gw, c, ch);
                     char b[160]; _snprintf(b, sizeof(b) - 1,
                         "[carry] HEAL PICKUP carrier=%u,%u carried=%u,%u ok=%d",
