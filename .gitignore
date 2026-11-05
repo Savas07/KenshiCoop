@@ -21,6 +21,7 @@ tools/manual-sessions/
 # Vendored dependency source (fetched via clone/git-LFS, not committed; ~500MB)
 third_party/enet/enet/
 third_party/KenshiLib_deps/
+third_party/KenshiLib_0.5.0/
 
 # Test-run artifacts (logs, screenshots, verdicts, history)
 tools/test-runs/

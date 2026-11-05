@@ -186,6 +186,9 @@ are in place:
 cmd //c scripts/build_plugin.cmd
 ```
 
+**On macOS:** you can build and play with CrossOver, with no Windows or VM. See
+[docs/BUILD_MACOS_CROSSOVER.md](docs/BUILD_MACOS_CROSSOVER.md).
+
 Dependencies are fetched, not committed:
 
 - KenshiLib + precompiled libs: clone
