@@ -83,6 +83,8 @@ bool  g_installed = false;
 // Re-entry guard: a fault raised while we are already reporting one must not come
 // back through here.
 LONG  g_busy      = 0;
+// The hang watchdog's thread (quietThread); its faults are handled locally.
+volatile DWORD g_quietTid = 0;
 
 // Repeat suppression, PER SITE rather than globally. Faults do repeat every frame
 // once state is corrupt, so some cap is needed - but a single shared budget is
@@ -288,6 +290,7 @@ void report(EXCEPTION_POINTERS* ep, const char* origin) {
 }
 
 LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
+    if (g_quietTid && GetCurrentThreadId() == g_quietTid) return EXCEPTION_CONTINUE_SEARCH;
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
     // Everything that can end the process. Breakpoints, single-steps and the
     // debugger's thread-name exception are not in that set and stay ignored.
@@ -358,6 +361,8 @@ void install(const char* dir, const char* modeTag) {
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
 }
+
+void quietThread(unsigned long tid) { g_quietTid = (DWORD)tid; }
 
 } // namespace crashdump
 } // namespace coop

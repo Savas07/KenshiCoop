@@ -8,6 +8,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
+#include <float.h>
 
 namespace coop {
 
@@ -386,6 +388,306 @@ bool relayToJoins(u8 type) {
         return false;
     }
 }
+
+// ---- Untrusted input --------------------------------------------------------
+// A peer's packet is attacker-controlled bytes (security report, Oct 2026).
+// Every received packet passes these before it is relayed or queued:
+//   * every fixed char field is terminated in place, so a full field can never
+//     run strcmp / std::string / %s off its end (honest senders strncpy size-1
+//     into zeroed packets, so their last byte is already 0 - a no-op for them);
+//   * the one-way save/load handshakes arrive only in their own direction (the
+//     other side never drains those queues, so a stray stream grew them forever);
+//   * a float that reaches an engine write or the interpolator is finite;
+//   * on the host, the ownerId a join stamps is its own id (a join could
+//     otherwise act as the host or as another join).
+
+template <size_t N> inline void termField(char (&s)[N]) { s[N - 1] = '\0'; }
+
+inline void termInvEntry(InvItemEntry& e) {
+    termField(e.stringID); termField(e.manufacturer); termField(e.material);
+}
+
+// Entries of E after a header H: the header's count, bounded by the bytes
+// actually received.
+template <class H, class E> unsigned int tailFit(unsigned int len, unsigned int count) {
+    if (len < sizeof(H)) return 0;
+    const unsigned int fit = (len - (unsigned int)sizeof(H)) / (unsigned int)sizeof(E);
+    return count < fit ? count : fit;
+}
+
+template <class T> inline T* fixedAt(enet_uint8* d, unsigned int len) {
+    return len >= sizeof(T) ? reinterpret_cast<T*>(d) : 0;
+}
+
+void terminateWireStrings(u8 type, enet_uint8* d, unsigned int len) {
+    switch (type) {
+    case PKT_INV_SNAPSHOT: {
+        InvSnapshotHeader* h = fixedAt<InvSnapshotHeader>(d, len);
+        if (!h) break;
+        InvItemEntry* e = reinterpret_cast<InvItemEntry*>(d + sizeof(InvSnapshotHeader));
+        const unsigned int n = tailFit<InvSnapshotHeader, InvItemEntry>(len, h->count);
+        for (unsigned int i = 0; i < n; ++i) termInvEntry(e[i]);
+        break;
+    }
+    case PKT_TRADE: {
+        TradeHeader* h = fixedAt<TradeHeader>(d, len);
+        if (!h) break;
+        InvItemEntry* e = reinterpret_cast<InvItemEntry*>(d + sizeof(TradeHeader));
+        const unsigned int n = tailFit<TradeHeader, InvItemEntry>(len, h->count);
+        for (unsigned int i = 0; i < n; ++i) termInvEntry(e[i]);
+        break;
+    }
+    case PKT_WORLD_ITEM: {
+        WorldItemSnapshotHeader* h = fixedAt<WorldItemSnapshotHeader>(d, len);
+        if (!h) break;
+        WorldItemEntry* e = reinterpret_cast<WorldItemEntry*>(d + sizeof(WorldItemSnapshotHeader));
+        const unsigned int n = tailFit<WorldItemSnapshotHeader, WorldItemEntry>(len, h->count);
+        for (unsigned int i = 0; i < n; ++i) termField(e[i].stringID);
+        break;
+    }
+    case PKT_NATIVE_TAKEN:
+        if (NativeTakenPacket* p = fixedAt<NativeTakenPacket>(d, len)) termField(p->stringID);
+        break;
+    case PKT_WORLD_DROP:
+        if (WorldDropPacket* p = fixedAt<WorldDropPacket>(d, len)) {
+            termField(p->stringID); termField(p->manufacturer); termField(p->material);
+        }
+        break;
+    case PKT_WORLD_PICKUP:
+        if (WorldPickupPacket* p = fixedAt<WorldPickupPacket>(d, len)) termField(p->stringID);
+        break;
+    case PKT_INV_XFER:
+        if (InvXferPacket* p = fixedAt<InvXferPacket>(d, len)) {
+            termField(p->stringID); termField(p->manufacturer); termField(p->material);
+        }
+        break;
+    case PKT_VENDOR_DELTA:
+        if (VendorDeltaPacket* p = fixedAt<VendorDeltaPacket>(d, len)) {
+            termField(p->stringID); termField(p->manufacturer); termField(p->material);
+        }
+        break;
+    case PKT_MEDICAL:
+        if (MedicalPacket* p = fixedAt<MedicalPacket>(d, len))
+            for (int k = 0; k < 4; ++k) termField(p->limbSid[k]);
+        break;
+    case PKT_FACTION:
+        if (FactionPacket* p = fixedAt<FactionPacket>(d, len)) termField(p->sid);
+        break;
+    case PKT_DEED:
+        if (DeedPacket* p = fixedAt<DeedPacket>(d, len)) termField(p->ownerSid);
+        break;
+    case PKT_FIXTURE:
+        if (FixturePacket* p = fixedAt<FixturePacket>(d, len)) termField(p->sid);
+        break;
+    case PKT_BUILD_PLACE:
+        if (BuildPlacePacket* p = fixedAt<BuildPlacePacket>(d, len)) termField(p->sid);
+        break;
+    case PKT_SPAWN_INFO:
+        if (SpawnInfoPacket* p = fixedAt<SpawnInfoPacket>(d, len)) {
+            termField(p->charSid); termField(p->facSid);
+        }
+        break;
+    case PKT_PROD:
+        if (ProdPacket* p = fixedAt<ProdPacket>(d, len)) termField(p->outSid);
+        break;
+    case PKT_RESEARCH:
+        if (ResearchPacket* p = fixedAt<ResearchPacket>(d, len)) termField(p->sid);
+        break;
+    case PKT_JOIN_STATE:
+        if (JoinStatePacket* p = fixedAt<JoinStatePacket>(d, len)) termField(p->name);
+        break;
+    case PKT_SAVE_REQ:
+        if (SaveReqPacket* p = fixedAt<SaveReqPacket>(d, len)) termField(p->name);
+        break;
+    case PKT_SAVE_BEGIN:
+        if (SaveBeginPacket* p = fixedAt<SaveBeginPacket>(d, len)) termField(p->name);
+        break;
+    case PKT_LOAD_GO:
+        if (LoadGoPacket* p = fixedAt<LoadGoPacket>(d, len)) termField(p->name);
+        break;
+    case PKT_LOAD_REQ:
+        if (LoadReqPacket* p = fixedAt<LoadReqPacket>(d, len)) termField(p->name);
+        break;
+    case PKT_LOAD_NACK:
+        if (LoadNackPacket* p = fixedAt<LoadNackPacket>(d, len)) termField(p->name);
+        break;
+    default:
+        break;
+    }
+}
+
+// The save transfer runs host -> join; its requests and verdicts join -> host.
+bool wrongDirection(u8 type, bool isHost) {
+    switch (type) {
+    case PKT_SAVE_BEGIN: case PKT_SAVE_FILE: case PKT_SAVE_DONE: case PKT_LOAD_GO:
+        return isHost;
+    case PKT_SAVE_REQ: case PKT_SAVE_ACK: case PKT_LOAD_REQ: case PKT_LOAD_NACK:
+        return !isHost;
+    default:
+        return false;
+    }
+}
+
+inline bool fin(f32 v) { return _finite(v) != 0; }
+inline bool finN(const f32* v, unsigned int n) {
+    for (unsigned int i = 0; i < n; ++i) if (!fin(v[i])) return false;
+    return true;
+}
+
+bool entityFinite(const EntityState& e) {
+    return fin(e.x) && fin(e.y) && fin(e.z) && fin(e.heading) && fin(e.cSpeed) &&
+           fin(e.cMotionX) && fin(e.cMotionY) && fin(e.cMotionZ);
+}
+
+// false = a NaN/Inf in a float the receiver writes into the engine; the whole
+// packet is dropped (no honest sender produces one). Entity batches are
+// filtered per row at delivery instead.
+bool wireFloatsFinite(u8 type, const enet_uint8* d, unsigned int len) {
+    switch (type) {
+    case PKT_EVENT: { EventPacket p; return !readPacket(d, len, &p) || fin(p.arg); }
+    case PKT_WORLD_ITEM: {
+        WorldItemSnapshotHeader h;
+        if (!readPacket(d, len, &h)) return true;
+        const unsigned int n = tailFit<WorldItemSnapshotHeader, WorldItemEntry>(len, h.count);
+        const WorldItemEntry* e = reinterpret_cast<const WorldItemEntry*>(d + sizeof(h));
+        for (unsigned int i = 0; i < n; ++i)
+            if (!fin(e[i].x) || !fin(e[i].y) || !fin(e[i].z)) return false;
+        return true;
+    }
+    case PKT_WORLD_DROP: { WorldDropPacket p; return !readPacket(d, len, &p) || (fin(p.x) && fin(p.y) && fin(p.z)); }
+    case PKT_NATIVE_TAKEN: { NativeTakenPacket p; return !readPacket(d, len, &p) || (fin(p.x) && fin(p.y) && fin(p.z)); }
+    case PKT_FIXTURE: { FixturePacket p; return !readPacket(d, len, &p) || (fin(p.x) && fin(p.y) && fin(p.z)); }
+    case PKT_CAM_HINT: { CamHintPacket p; return !readPacket(d, len, &p) || (fin(p.x) && fin(p.y) && fin(p.z)); }
+    case PKT_BUILD_PLACE: {
+        BuildPlacePacket p;
+        return !readPacket(d, len, &p) || (fin(p.x) && fin(p.y) && fin(p.z) && fin(p.yaw));
+    }
+    case PKT_BUILD_STATE: { BuildStatePacket p; return !readPacket(d, len, &p) || fin(p.progress); }
+    case PKT_SPAWN_INFO: {
+        SpawnInfoPacket p;
+        return !readPacket(d, len, &p) ||
+               (fin(p.x) && fin(p.y) && fin(p.z) && fin(p.heading) && fin(p.age));
+    }
+    case PKT_COMBAT_HIT: { CombatHitPacket p; return !readPacket(d, len, &p) || (fin(p.flesh) && fin(p.blood)); }
+    case PKT_SPEED_REQ: case PKT_SPEED_SET: { SpeedPacket p; return !readPacket(d, len, &p) || fin(p.speed); }
+    case PKT_FACTION: { FactionPacket p; return !readPacket(d, len, &p) || fin(p.relation); }
+    case PKT_TREATMENT: { TreatmentPacket p; return !readPacket(d, len, &p) || finN(p.partBand, MED_PARTS_MAX); }
+    case PKT_STATS: {
+        StatsPacket p;
+        return !readPacket(d, len, &p) ||
+               (finN(p.stats, STATS_SLOT_MAX) && fin(p.xp) && fin(p.freeAttributePoints));
+    }
+    case PKT_MEDICAL: {
+        MedicalPacket p;
+        if (!readPacket(d, len, &p)) return true;
+        if (!fin(p.blood) || !fin(p.bleedRate) || !fin(p.hunger) || !fin(p.fed)) return false;
+        for (unsigned int i = 0; i < MED_PARTS_MAX; ++i) {
+            const MedPartEntry& m = p.parts[i];
+            if (!fin(m.flesh) || !fin(m.fleshStun) || !fin(m.bandaging) || !fin(m.juryRig)) return false;
+        }
+        return true;
+    }
+    case PKT_PROD: {
+        ProdPacket p;
+        return !readPacket(d, len, &p) ||
+               (fin(p.outAmount) && finN(p.inAmount, 2) && fin(p.grown) && fin(p.died) &&
+                fin(p.growStart) && fin(p.harvested));
+    }
+    case PKT_JOIN_STATE: {
+        JoinStatePacket p;
+        if (!readPacket(d, len, &p)) return true;
+        for (unsigned int i = 0; i < JS_JOBS_MAX; ++i)
+            if (!finN(p.jobs[i].loc, 3)) return false;
+        return true;
+    }
+    case PKT_STEALTH: {
+        StealthPacket p;
+        if (!readPacket(d, len, &p)) return true;
+        for (unsigned int i = 0; i < STEALTH_SEER_MAX; ++i)
+            if (!fin(p.seers[i].prog)) return false;
+        return true;
+    }
+    default:
+        return true;
+    }
+}
+
+// Byte offset of the sender id a join stamps into each packet it authors, or
+// -1 for the types that carry none (handshake, roster, clock probes).
+int ownerIdOffset(u8 type) {
+    switch (type) {
+    case PKT_ENTITY_BATCH:      return (int)offsetof(EntityBatchHeader, ownerId);
+    case PKT_EVENT:             return (int)offsetof(EventPacket, ownerId);
+    case PKT_INV_SNAPSHOT:      return (int)offsetof(InvSnapshotHeader, ownerId);
+    case PKT_WORLD_ITEM:        return (int)offsetof(WorldItemSnapshotHeader, ownerId);
+    case PKT_WORLD_ITEM_REMOVE: return (int)offsetof(WorldItemRemoveHeader, ownerId);
+    case PKT_WORLD_ITEM_CLAIM:  return (int)offsetof(WorldItemClaimHeader, ownerId);
+    case PKT_NPC_CENSUS:        return (int)offsetof(NpcCensusHeader, ownerId);
+    case PKT_WORLD_DROP:        return (int)offsetof(WorldDropPacket, ownerId);
+    case PKT_WORLD_PICKUP:      return (int)offsetof(WorldPickupPacket, ownerId);
+    case PKT_INV_XFER:          return (int)offsetof(InvXferPacket, ownerId);
+    case PKT_INV_XFER_ACK:      return (int)offsetof(InvXferAckPacket, ownerId);
+    case PKT_MEDICAL:           return (int)offsetof(MedicalPacket, ownerId);
+    case PKT_TREATMENT:         return (int)offsetof(TreatmentPacket, ownerId);
+    case PKT_COMBAT_HIT:        return (int)offsetof(CombatHitPacket, ownerId);
+    case PKT_SPEED_REQ:
+    case PKT_SPEED_SET:         return (int)offsetof(SpeedPacket, ownerId);
+    case PKT_STATS:             return (int)offsetof(StatsPacket, ownerId);
+    case PKT_MONEY:             return (int)offsetof(MoneyPacket, ownerId);
+    case PKT_MONEY_DELTA:       return (int)offsetof(MoneyDeltaPacket, ownerId);
+    case PKT_VENDOR_DELTA:      return (int)offsetof(VendorDeltaPacket, ownerId);
+    case PKT_VENDOR_CASH:       return (int)offsetof(VendorCashPacket, ownerId);
+    case PKT_TRADE:             return (int)offsetof(TradeHeader, ownerId);
+    case PKT_NATIVE_TAKEN:      return (int)offsetof(NativeTakenPacket, ownerId);
+    case PKT_FACTION:           return (int)offsetof(FactionPacket, ownerId);
+    case PKT_TIME:              return (int)offsetof(TimePacket, ownerId);
+    case PKT_DOOR:              return (int)offsetof(DoorPacket, ownerId);
+    case PKT_PROD:              return (int)offsetof(ProdPacket, ownerId);
+    case PKT_RESEARCH:          return (int)offsetof(ResearchPacket, ownerId);
+    case PKT_JOIN_STATE:        return (int)offsetof(JoinStatePacket, ownerId);
+    case PKT_DEED:              return (int)offsetof(DeedPacket, ownerId);
+    case PKT_FIXTURE:           return (int)offsetof(FixturePacket, ownerId);
+    case PKT_CHARGEN:           return (int)offsetof(CharGenHeader, ownerId);
+    case PKT_BUILD_PLACE:       return (int)offsetof(BuildPlacePacket, ownerId);
+    case PKT_BUILD_STATE:       return (int)offsetof(BuildStatePacket, ownerId);
+    case PKT_BUILD_DOOR:        return (int)offsetof(BuildDoorPacket, ownerId);
+    case PKT_BUILD_REMOVE:      return (int)offsetof(BuildRemovePacket, ownerId);
+    case PKT_STEALTH:           return (int)offsetof(StealthPacket, ownerId);
+    case PKT_SPAWN_REQ:         return (int)offsetof(SpawnReqPacket, ownerId);
+    case PKT_SPAWN_INFO:        return (int)offsetof(SpawnInfoPacket, ownerId);
+    case PKT_SAVE_REQ:          return (int)offsetof(SaveReqPacket, ownerId);
+    case PKT_SAVE_BEGIN:        return (int)offsetof(SaveBeginPacket, ownerId);
+    case PKT_SAVE_FILE:         return (int)offsetof(SaveFileHeader, ownerId);
+    case PKT_SAVE_DONE:         return (int)offsetof(SaveDoneHeader, ownerId);
+    case PKT_SAVE_ACK:          return (int)offsetof(SaveAckPacket, ownerId);
+    case PKT_LOAD_GO:           return (int)offsetof(LoadGoPacket, ownerId);
+    case PKT_LOAD_REQ:          return (int)offsetof(LoadReqPacket, ownerId);
+    case PKT_LOAD_NACK:         return (int)offsetof(LoadNackPacket, ownerId);
+    case PKT_CAM_HINT:          return (int)offsetof(CamHintPacket, ownerId);
+    case PKT_CELL_CLAIM:        return (int)offsetof(CellClaimPacket, ownerId);
+    default:                    return -1;
+    }
+}
+
+bool senderOwnsPacket(u8 type, const enet_uint8* d, unsigned int len, u32 peerId) {
+    const int off = ownerIdOffset(type);
+    if (off < 0) return true;
+    if (len < (unsigned int)off + (unsigned int)sizeof(u32)) return false;
+    u32 owner;
+    std::memcpy(&owner, d + off, sizeof(owner));
+    return owner == peerId;
+}
+
+// Rate-limited: a hostile peer must not be able to flood the log either.
+void noteRejected(unsigned long& n, u8 type, u32 peer, const char* why) {
+    ++n;
+    if (n > 16 && (n & 1023) != 0) return;
+    char b[160];
+    _snprintf(b, sizeof(b) - 1, "dropped packet type=%u from peer %u: %s (n=%lu)",
+              (unsigned)type, (unsigned)peer, why, n);
+    b[sizeof(b) - 1] = '\0';
+    netErr(b);
+}
 } // namespace
 
 void NetLink::sendOut(ENetPacket* out, enet_uint8 ch, u32 targetMask, ENetPeer* except) {
@@ -640,6 +942,7 @@ void NetLink::threadLoop() {
     InterlockedExchange(&reservedDirty_, 0);
     applyReservedIds();
     DWORD lastConnectAttempt = GetTickCount();
+    unsigned long rejectedRx = 0; // untrusted-input drops (noteRejected)
 
     // Wall-clock time-sync state (client only). The join pings every ~2 s; each
     // pong yields an (rtt, offset) sample; the minimum-RTT sample wins (NTP
@@ -715,11 +1018,29 @@ void NetLink::threadLoop() {
                     // packet (peer 0) and the HELLO itself are in the file.
                     recordReceive(ev, isHost_);
                     const u8 type = packetType(ev.packet->data, (unsigned)ev.packet->dataLength);
+                    const unsigned rxLen = (unsigned)ev.packet->dataLength;
+                    const u32 rxPeer = isHost_ ? (u32)(size_t)ev.peer->data : 0u;
+                    terminateWireStrings(type, ev.packet->data, rxLen);
+                    if (wrongDirection(type, isHost_) ||
+                        !wireFloatsFinite(type, ev.packet->data, rxLen)) {
+                        noteRejected(rejectedRx, type, rxPeer,
+                                     wrongDirection(type, isHost_) ? "wrong direction"
+                                                                   : "non-finite float");
+                        enet_packet_destroy(ev.packet);
+                        break;
+                    }
                     if (isHost_ && type != PKT_HELLO) {
                         // Only a welcomed join is a session member: drop what it
                         // sends before its HELLO is answered, then fan its owner
                         // state out to the other joins (star relay).
-                        if ((u32)(size_t)ev.peer->data == 0) {
+                        if (rxPeer == 0) {
+                            enet_packet_destroy(ev.packet);
+                            break;
+                        }
+                        // A join speaks only for itself: the ownerId it stamps
+                        // must be the id the host assigned this connection.
+                        if (!senderOwnsPacket(type, ev.packet->data, rxLen, rxPeer)) {
+                            noteRejected(rejectedRx, type, rxPeer, "ownerId is not the sender");
                             enet_packet_destroy(ev.packet);
                             break;
                         }
@@ -836,6 +1157,7 @@ void NetLink::threadLoop() {
                                 for (unsigned i = 0; i < hdr.count; ++i) {
                                     EntityState e;
                                     std::memcpy(&e, p + i * sizeof(EntityState), sizeof(e));
+                                    if (!entityFinite(e)) continue; // never into the interpolator
                                     deliverEntity(hdr.ownerId, hdr.sendMs, e);
                                 }
                             }

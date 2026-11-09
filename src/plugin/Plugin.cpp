@@ -30,6 +30,7 @@
 #include "core/Config.h"
 #include "core/CrashDump.h"
 #include "core/FocusGuard.h"
+#include "core/HangWatch.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
 #include "core/Version.h"
@@ -38,6 +39,7 @@
 #include "net/SteamInvite.h"
 #include "game/Engine.h"
 #include "game/EngineUi.h"       // Phase 5a: F2 co-op panel + status overlay
+#include "game/ReKenshiFocus.h" // RE_Kenshi alt-tab fault guard
 #include "devtools/DevTools.h"   // developer tools (docs/DEVTOOLS.md), off unless "devtools": 1
 #include "devtools/PacketRecorder.h"
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
@@ -151,6 +153,11 @@ struct SessionController {
     coop::u32    loadXferMask;
     // Host: the newest LOAD_GO id sent to each join (per-join stale-NACK guard).
     std::map<coop::u32, coop::u32> goIdFor;
+    // Host: the save name each join's newest LOAD_GO announced, and the last
+    // GO's name for a join without one. A NACK streams THIS folder - never a
+    // name the join puts in its NACK.
+    std::map<coop::u32, std::string> goNameFor;
+    std::string  lastGoName;
     // Character creation gate (protocol 58). Host: its live world came from New
     // Game this session. Join: the GO it loaded said so (freshStart).
     bool         worldFresh;
@@ -301,6 +308,8 @@ void warnIfNoPortraits(const std::string& name) {
 void sessionResetForUi() {
     g_session.peers.clear();
     g_session.goIdFor.clear();
+    g_session.goNameFor.clear();
+    g_session.lastGoName.clear();
     g_session.bootstrapMask = 0;
     g_session.loadXferMask  = 0;
     g_peerPresent = false;
@@ -486,6 +495,7 @@ void rosterLoadForWorld(bool fresh) {
 // the folder, so the joins' copies carry it too.
 void rosterWrite(const std::string& save) {
     if (g_roster.empty()) return;
+    if (!coop::savexfer::saveNameSafe(save)) return; // never a path outside the save root
     const std::string folder = coop::savexfer::saveFolderFor(save);
     CreateDirectoryW(wideOf(folder).c_str(), 0);
     FILE* f = _wfopen(wideOf(rosterFileOf(save)).c_str(), L"wb");
@@ -674,6 +684,7 @@ void processNetEvents(GameWorld* gw) {
             g_session.peers.erase(id);
             g_inbound.purgeOwner(id);
             g_session.goIdFor.erase(id);
+            g_session.goNameFor.erase(id);
             g_session.bootstrapMask &= ~coop::peerBit(id);
             g_session.loadXferMask  &= ~coop::peerBit(id);
         }
@@ -782,12 +793,22 @@ void driveSaveSync() {
             char name[sizeof(it->pkt.name) + 1];
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
+            const char* want = name[0] ? name : "coopresume";
             char b[144];
+            if (!coop::savexfer::saveNameSafe(want)) {
+                // A traversing name would save, write the roster and stream a
+                // folder outside the save root.
+                _snprintf(b, sizeof(b) - 1,
+                          "[save] REQ from join id=%u name='%s' REFUSED (unsafe save name)",
+                          it->pkt.reqId, name);
+                b[sizeof(b) - 1] = '\0'; coopErr(b);
+                continue;
+            }
             _snprintf(b, sizeof(b) - 1,
                       "[save] REQ from join id=%u name='%s' -> saving",
                       it->pkt.reqId, name);
             b[sizeof(b) - 1] = '\0'; coopLog(b);
-            if (!coop::engine::saveGameAs(name[0] ? name : "coopresume"))
+            if (!coop::engine::saveGameAs(want))
                 coopErr("[save] join-requested save FAILED to issue");
         }
 
@@ -821,7 +842,11 @@ void driveSaveSync() {
                     go.freshStart  = g_worldFresh ? 1 : 0;
                     g_net.queueLoadGo(go, g_session.bootstrapMask);
                     for (coop::u32 k = 1; k < coop::MAX_PLAYERS; ++k)
-                        if (g_session.bootstrapMask & coop::peerBit(k)) g_session.goIdFor[k] = go.loadId;
+                        if (g_session.bootstrapMask & coop::peerBit(k)) {
+                            g_session.goIdFor[k]   = go.loadId;
+                            g_session.goNameFor[k] = g_bootstrapName;
+                        }
+                    g_session.lastGoName = g_bootstrapName;
                     g_session.bootstrapMask = 0;
                     g_loadPumpArmTick = GetTickCount();
                     char b2[192];
@@ -902,8 +927,11 @@ void driveLoadSync(GameWorld* gw) {
             go.freshStart  = 0; // a load: the new world is a saved campaign
             g_net.queueLoadGo(go, joinMask());
             for (std::set<coop::u32>::const_iterator pit = g_session.peers.begin();
-                 pit != g_session.peers.end(); ++pit)
-                g_session.goIdFor[*pit] = go.loadId;
+                 pit != g_session.peers.end(); ++pit) {
+                g_session.goIdFor[*pit]   = go.loadId;
+                g_session.goNameFor[*pit] = name;
+            }
+            g_session.lastGoName = name;
             g_loadPumpArmTick = GetTickCount();
             char b[160];
             _snprintf(b, sizeof(b) - 1,
@@ -942,6 +970,14 @@ void driveLoadSync(GameWorld* gw) {
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
             if (!name[0]) continue;
+            if (!coop::savexfer::saveNameSafe(name)) {
+                char b[144];
+                _snprintf(b, sizeof(b) - 1,
+                          "[load] REQ from join id=%u name='%s' REFUSED (unsafe save name)",
+                          it->pkt.reqId, name);
+                b[sizeof(b) - 1] = '\0'; coopErr(b);
+                continue;
+            }
             if (coop::savexfer::folderFingerprint(name) == 0) {
                 char b[144];
                 _snprintf(b, sizeof(b) - 1,
@@ -979,11 +1015,26 @@ void driveLoadSync(GameWorld* gw) {
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
                 continue;
             }
+            // Stream the folder the GO announced, not the name in the NACK: the
+            // NACK's name is the join's word, and the join could name any path.
+            std::map<coop::u32, std::string>::const_iterator gn =
+                g_session.goNameFor.find(it->pkt.ownerId);
+            const std::string& goName =
+                (gn != g_session.goNameFor.end()) ? gn->second : g_session.lastGoName;
+            // The GO carried the name cut to the wire field; the join echoes that.
+            const std::string sentName = goName.substr(0, sizeof(it->pkt.name) - 1);
+            if (goName.empty() || _stricmp(sentName.c_str(), name) != 0) {
+                _snprintf(b, sizeof(b) - 1,
+                          "[load] NACK id=%u name='%s' does not match the announced save '%s' - ignored",
+                          it->pkt.loadId, name, goName.c_str());
+                b[sizeof(b) - 1] = '\0'; coopErr(b);
+                continue;
+            }
             _snprintf(b, sizeof(b) - 1,
                       "[load] NACK id=%u name='%s' joinFp=%08x -> transfer after reload",
                       it->pkt.loadId, name, it->pkt.fingerprint);
             b[sizeof(b) - 1] = '\0'; coopLog(b);
-            g_loadXferPending = name;
+            g_loadXferPending = goName;
             g_session.loadXferMask |= coop::peerBit(it->pkt.ownerId);
         }
         if (!g_loadXferPending.empty() && coop::engine::gameplayLive(gw) &&
@@ -1029,6 +1080,16 @@ void driveLoadSync(GameWorld* gw) {
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
             if (!name[0]) continue;
+            if (!coop::savexfer::saveNameSafe(name)) {
+                // Never fingerprint (probe) or load a folder outside the save
+                // root; no NACK either - nothing here may be streamed over.
+                char rb[160];
+                _snprintf(rb, sizeof(rb) - 1,
+                          "[load] GO id=%u name='%s' REFUSED (unsafe save name)",
+                          it->pkt.loadId, name);
+                rb[sizeof(rb) - 1] = '\0'; coopErr(rb);
+                continue;
+            }
             coop::u32 fp = coop::savexfer::folderFingerprint(name);
             char b[192];
             if (!s_forceStream && fp != 0 && fp == it->pkt.fingerprint) {
@@ -1812,9 +1873,17 @@ static void tickCharGen(GameWorld* gw, bool worldLive) {
         const unsigned int* h = g.hdr.hand;
         Character* c = coop::engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
         if (!c) { chargenLog("APPLY-FAIL(unresolved)", g.hdr.ownerId, 0, 0); continue; }
+        // Only a squad member another player owns takes a peer's look - never one
+        // of ours, never a world NPC: the .bod2 goes straight into the engine's
+        // GameData loader and the name onto the body.
+        if (g_repl.ownerClassForHand(h) != 2) {
+            chargenLog("APPLY-FAIL(not a peer's character)", g.hdr.ownerId, c, 0);
+            continue;
+        }
         // A race from a mod we don't have would leave setRace with an unresolved
-        // race and can take the session down: keep the old look instead.
-        if (!g.raceSid.empty() && !coop::engine::chargenRaceKnown(gw, g.raceSid.c_str())) {
+        // race and can take the session down: keep the old look instead. The
+        // sender always names its race, so a missing one is refused too.
+        if (g.raceSid.empty() || !coop::engine::chargenRaceKnown(gw, g.raceSid.c_str())) {
             char rx[128];
             _snprintf(rx, sizeof(rx) - 1, " race='%s' (not installed here)", g.raceSid.c_str());
             rx[sizeof(rx) - 1] = '\0';
@@ -2396,7 +2465,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     ++g_tick;
     g_lastGw = gw; // cache for the argument-less F2 UI callbacks
     coop::focusguard::tick(); // no-op unless KENSHICOOP_NO_FOCUS (automated runs)
-
+    coop::hangwatch::tick(true);
 #ifdef KENSHICOOP_HARNESS
     // TEST-ONLY (KENSHICOOP_TEST_CRASH=<seconds>): fault on purpose, to prove the
     // crash-dump filter actually produces a dump with our frames in it. A crash
@@ -2639,6 +2708,27 @@ void coopPanelDriveSeh() {
 void titleUpdate_hook(TitleScreen* self) {
     g_titleUpdate_orig(self);
     coop::focusguard::tick(); // no-op unless KENSHICOOP_NO_FOCUS (automated runs)
+#ifdef KENSHICOOP_HARNESS
+    // TEST-ONLY (KENSHICOOP_TEST_FOCUS_NOPLAYER=1): 5 s into the title, run RE_Kenshi's
+    // focus handler with ou->player cleared - the state the game-exit crash faults in
+    // (game/ReKenshiFocus.h). Unguarded this faults; guarded it logs a skip.
+    {
+        static int s_mode = -1;
+        static DWORD s_since = 0;
+        if (s_mode < 0) {
+            const char* e = getenv("KENSHICOOP_TEST_FOCUS_NOPLAYER");
+            s_mode = e ? atoi(e) : 0;
+        }
+        if (s_mode > 0) {
+            if (s_since == 0) s_since = GetTickCount();
+            if (GetTickCount() - s_since >= 5000) {
+                s_mode = 0;
+                coop::rekfocus::testFocusLossWithoutPlayer();
+            }
+        }
+    }
+#endif
+    coop::hangwatch::tick(false);
 
     // Bring-up trace: log once on the first title tick, then only when the
     // online state flips (the moment the user toggles ONLINE via F2), so the log
@@ -3329,8 +3419,16 @@ __declspec(dllexport) void startPlugin() {
         coop::crashdump::install(dir.c_str(), g_cfg.isHost ? "host" : "join");
     }
 
+    // Main-thread hang watchdog: a join that froze in the Holy Nation town left
+    // no trace of where its main thread was stuck. See core/HangWatch.h.
+    coop::hangwatch::install(&coop::engine::loadEdgeSerial);
+
     // Automated test runs: keep this instance from taking the user's desktop.
     coop::focusguard::install(g_cfg.noFocus);
+
+    // RE_Kenshi's focus listener faults when the game window closes after the
+    // world is gone (every exit with the window focused). See game/ReKenshiFocus.h.
+    coop::rekfocus::install();
 
     logStartupBanner();
 

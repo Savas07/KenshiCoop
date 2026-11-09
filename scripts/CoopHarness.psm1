@@ -54,6 +54,9 @@ $script:CoopDiagEnvKeys = @(
     # "[regime]" line per change of the drive branch (ReplicatorDrive.cpp): which
     # regime held a copy where the audit dumps saw it off its host body.
     'KENSHICOOP_DEBUG_REGIME'
+    # "[combat] trace" at 10 Hz per copy in the combat regime (ReplicatorDrive.cpp):
+    # local fight read, lock, raw task key, copy->target distance.
+    'KENSHICOOP_DEBUG_COMBAT_COPY'
     # On-screen authority labels (Replicator::debugMark): green DRV/HI, red
     # CULLED, yellow PARKED, gray MID, pinned over each judged body. Purely
     # visual - nothing is logged per body - so this earns its place in the

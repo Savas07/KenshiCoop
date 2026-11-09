@@ -165,6 +165,10 @@ bool orderMoveTo(Character* c, float x, float y, float z);
 // obeys), so the engine grounds it and plays a real walk/run clip. Re-issued each
 // frame toward the moving target; the engine acts on the next tick.
 bool walkTo(Character* c, float x, float y, float z, float speed);
+// walkTo for an AI body WITHOUT the player move order: only the movement
+// controller's HIGH_PRIORITY destination, so its current task (an attack it is
+// arming) is not replaced. A player-controlled body ignores this.
+bool steerTo(Character* c, float x, float y, float z, float speed);
 
 // SEH-guarded: halt + teleport to an exact transform (a clean stop at rest).
 bool park(Character* c, float x, float y, float z, float heading);

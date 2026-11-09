@@ -8,11 +8,16 @@ namespace {
 const float PI_F  = 3.14159265358979323846f;
 const float TWO_PI = 6.28318530717958647692f;
 
-// Shortest-arc interpolation between two yaw angles (radians).
+// Shortest-arc interpolation between two yaw angles (radians). A constant-time
+// wrap: the old subtract-2pi loop never ended on an infinite heading and took
+// millions of turns on a huge one (both straight off the wire). The receive
+// path drops non-finite rows; this stays safe on its own regardless.
 float lerpAngle(float a, float b, float t) {
     float d = b - a;
-    while (d >  PI_F) d -= TWO_PI;
-    while (d < -PI_F) d += TWO_PI;
+    if (!(d > -1.0e6f && d < 1.0e6f)) return b; // NaN/Inf/absurd: no arc to follow
+    d = fmodf(d, TWO_PI);                        // (-2pi, 2pi), exact for small d
+    if (d >  PI_F) d -= TWO_PI;
+    else if (d < -PI_F) d += TWO_PI;
     return a + d * t;
 }
 

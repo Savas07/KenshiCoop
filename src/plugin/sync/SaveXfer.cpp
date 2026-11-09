@@ -376,6 +376,9 @@ bool folderInventory(const std::string& folder, unsigned int* outFiles,
 }
 
 u32 folderFingerprint(const std::string& name) {
+    // A network-supplied name must never derive a path outside the save root
+    // ("..\..\Documents" would fingerprint - and so probe - any folder).
+    if (!saveNameSafe(name)) return 0;
     std::string folder = saveFolderFor(name);
     std::vector<XferFile> files;
     collectFiles(folder, "", 0, &files);
@@ -496,6 +499,16 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name, u32 targetMas
     g_sendFiles.clear();
     g_sendCrcs.clear();
     g_sendActive = false;
+
+    // Last line of defence: whatever the caller validated, only a plain save
+    // name under the save root is ever read and streamed to a peer.
+    if (!saveNameSafe(name)) {
+        char b[160];
+        _snprintf(b, sizeof(b) - 1, "[save] XFER-BEGIN refused: unsafe save name '%s'",
+                  name.c_str());
+        b[sizeof(b) - 1] = '\0'; coop::logErrLine(b);
+        return false;
+    }
 
     std::string folder = saveFolderFor(name);
     DWORD attrs = attrsOf(folder);

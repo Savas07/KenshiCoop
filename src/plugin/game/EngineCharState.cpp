@@ -403,8 +403,11 @@ bool applyFurniture(GameWorld* gw, Character* occupant,
     if (!fn) return false;
     // Resolve the furniture OUTSIDE the SEH frame (resolveObjectByHand guards
     // itself). A null is only fatal for ENTER; an EXIT can fall back to the
-    // occupant's own inWhat below.
-    RootObject* ro = furnHand ? resolveObjectByHand(furnHand) : 0;
+    // occupant's own inWhat below. Only a BUILDING hand is furniture: the hand
+    // comes off the wire, and any other type resolves to an object the engine's
+    // bed/cage setters would treat as a UseableStuff.
+    RootObject* ro = (furnHand && furnHand[0] == (unsigned int)BUILDING)
+                         ? resolveObjectByHand(furnHand) : 0;
     __try {
         const int desired = on ? kind : 0;
         int cur = 0;

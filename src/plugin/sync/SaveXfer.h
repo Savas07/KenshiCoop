@@ -53,8 +53,10 @@ void listSaves(std::vector<SaveListEntry>& out, unsigned int maxOut);
 void setSaveRootForTest(const std::string& root);
 #endif
 
-// A received transfer name must resolve to exactly one folder directly under
-// the save root. Rejects: empty, "." / "..", any byte Windows forbids in a
+// A save name must resolve to exactly one folder directly under the save root.
+// Every name a peer sends (SAVE_REQ, LOAD_REQ, LOAD_NACK, LOAD_GO, SAVE_BEGIN)
+// and every folder this side fingerprints or streams goes through it.
+// Rejects: empty, "." / "..", any byte Windows forbids in a
 // file name (control bytes, < > : " / \ | ? *), a trailing '.' or ' ' (Windows
 // strips those, so two names would alias one folder) and our own "__incoming" /
 // "__old" suffixes (a transfer must never target another save's staging or
@@ -79,7 +81,8 @@ bool folderInventory(const std::string& folder, unsigned int* outFiles,
 // Protocol 32 (coordinated load): fingerprint of save 'name' - FNV-1a over
 // the sorted lower-cased relative paths + per-file content CRCs
 // (coop::folderFingerprintOf). Byte-identical folders agree cross-machine;
-// 0 = missing/unreadable folder (the LOAD_GO/NACK "unknown" sentinel).
+// 0 = missing/unreadable folder or an unsafe name (the LOAD_GO/NACK "unknown"
+// sentinel).
 // Reads every file once (a few MB save = a few ms; called on load edges
 // only, never per tick).
 u32 folderFingerprint(const std::string& name);
@@ -112,8 +115,9 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
 
 // Snapshot save 'name' and queue the BEGIN to the joins in targetMask (bit =
 // player id; the whole transfer goes only to them). Returns false when the
-// folder is missing/empty (nothing is queued). One transfer at a time; a
-// re-begin abandons the previous one (the join drops stale xferIds).
+// folder is missing/empty or the name fails saveNameSafe (nothing is queued).
+// One transfer at a time; a re-begin abandons the previous one (the join drops
+// stale xferIds).
 bool beginSend(NetLink& net, u32 localId, const std::string& name,
                u32 targetMask = PEER_MASK_ALL);
 bool sending();

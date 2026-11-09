@@ -3,7 +3,9 @@
   Zero-game fixture for two combat oracles.
   combat_order: a duelist the join re-keys into a fresh platoon when the fight
   starts is still judged, so a copy that fights under its new local hand PASSES
-  and one that does not FAILS.
+  and one that does not FAILS. A host NPC already brawling before the order is
+  not judged, a host fight too weak to compare SKIPS, and a copy fighting at half
+  its host's rate FAILS even above the old absolute 0.40.
   combat_snap_rate: a battler the host places during the settle window PASSES;
   a copy that keeps snapping inside the window FAILS, also when its snap counter
   restarted mid-window.
@@ -47,24 +49,30 @@ function Get-Gate { param([string]$Name)
 # ---- combat_order logs ----------------------------------------------------------
 # The host orders the duel at 20 s and its duelist 3,33 (container 10,100) fights
 # from then on. The join re-keys it at the order to local 1,77 in container 50,500
-# and logs it there until 36 s. $JoinFights: whether that copy fights.
-$WIRE = "3,33,1,10,100"; $LOCAL = "1,77,1,50,500"
+# and logs it there until 36 s. $HostPost / $JoinPost: how many of every 8
+# post-order samples are melee on each side. -Brawler adds host NPC 4,44, which
+# fights from the start and whose join copy mirrors that before and after.
+$WIRE = "3,33,1,10,100"; $LOCAL = "1,77,1,50,500"; $BRAWL = "4,44,1,10,100"
 function New-OrderPair {
-    param([string]$HostPath, [string]$JoinPath, [bool]$JoinFights)
+    param([string]$HostPath, [string]$JoinPath, [int]$HostPost = 8, [int]$JoinPost = 8,
+          [switch]$Brawler)
     $h = New-Object System.Collections.Generic.List[string]
     $j = New-Object System.Collections.Generic.List[string]
     for ($ms = 0; $ms -le 40000; $ms += 500) {
+        $i = [int]($ms / 500)
         if ($ms -eq 20000) { $h.Add(("[{0}] [HOST] INFO: SCENARIO COMBAT issued orders=2" -f (Stamp $ms))) }
-        $task = if ($ms -ge 20000) { 65024 } else { 65535 }
+        $task = if ($ms -ge 20000 -and ($i % 8) -lt $HostPost) { 65024 } else { 65535 }
         $h.Add(("[{0}] [HOST] INFO: SCENARIO MEMBER hand={1} pos=10.00,0.00,10.00 task={2}" -f (Stamp $ms), $WIRE, $task))
+        if ($Brawler) { $h.Add(("[{0}] [HOST] INFO: SCENARIO MEMBER hand={1} pos=12.00,0.00,10.00 task=65024" -f (Stamp $ms), $BRAWL)) }
         if ($ms -gt 36000) { continue }
         if ($ms -eq 20000) { $j.Add(("[{0}] [JOIN] INFO: [rekey] wire=3,33 local=1,77 localc=50,500" -f (Stamp $ms))) }
         if ($ms -lt 20000) {
             $j.Add(("[{0}] [JOIN] INFO: SCENARIO RECV hand={1} pos=10.00,0.00,10.00 task=65535" -f (Stamp $ms), $WIRE))
         } else {
-            $jt = if ($JoinFights) { 65024 } else { 65535 }
+            $jt = if (($i % 8) -lt $JoinPost) { 65024 } else { 65535 }
             $j.Add(("[{0}] [JOIN] INFO: SCENARIO RECV hand={1} pos=10.00,0.00,10.00 task={2}" -f (Stamp $ms), $LOCAL, $jt))
         }
+        if ($Brawler) { $j.Add(("[{0}] [JOIN] INFO: SCENARIO RECV hand={1} pos=12.00,0.00,10.00 task=65024" -f (Stamp $ms), $BRAWL)) }
     }
     $h | Set-Content -Path $HostPath -Encoding UTF8
     $j | Set-Content -Path $JoinPath -Encoding UTF8
@@ -91,7 +99,7 @@ try {
     # ---- 1. combat_order: re-keyed duelist fights under its local hand. ----
     Write-Host "== combat_order: duelist re-keyed at the order, copy fights (expect PASS) =="
     $h1 = Join-Path $tmp "host_fight.log"; $j1 = Join-Path $tmp "join_fight.log"
-    New-OrderPair -HostPath $h1 -JoinPath $j1 -JoinFights $true
+    New-OrderPair -HostPath $h1 -JoinPath $j1
     Reset-GateResults
     $null = Test-CombatOrder -HostFile $h1 -JoinFile $j1
     $g1 = Get-Gate 'combat_order'
@@ -101,14 +109,43 @@ try {
     # ---- 2. combat_order: re-keyed duelist stays at peace. ----
     Write-Host "== combat_order: duelist re-keyed at the order, copy never fights (expect FAIL) =="
     $h2 = Join-Path $tmp "host_peace.log"; $j2 = Join-Path $tmp "join_peace.log"
-    New-OrderPair -HostPath $h2 -JoinPath $j2 -JoinFights $false
+    New-OrderPair -HostPath $h2 -JoinPath $j2 -JoinPost 0
     Reset-GateResults
     $null = Test-CombatOrder -HostFile $h2 -JoinFile $j2
     $g2 = Get-Gate 'combat_order'
     Check "re-keyed peaceful copy FAILs" ($null -ne $g2 -and $g2.status -eq 'FAIL')
     Check "failure is the post-order ratio" ($null -ne $g2 -and $g2.metrics.postRatio -eq 0)
 
-    # ---- 3. combat_snap_rate: four placement snaps before settle, three in the window. ----
+    # ---- 3. combat_order: the bar's brawl was already running at the order. ----
+    Write-Host "== combat_order: a host NPC fights before the order too (expect PASS, brawler not judged) =="
+    $h6 = Join-Path $tmp "host_brawl.log"; $j6 = Join-Path $tmp "join_brawl.log"
+    New-OrderPair -HostPath $h6 -JoinPath $j6 -Brawler
+    Reset-GateResults
+    $null = Test-CombatOrder -HostFile $h6 -JoinFile $j6
+    $g6 = Get-Gate 'combat_order'
+    Check "mirrored pre-order brawl PASSes" ($null -ne $g6 -and $g6.status -eq 'PASS')
+    Check "the brawler is left out" ($null -ne $g6 -and $g6.metrics.brawlers -eq 1 -and $g6.metrics.duelists -eq 1)
+
+    # ---- 4. combat_order: the host's own fight is too weak to compare. ----
+    Write-Host "== combat_order: host melee in 1 of 8 samples (expect SKIP) =="
+    $h7 = Join-Path $tmp "host_weak.log"; $j7 = Join-Path $tmp "join_weak.log"
+    New-OrderPair -HostPath $h7 -JoinPath $j7 -HostPost 1 -JoinPost 0
+    Reset-GateResults
+    $null = Test-CombatOrder -HostFile $h7 -JoinFile $j7
+    $g7 = Get-Gate 'combat_order'
+    Check "weak host fight SKIPs" ($null -ne $g7 -and $g7.status -eq 'SKIP')
+
+    # ---- 5. combat_order: the copy fights half as much as its host. ----
+    Write-Host "== combat_order: host melee 8 of 8, join 4 of 8 (expect FAIL) =="
+    $h8 = Join-Path $tmp "host_half.log"; $j8 = Join-Path $tmp "join_half.log"
+    New-OrderPair -HostPath $h8 -JoinPath $j8 -JoinPost 4
+    Reset-GateResults
+    $null = Test-CombatOrder -HostFile $h8 -JoinFile $j8
+    $g8 = Get-Gate 'combat_order'
+    Check "half the host's fight FAILs" ($null -ne $g8 -and $g8.status -eq 'FAIL')
+    Check "join ratio is above the old absolute floor" ($null -ne $g8 -and $g8.metrics.postRatio -ge 0.40)
+
+    # ---- 6. combat_snap_rate: four placement snaps before settle, three in the window. ----
     Write-Host "== combat_snap_rate: spawn placement snaps n=1-4, then 3 in-window (expect PASS) =="
     $p3 = Join-Path $tmp "spawn.log"
     New-SnapLog -Path $p3 -Hand "5,1919" -Snaps @(
@@ -120,7 +157,7 @@ try {
     $g3 = Get-Gate 'combat_snap_rate'
     Check "persistence is the 3 in-window snaps" ($null -ne $g3 -and $g3.metrics.maxPersistPerHand -eq 3)
 
-    # ---- 4. combat_snap_rate: the copy keeps snapping inside the window. ----
+    # ---- 7. combat_snap_rate: the copy keeps snapping inside the window. ----
     Write-Host "== combat_snap_rate: 7 in-window snaps on one hand (expect FAIL) =="
     $p4 = Join-Path $tmp "persist.log"
     New-SnapLog -Path $p4 -Hand "3,3090" -Snaps @(
@@ -131,7 +168,7 @@ try {
     $g4 = Get-Gate 'combat_snap_rate'
     Check "failure names the 7 snaps" ($null -ne $g4 -and $g4.detail -match 'snapped 7x')
 
-    # ---- 5. combat_snap_rate: same 7 snaps, the copy re-acquired after the fourth. ----
+    # ---- 8. combat_snap_rate: same 7 snaps, the copy re-acquired after the fourth. ----
     Write-Host "== combat_snap_rate: 7 in-window snaps, counter restarted mid-window (expect FAIL) =="
     $p5 = Join-Path $tmp "reacquired.log"
     New-SnapLog -Path $p5 -Hand "1,2590" -Snaps @(

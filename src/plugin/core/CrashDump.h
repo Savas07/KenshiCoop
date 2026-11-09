@@ -26,6 +26,12 @@ namespace crashdump {
 // call is ignored.
 void install(const char* dir, const char* modeTag);
 
+// Faults on this one thread are expected and handled where they happen, so the
+// tracer stays silent for it: the hang watchdog (core/HangWatch.h) walks a
+// suspended thread's stack, and a report would take the log lock that thread
+// may hold. 0 clears it.
+void quietThread(unsigned long tid);
+
 } // namespace crashdump
 } // namespace coop
 

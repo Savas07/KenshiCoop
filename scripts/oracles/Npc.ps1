@@ -1387,6 +1387,89 @@ function Test-CagePeer {
                             enterLatMs = $m.EnterLatMs; hostZeroDwell = $m.HostZeroDwell } -Detail $detail)
 }
 
+# cage_peer_refuse: the host sim knocks out and cages its DRIVEN copy of the
+# join's leader while the join's own body stays up - the world_parity desync
+# where the host held such a copy caged 26-38 u off its owner until the owner
+# left. Gates:
+#   premise  - the host's put landed, it authored SEND PEER-ENTER for L1, and
+#              the join SKIPPED it with down=0: the refused path really ran.
+#   release  - the host logged "[furn] PEER-ENTER refused" for L1 and its HEAL
+#              EXIT ejected the copy (ok=1) within MaxReleaseMs of the put.
+#   owner    - the join's own L1 never read occupied.
+#   converge - the host copy's last TailSamples samples read in=0 and sit
+#              within PosTol of the join's own body (nearest join sample).
+function Test-CagePeerRefuse {
+    param([string]$HostFile, [string]$JoinFile, [int]$MaxReleaseMs = 25000,
+          [double]$PosTol = 5.0, [int]$TailSamples = 4, [int]$PairMs = 1000)
+    $mk = Select-String -Path $JoinFile -Pattern 'SCENARIO FURN L1 hand=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mk) {
+        Write-Host "  CAGE-PEER-REFUSE FAIL - L1 never latched on the join"
+        return (Add-GateResult -Name "cage_peer_refuse" -Status FAIL -Detail "no L1 latch")
+    }
+    $subj = ($mk.Matches[0].Groups[1].Value + ',' + $mk.Matches[0].Groups[2].Value)
+    $esc = [regex]::Escape($subj)
+    $bad = @(); $m = @{}
+
+    # 1. Premise.
+    $pk = Select-String -Path $HostFile -Pattern 'SCENARIO FURNACT host put hand=[\d,]+ kind=2 ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $pk) { $bad += "host put never landed (no ok=1 marker)" }
+    $authored = (Select-String -Path $HostFile -Pattern ('\[furn\] SEND PEER-ENTER id=\d+ occ=' + $esc) -Quiet)
+    if (-not $authored) { $bad += "host never authored SEND PEER-ENTER for L1 (copy not down at the put?)" }
+    $skipped = (Select-String -Path $JoinFile -Pattern ('\[furn\] RECV PEER-ENTER own occ=' + $esc + ' SKIP \(down=0') -Quiet)
+    if (-not $skipped) { $bad += "join never skipped the enter with down=0" }
+
+    if ($bad.Count -eq 0) {
+        # 2. Release.
+        $Tp = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO FURNACT host put '
+        $Tr = Get-MarkerTimeMs -File $HostFile -Pattern ('\[furn\] PEER-ENTER refused occ=' + $esc)
+        $Te = Get-MarkerTimeMs -File $HostFile -Pattern ('\[furn\] HEAL EXIT occ=' + $esc + ' kind=\d+ ok=1')
+        if ($null -eq $Tr) { $bad += "host never released the refused placement (held the copy caged)" }
+        if ($null -eq $Te) {
+            $bad += "host never ejected the copy (no HEAL EXIT ok=1)"
+        } else {
+            $m["ReleaseMs"] = [int]($Te - $Tp)
+            if ($m.ReleaseMs -gt $MaxReleaseMs) { $bad += "eject $($m.ReleaseMs)ms after the put > $MaxReleaseMs" }
+        }
+        # 3. The owner's body was never jailed.
+        $J = Get-FurnSeries -File $JoinFile -HandIS $subj
+        $H = Get-FurnSeries -File $HostFile -HandIS $subj
+        $jOcc = @($J | Where-Object { $_.in -ne 0 })
+        if ($jOcc.Count -gt 0) { $bad += "join's own L1 read occupied in $($jOcc.Count) sample(s)" }
+        # 4. Converge: the host copy's tail inside the join's series.
+        $jEnd = if ($J.Count -gt 0) { $J[$J.Count - 1].t } else { 0 }
+        $tail = @($H | Where-Object { $_.t -le $jEnd } | Select-Object -Last $TailSamples)
+        if ($tail.Count -lt $TailSamples) {
+            $bad += "only $($tail.Count) host sample(s) inside the join's series"
+        } else {
+            $occ = @($tail | Where-Object { $_.in -ne 0 })
+            if ($occ.Count -gt 0) {
+                $bad += "host copy still occupied (in=$($occ[0].in)) at t=$($occ[0].rawT)"
+            } else {
+                $worst = 0.0
+                foreach ($s in $tail) {
+                    $js = $null
+                    foreach ($c in $J) {
+                        if ([math]::Abs($c.t - $s.t) -gt $PairMs) { continue }
+                        if ($null -eq $js -or [math]::Abs($c.t - $s.t) -lt [math]::Abs($js.t - $s.t)) { $js = $c }
+                    }
+                    if ($null -eq $js) { continue }
+                    $gap = [math]::Sqrt([math]::Pow($s.x - $js.x, 2) + [math]::Pow($s.z - $js.z, 2))
+                    if ($gap -gt $worst) { $worst = $gap }
+                }
+                $m["TailGap"] = [math]::Round($worst, 1)
+                if ($worst -gt $PosTol) { $bad += "host copy ended $($m.TailGap) u from its owner (> $PosTol)" }
+            }
+        }
+    }
+
+    $v = if ($bad.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $bad -join "; "
+    Write-Host "  CAGE-PEER-REFUSE $v - authored=$authored skipped=$skipped releaseMs=$($m.ReleaseMs) tailGap=$($m.TailGap) $detail"
+    return (Add-GateResult -Name "cage_peer_refuse" -Status $v `
+                -Metrics @{ authored = $authored; skipped = $skipped
+                            releaseMs = $m.ReleaseMs; tailGap = $m.TailGap } -Detail $detail)
+}
+
 # sneak_probe (protocol 20 phase 0, host-side spike): the host forced
 # stealthMode on a DRIVEN copy near NPCs. Gates: the engine call landed
 # (SNEAKACT on ok=1), the mode read back 1 on the copy, and the copy's

@@ -1060,6 +1060,20 @@
             Tier = 'full'; WanVariant = $true
         }
 
+        # cage_peer_refuse: the same placement REFUSED by its owner - the host
+        # sim knocks out and cages its copy of the join's leader while the
+        # join's own body stays up (the world_parity jailed-PC desync: the
+        # host held the copy caged 26-38 u off its owner until the owner left).
+        # The host must stop holding once the owner's stream stays up, eject
+        # the copy and bring it back onto its owner.
+        cage_peer_refuse = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'cage_peer_refuse'
+            Gating   = @('cage_peer_refuse', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
+
         # sneak_probe: protocol-20 phase-0 spike (host-side, log-only). The host
         # forces stealthMode on its DRIVEN copy of the join's leader near the bar
         # NPCs and logs the copy's whoSeesMeSneaking series - proves the engine's

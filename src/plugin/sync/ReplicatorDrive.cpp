@@ -37,6 +37,36 @@ void Replicator::logHardSnap(Character* c, const EntityState& out, const char* k
     skipped = 0;
 }
 
+void Replicator::authorPeerEnter(GameWorld* gw, Driven& d, const EntityState& out,
+                                 const unsigned int furn[5], int kind,
+                                 float x, float z, unsigned long now) {
+    // N players under presence authority: several clients run world sims
+    // (streamNpcs_), so only ONE may author this edge - the authority of the
+    // cell our copy stands in. When that authority is the occupant's own author
+    // (its cell, where it cannot see the third-party action), the host stands
+    // in for it, or - for the host's own body - every other client may
+    // (duplicate ENTERs are idempotent on the receiver). With two players every
+    // case resolves to "author it".
+    if (cellAuth_ && d.author != AUTHOR_NONE) {
+        u32 cellOwner = authorityFor(gw, x, z);
+        bool may = cellOwner == localId_ ||
+            (cellOwner == d.author &&
+             (localId_ == (u32)CELL_OWNER_HOST || d.author == (u32)CELL_OWNER_HOST));
+        if (!may) return;
+    }
+    if (d.furnPeerTick != 0 && (now - d.furnPeerTick) < FURN_PEER_MS) return;
+    d.furnPeerTick = now;
+    PendFurnEnter pe;
+    pe.occ = keyOf(out);
+    for (int fi = 0; fi < 5; ++fi) pe.furn[fi] = furn[fi];
+    pe.kind = kind;
+    furnPeerPend_.push_back(pe);
+    char b[160]; _snprintf(b, sizeof(b) - 1,
+        "[furn] PEER-ENTER author occ=%u,%u furn=%u,%u kind=%d",
+        out.hIndex, out.hSerial, furn[3], furn[4], kind);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
 bool Replicator::ownsLocalBody(Character* c, unsigned int lh[5]) const {
     if (!c || !engine::readObjectHand(reinterpret_cast<RootObject*>(c), lh)) {
         memset(lh, 0, 5 * sizeof(unsigned int));
@@ -685,6 +715,31 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // throttle - and AI-suspend so the local sim cannot re-seat
                 // the copy before the next drive tick. The chained-state
                 // heal stays throttled below.
+                // A cage the local sim put a DOWN owner's chained body into is
+                // the protocol-36 third-party placement (a guard carrying its
+                // KO'd prisoner to a cage), not an unvouched re-seat: breaking
+                // it every tick only sent the guard back for it - world_parity
+                // runs 20261024_010654_s2 / _010657_s3: 51 and 32 CAGE-BREAK
+                // lines ~1 s apart, each cycle a host-authored pickup + drop on
+                // the owner's own body. Author the enter and hold, as the
+                // free-body branch below does; the owner applies it to its own
+                // down body and its stream then carries BODY_IN_CAGE. A
+                // conscious owner keeps the break (it authors its own body), and
+                // so does one that has not applied it within FURN_PEER_REFUSE_MS.
+                bool cagedDown = haveFr && localKind == 2 && streamNpcs_ && isSquad &&
+                                 (coop::bodyDownNotCrawling(out.bodyState) ||
+                                  d.koLatched || d.deathLatched);
+                if (!cagedDown) d.furnCageHoldTick = 0;
+                else if (d.furnCageHoldTick == 0) d.furnCageHoldTick = now;
+                if (cagedDown && (now - d.furnCageHoldTick) < FURN_PEER_REFUSE_MS) {
+                    authorPeerEnter(gw, d, out, lfr.furn, 2,
+                                    haveActual ? ax : out.x, haveActual ? az : out.z, now);
+                    d.furnNoSeeTick = 0;
+                    d.parked = false; d.haveDest = false;
+                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                    d.dbgRegime = DR_FURN;
+                    continue;
+                }
                 if (haveFr && (localKind == 1 || localKind == 2)) {
                     int brokeKind = localKind;
                     bool broke = engine::applyFurniture(gw, c, lfr.furn,
@@ -831,43 +886,39 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // crippled body reads Character::isDown() while conscious, so
                 // plain bodyIsDown would have us author bed-enters for someone
                 // who crawled past a bed under their own control.
-                bool downish = coop::bodyDownNotCrawling(out.bodyState) ||
-                               d.koLatched || d.deathLatched ||
+                bool ownerDown = coop::bodyDownNotCrawling(out.bodyState) ||
+                                 d.koLatched || d.deathLatched;
+                bool downish = ownerDown ||
                                coop::bodyDownNotCrawling(engine::readBodyState(c));
-                // N players under presence authority: several clients run world
-                // sims (streamNpcs_), so only ONE may author this edge - the
-                // authority of the cell our copy stands in. When that authority
-                // is the occupant's own author (its cell, where it cannot see the
-                // third-party action), the host stands in for it, or - for the
-                // host's own body - every other client may (duplicate ENTERs are
-                // idempotent on the receiver). With two players every case
-                // resolves to "author it", exactly as before.
-                bool mayAuthorEnter = true;
-                if (cellAuth_ && d.author != AUTHOR_NONE) {
-                    u32 cellOwner = authorityFor(gw, haveActual ? ax : out.x,
-                                                 haveActual ? az : out.z);
-                    mayAuthorEnter = cellOwner == localId_ ||
-                        (cellOwner == d.author &&
-                         (localId_ == (u32)CELL_OWNER_HOST ||
-                          d.author == (u32)CELL_OWNER_HOST));
+                // The local term covers the owner's KO still in flight, but the
+                // hold itself `continue`s past every posture apply, so a copy
+                // the host sim downed is never woken to match an upright owner:
+                // it stayed down, so held, until the owner LEFT (only
+                // sweepCarries' SWEEP EXIT released it; world_parity: the host's
+                // copy of a jailed join PC stood 26-38 u off its owner's body for
+                // over a minute). The owner applies a PEER-ENTER only to its own
+                // DOWN body, so FURN_PEER_REFUSE_MS of an up owner outside any
+                // furniture is its refusal: stop holding, and the debounced HEAL
+                // EXIT below ejects the copy for the drive to wake.
+                if (ownerDown) {
+                    d.furnPeerUpTick = 0;
+                } else if (d.furnPeerUpTick == 0) {
+                    d.furnPeerUpTick = now;
+                } else if (downish && (now - d.furnPeerUpTick) >= FURN_PEER_REFUSE_MS) {
+                    if (d.furnPeerTick != 0) {
+                        char b[160]; _snprintf(b, sizeof(b) - 1,
+                            "[furn] PEER-ENTER refused occ=%u,%u kind=%d up=%lums (owner not down) - releasing",
+                            out.hIndex, out.hSerial, localKind, now - d.furnPeerUpTick);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                        d.furnPeerTick = 0;
+                    }
+                    downish = false;
                 }
                 if (streamNpcs_ && isSquad && downish) {
                     // Not ours to author: another world authority is (or will
                     // be) sending it, so only HOLD the self-heal exit below.
-                    if (mayAuthorEnter &&
-                        (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS)) {
-                        d.furnPeerTick = now;
-                        PendFurnEnter pe;
-                        pe.occ = keyOf(out);
-                        for (int fi = 0; fi < 5; ++fi) pe.furn[fi] = lfr.furn[fi];
-                        pe.kind = localKind;
-                        furnPeerPend_.push_back(pe);
-                        char b[160]; _snprintf(b, sizeof(b) - 1,
-                            "[furn] PEER-ENTER author occ=%u,%u furn=%u,%u kind=%d",
-                            out.hIndex, out.hSerial, lfr.furn[3], lfr.furn[4],
-                            localKind);
-                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-                    }
+                    authorPeerEnter(gw, d, out, lfr.furn, localKind,
+                                    haveActual ? ax : out.x, haveActual ? az : out.z, now);
                     d.furnNoSeeTick = 0; // never self-heal-eject a host placement
                     d.parked = false; d.haveDest = false;
                     if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
@@ -892,6 +943,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 continue;
             } else {
                 d.furnNoSeeTick = 0;
+                d.furnPeerUpTick = 0;
             }
         }
         // ---- Crawl carve-out (protocol 53) -------------------------------------
@@ -1146,12 +1198,13 @@ void Replicator::applyTargets(GameWorld* gw) {
             // The host retargeted since our last order.
             bool tgtChanged = d.combatArmed &&
                 (d.combatTgtIdx != out.sIndex || d.combatTgtSer != out.sSerial);
-            // KENSHICOOP_DEBUG_COMBAT_COPY=1: 10 Hz trace of every SQUAD copy in the
-            // combat regime - its local fight read, sword state, which body it is
-            // locked on (1 = the owner's target, 2 = another body, 0 = none), its
-            // current task, and the three distances that tell a lost fight from a
-            // displaced one: copy->owner (dO), copy->target (dT), target->owner (tO).
-            if (isSquad && combatCopyDebug()) {
+            // KENSHICOOP_DEBUG_COMBAT_COPY=1: 10 Hz trace of every copy in the
+            // combat regime (squad and world NPC) - its local fight read, sword
+            // state, which body it is locked on (1 = the owner's target, 2 =
+            // another body, 0 = none), its current raw task key, and the three
+            // distances that tell a lost fight from a displaced one: copy->owner
+            // (dO), copy->target (dT), target->owner (tO).
+            if (combatCopyDebug()) {
                 static std::map<unsigned long long, unsigned long> s_traceMs;
                 unsigned long long tkey = ((unsigned long long)out.hIndex << 32) | out.hSerial;
                 unsigned long& last = s_traceMs[tkey];
@@ -1291,8 +1344,19 @@ void Replicator::applyTargets(GameWorld* gw) {
             // arming budget is spent (a copy that won't fight here), the walk band
             // keeps it tracking the owner's roaming brawl.
             // World-NPC copies keep the soft bands and converge while arming
-            // (combat_crowd: without it, medians hit 50+ u); their walkTo is a
-            // HIGH_PRIORITY destination, not a player order.
+            // (combat_crowd: without it, medians hit 50+ u). Inside the churn
+            // ceiling they are steered by the movement controller's HIGH_PRIORITY
+            // destination ALONE. walkTo also issues the player move order, and for
+            // an AI body that is a new current task (MOVE_ON_FREE_WILL) that
+            // replaced the attack it was arming: combat_order runs 20261023_224018
+            // / _224020_s2 / _224023_s3 put every such sample of a combat copy
+            // within 2 s after a drive walk, and the copy stood idle once the walk
+            // ended. Past the ceiling the fight is in the wrong place and the move
+            // order is what actually moves it: steering alone loses to the copy's
+            // own combat footwork (combat_battle runs 20261024_001959 /
+            // _002001_s2: 110 and 52 snaps of copies that kept fighting 20+ u off;
+            // steering there whenever the source stood still doubled the
+            // persistent snaps, runs 20261024_005408 / _005410_s2).
             if (haveActual) {
                 bool arming = !hostWaiting && !localFighting &&
                               d.combatOrders <= COMBAT_REISSUE_CAP;
@@ -1399,9 +1463,12 @@ void Replicator::applyTargets(GameWorld* gw) {
                         float cap = base * 2.5f;
                         if (cap < combatSlideMax_) cap = combatSlideMax_;
                         if (spd > cap) spd = cap;
-                        engine::walkTo(c, out.x, out.y, out.z, spd);
+                        if (isSquad || drift > combatSnapDist_)
+                            engine::walkTo(c, out.x, out.y, out.z, spd);
+                        else
+                            engine::steerTo(c, out.x, out.y, out.z, spd);
                         ++combatSoftWalk_;
-                        if (isSquad && combatCopyDebug()) {
+                        if (combatCopyDebug()) {
                             char b[160]; _snprintf(b, sizeof(b) - 1,
                                 "[combat] walk hand=%u,%u drift=%.1f spd=%.1f localFight=%d arming=%d",
                                 out.hIndex, out.hSerial, drift, spd, localFighting ? 1 : 0,
@@ -1722,7 +1789,11 @@ void Replicator::applyTargets(GameWorld* gw) {
             else if (!simPaused && vdt > 0 && (!isSquad || hostMoving))
                 d.velPeak *= std::pow(0.5f, (float)vdt / 1000.0f);
         }
-        if (haveNewest && vlen > NPC_MOVE_VEL) d.moveSeenMs = now;
+        if (haveNewest && vlen > NPC_MOVE_VEL) {
+            d.moveSeenMs = now;
+            float hl = std::sqrt(vx * vx + vz * vz);
+            if (hl > 0.01f) { d.stepDirX = vx / hl; d.stepDirZ = vz / hl; d.haveStepDir = true; }
+        }
         bool npcMoving = haveNewest && d.moveSeenMs != 0 &&
                          (now - d.moveSeenMs) <= moveHold;
         // This hold is what the idle march-in-place costs: while it runs the drive
@@ -1768,17 +1839,52 @@ void Replicator::applyTargets(GameWorld* gw) {
         // 3+3 npc_sync A/B march idleFrac failed 2/3 (0.0106 / 0.0202 vs base
         // <= 0.0083) and snap_rate 1/3, because walk-ordered animal copies stalled
         // 5 s and then snapped 200-400 u where the per-step park had kept them
-        // within a step.
+        // within a step. The bridge below keys on the OWNER instead: in npc_sync
+        // runs 20261024_021313 to _021318_s3, 98% of flips (309/315, 861/869,
+        // 351/356) came at 20 Hz cadence while the owner streamed cMoving=1 at
+        // walk speed (cSpeed ~15), and the still phase lasted 355-400 ms median
+        // (99% <= 1.5-1.9 s), so the 300 ms hold ended 55-100 ms short of the next
+        // step. An NPC's cMoving alone also flaps on fidgets and turns (see the
+        // unified-drive note below); those never translate, so the bridge also
+        // needs a translation within NPC_STEP_HOLD_MS. NPC_STEP_MAX_GAP bounds
+        // what sank the attempt above: a copy that is not following its walk
+        // order drops the bridge after a couple of steps and gets the per-step
+        // park back instead of stalling until the owner stops.
         // Mid-tier body = sparse stream cadence (the round-robin period).
         // Its drive shares the near-tier code below, but its counters/oracles
         // are tracked apart: the near-tier gates guard the validated 20 Hz
         // pipeline, the mid tier is judged by the anti-zombie oracle.
         bool midTier = !isSquad && segMs > 250;
         if (midTier) d.midSeenMs = now;
+        // Owner stepping: the stream stands still between steps of a walk its
+        // owner still reports. The engine updates a character it simulates
+        // coarsely in jumps, on the host (the staircase above) and on the join
+        // alike: KENSHICOOP_DEBUG_REGIME "lstep" traces of npc_sync (runs
+        // 20261024_025900 to _025905_s3) caught 1281-3477 walk-ordered copies per
+        // run standing still for a median 16-17 frames and then jumping 6-12 u
+        // in one frame, with no drive teleport. So during a still phase the host
+        // body is walking, not at rest.
+        bool ownerStepping = !isSquad && haveNewest && vlen <= NPC_MOVE_VEL &&
+            out.cMoving != 0 && out.cSpeed > NPC_STEP_MIN_SPEED &&
+            d.moveSeenMs != 0 && (now - d.moveSeenMs) <= NPC_STEP_HOLD_MS;
+        // Owner-paced: a near-tier copy holds its walk verdict through the still
+        // phase (the bridge) and walks on toward a lead along the last step at
+        // the owner's own speed instead of halting at the step end.
+        bool ownerPaced = ownerStepping && !midTier && d.haveStepDir &&
+            gapNewest <= NPC_STEP_MAX_GAP;
+        if (ownerPaced) npcMoving = true;
         if (!isSquad) {
             if (d.wasMoving && !npcMoving) {
                 if (midTier) ++restFlipMid_;
                 else         ++restFlipNpc_;
+                if (regimeDebug()) {
+                    char fb[200]; _snprintf(fb, sizeof(fb) - 1,
+                        "[regime] flip hand=%u,%u mid=%d cMoving=%d cSpeed=%.1f seg=%lu hold=%lu "
+                        "vlen=%.2f gap=%.1f",
+                        it->first.i, it->first.s, midTier ? 1 : 0, out.cMoving ? 1 : 0,
+                        out.cSpeed, segMs, moveHold, vlen, gapNewest);
+                    fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
+                }
             }
             d.wasMoving = npcMoving;
         }
@@ -2216,13 +2322,29 @@ void Replicator::applyTargets(GameWorld* gw) {
             // Lead only while the instantaneous velocity is meaningful: the
             // debounced classifier keeps the walk verdict through mid-walk
             // velocity dips (vlen ~ 0), where a lead projection would
-            // divide by zero - aim at the newest position instead.
-            if (vlen > 0.01f) {
-                float leadSec = LEAD_SECONDS;
-                float segSec  = (float)segMs / 1000.0f * 1.5f;
+            // divide by zero - aim at the newest position instead. An
+            // owner-paced still phase leads along the last step at the owner's
+            // speed instead, so the copy keeps walking until the next step.
+            float leadSec = LEAD_SECONDS;
+            {
+                float segSec = (float)segMs / 1000.0f * 1.5f;
                 if (segSec > leadSec) leadSec = segSec;
                 if (leadSec > 3.0f)   leadSec = 3.0f;
-                float lead = vlen * leadSec;
+            }
+            if (ownerPaced) {
+                float lead = out.cSpeed * multEff * leadSec;
+                tx += d.stepDirX * lead; tz += d.stepDirZ * lead;
+            } else if (vlen > 0.01f) {
+                // A stepped source's jump reads 300-3300 u/s on the newest pair
+                // for one sample, which projected the target 180-2000 u ahead
+                // for a frame (a path restart each way). An NPC leads at no
+                // more than NPC_LEAD_VEL_CAP x its owner's own speed.
+                float leadV = vlen;
+                if (!isSquad && out.cSpeed > 1.0f) {
+                    float cap = out.cSpeed * multEff * NPC_LEAD_VEL_CAP;
+                    if (leadV > cap) leadV = cap;
+                }
+                float lead = leadV * leadSec;
                 tx += vx / vlen * lead; ty += vy / vlen * lead; tz += vz / vlen * lead;
             }
             float moved = d.haveDest ? dist3(tx, ty, tz, d.dx, d.dy, d.dz)
@@ -2248,7 +2370,16 @@ void Replicator::applyTargets(GameWorld* gw) {
             // the 12 u/s fallback. Walk in at the owner's last running pace
             // (velPeak is frozen while the owner is halted).
             if (isSquad && !hostMoving && d.velPeak > base) base = d.velPeak;
-            float wantSpd = out.cSpeed + gapNewest * catchupK_;
+            // Owner-paced: catch up on the distance still BEHIND the step end
+            // along the direction of travel. gapNewest grows again once the copy
+            // walks past it toward the lead, which would rush it onto the lead
+            // point and leave it standing there.
+            float catchGap = gapNewest;
+            if (ownerPaced && haveActual) {
+                float along = (newest.x - ax) * d.stepDirX + (newest.z - az) * d.stepDirZ;
+                catchGap = (along > 0.0f) ? along : 0.0f;
+            }
+            float wantSpd = out.cSpeed + catchGap * catchupK_;
             if (wantSpd > base * 2.5f) wantSpd = base * 2.5f;
             unsigned long ddt = (d.driveMs != 0) ? (now - d.driveMs) : 0;
             d.driveMs = now;
@@ -2510,6 +2641,13 @@ void Replicator::applyTargets(GameWorld* gw) {
                 if (engine::readMotion(c, &m, &sp) && m && sp > 0.1f)
                     ++walkTruthFrames_;
             }
+        } else if (oracleNear && !oracleActive && haveActual && d.haveActual && ownerStepping) {
+            // Not at rest: the owner is walking a stepped stream (see
+            // ownerStepping). A copy its own engine updates in jumps stands
+            // still between them with its walk state set, which this oracle used
+            // to score as marching in place - 2.6x more holdStop once the bridge
+            // kept such copies walking. Counted, not scored.
+            ++marchStepSkip_;
         } else if (oracleNear && !oracleActive && haveActual && d.haveActual) {
             // Host is AT REST. Is the driven body marching in place? (walk clip
             // playing while the body does not translate). This is the bug the
@@ -2533,11 +2671,40 @@ void Replicator::applyTargets(GameWorld* gw) {
                     ++marchHold_;
                     if (d.moveSeenMs != 0 &&
                         (now - d.moveSeenMs) <= MARCH_DIP_MS) ++marchHoldDip_;
-                    else ++marchHoldStop_;
+                    else {
+                        ++marchHoldStop_;
+                        if (regimeDebug()) {
+                            char hb[200]; _snprintf(hb, sizeof(hb) - 1,
+                                "[regime] holdStop hand=%u,%u paced=%d halted=%d dest=%d "
+                                "toDest=%.1f gap=%.1f since=%lu cMoving=%d cSpeed=%.1f",
+                                it->first.i, it->first.s, ownerPaced ? 1 : 0,
+                                d.walkHalted ? 1 : 0, d.haveDest ? 1 : 0,
+                                d.haveDest ? dist3(ax, ay, az, d.dx, d.dy, d.dz) : -1.0f,
+                                gapNewest, now - d.moveSeenMs, out.cMoving ? 1 : 0,
+                                out.cSpeed);
+                            hb[sizeof(hb) - 1] = '\0'; coop::logLine(hb);
+                        }
+                    }
                 }
                 else if (d.restEnterMs != 0 &&
                          (now - d.restEnterMs) <= MARCH_SETTLE_MS) ++marchSettle_;
                 else ++marchRelapse_;
+            }
+        }
+        if (regimeDebug() && !isSquad && haveActual && d.haveActual) {
+            float st = dist3(ax, ay, az, d.lx, d.ly, d.lz);
+            bool walkOrd = genuinelyMoving && d.haveDest && !d.walkHalted;
+            if (walkOrd && st < TRANSLATE_EPS) {
+                ++d.dbgStillF;
+            } else {
+                if (walkOrd && d.dbgStillF >= 4 && st >= 0.5f) {
+                    char lb[160]; _snprintf(lb, sizeof(lb) - 1,
+                        "[regime] lstep hand=%u,%u still=%u jump=%.2f paced=%d gap=%.1f",
+                        it->first.i, it->first.s, d.dbgStillF, st, ownerPaced ? 1 : 0,
+                        gapNewest);
+                    lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+                }
+                d.dbgStillF = 0;
             }
         }
         if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }

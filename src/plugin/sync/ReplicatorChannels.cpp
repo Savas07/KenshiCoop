@@ -12,6 +12,8 @@
 
 #include "ReplicatorUtil.h"
 
+#include <limits.h>
+
 namespace coop {
 
 // Quantized fingerprint of a medical snapshot (FNV-1a over rounded fields):
@@ -688,7 +690,11 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
                 if (!engine::readPlayerWallet(gw, &cur) || cur < 0) return;
                 poolTotal_ = cur; poolSeen_ = cur;
             }
-            int want = poolTotal_ + p.delta;
+            // 64-bit sum, capped: a peer's delta is untrusted, and INT_MAX +
+            // delta is signed overflow (it wrapped the pool negative).
+            const __int64 sum = (__int64)poolTotal_ + (__int64)p.delta;
+            int want = (sum > (__int64)INT_MAX) ? INT_MAX
+                     : (sum < (__int64)INT_MIN) ? INT_MIN : (int)sum;
             if (want < 0) {
                 char b[128];
                 _snprintf(b, sizeof(b) - 1,
@@ -746,11 +752,11 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
     while (!poolPending_.empty() && poolPending_.front().seq <= p.ackSeq)
         poolPending_.pop_front();
     poolAcked_ = p.ackSeq;
-    int want = p.money;
+    __int64 sum = p.money;
     for (std::deque<PoolDelta>::iterator it = poolPending_.begin();
          it != poolPending_.end(); ++it)
-        want += it->delta;
-    if (want < 0) want = 0;
+        sum += it->delta;
+    int want = (sum < 0) ? 0 : (sum > (__int64)INT_MAX) ? INT_MAX : (int)sum;
     int cur = -1;
     if (!engine::readPlayerWallet(gw, &cur)) return;
     if (cur == want) { poolSeen_ = cur; return; } // already converged

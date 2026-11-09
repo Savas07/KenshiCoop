@@ -1095,6 +1095,14 @@ private:
         // Third-party placement (protocol 36): last time the host authored a
         // PEER-ENTER for this peer-owned driven body (re-author throttle).
         unsigned long furnPeerTick;
+        // First tick of the current hold at which the owner's stream reported
+        // its body up (not down, no KO/death latch) - FURN_PEER_REFUSE_MS of
+        // that is the owner refusing the placement. 0 = not up / not holding.
+        unsigned long furnPeerUpTick;
+        // First tick of the current hold of a CHAINED owner's body the local
+        // sim caged (the PEER-ENTER kind 2 below the stream=3 branch). 0 = not
+        // holding; FURN_PEER_REFUSE_MS of it unapplied falls back to the break.
+        unsigned long furnCageHoldTick;
         // Chained/pole prisoner (protocol 41): the OWNER hand last seen for this
         // body while it was locally chained, so a lost/late reliable ENTER (or
         // an AI break-out) can be self-healed by re-applying setChainedMode -
@@ -1122,6 +1130,12 @@ private:
         // showed genuine translation; the walking verdict holds for a fixed
         // time after it so mid-walk velocity dips can't flap the classifier.
         unsigned long moveSeenMs;
+        // Horizontal unit direction of the last stream translation, so a
+        // stepped source's still phase can be walked through along it (the
+        // owner-paced lead in applyTargets). haveStepDir = set at least once.
+        float        stepDirX, stepDirZ;
+        bool         haveStepDir;
+        unsigned int dbgStillF; // KENSHICOOP_DEBUG_REGIME: walk-ordered frames without translation
         // The classifier's previous verdict, so genuine walk->rest
         // transitions can be counted (restFlipNpc_) as a flap-rate signal.
         bool         wasMoving;
@@ -1189,10 +1203,12 @@ private:
                    dbgRegime(0), dbgMs(0), dbgGap(0), dbgVlen(0), dbgNx(0), dbgNy(0), dbgNz(0),
                    dbgHaveNewest(false), dbgLoggedRegime(-1),
                    carryNoSeeTick(0),
-                   furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
+                   furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0), furnPeerUpTick(0),
+                   furnCageHoldTick(0),
                    haveChainOwner(false), chainHealTick(0),
                    sneakTick(0), proneTick(0), crawlDrive(false),
-                   velPeak(0.0f), moveSeenMs(0), wasMoving(false),
+                   velPeak(0.0f), moveSeenMs(0), stepDirX(0.0f), stepDirZ(0.0f),
+                   haveStepDir(false), dbgStillF(0), wasMoving(false),
                    restEnterMs(0), walkBranchPrev(false),
                    zeroF(0), activeF(0), advMs(0),
                    oracleActivePrev(false), oracleOnsetMs(0),
@@ -2311,6 +2327,9 @@ private:
     //          the visible idle jitter.
     unsigned long marchHoldDip_;
     unsigned long marchHoldStop_;
+    // At-rest-by-velocity frames NOT scored, because the owner reports a walk
+    // whose stream is between steps (ownerStepping in applyTargets).
+    unsigned long marchStepSkip_;
 
     // AI-gating spike: how often does a driven NPC's LOCAL task match the host's
     // streamed rawTask? High agreement => we can gate the local AI (freeze when it
@@ -3102,6 +3121,13 @@ private:
     // Recompute claimedCells_ from claimSlots_. The lowest player id wins a
     // contested cell; then the co-location collapse is applied.
     void rebuildClaimedCells();
+    // Third-party placement (protocol 36): queue a PEER-ENTER for a peer-owned
+    // driven body a local-sim actor put into furniture `furn` of `kind`, at most
+    // every FURN_PEER_MS, when this client may author it (the authority of the
+    // cell the copy stands in - see the call site). publishOwned sends it.
+    void authorPeerEnter(GameWorld* gw, Driven& d, const EntityState& out,
+                         const unsigned int furn[5], int kind,
+                         float x, float z, unsigned long now);
     // Are squads standing together? Fills collapseTo_ (player -> the lowest id
     // it collapses onto) and returns the TOTAL verdict (every claiming player
     // collapses onto the host). Player o collapses onto the lowest m < o such

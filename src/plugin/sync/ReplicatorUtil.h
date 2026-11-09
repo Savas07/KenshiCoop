@@ -116,6 +116,18 @@ const unsigned long ONSET_EARLY_MS  = 100;
 const unsigned long ONSET_SETTLE_MS = 300;
 const float NPC_MOVE_VEL = 0.75f; // NPC est. velocity (u/s) above which it is "walking"
                                   // (vs a fidget/turn in place -> treat as at rest)
+// Stepped-source bridge (see the walk-hold note in applyTargets): a near-tier
+// NPC keeps its walk verdict through a still phase of its stream while the
+// owner itself reports walking, within these bounds.
+const float NPC_STEP_MIN_SPEED = 2.0f;        // owner cSpeed (u/s) that counts as walking
+const unsigned long NPC_STEP_HOLD_MS = 1500;  // longest still phase bridged
+const float NPC_STEP_MAX_GAP = 80.0f;         // copy-to-source gap past which the bridge
+                                              // drops and the rest-branch park corrects.
+                                              // npc_sync, 6 runs each: 40 u left 79-109
+                                              // flips/min in 3 runs (copies trailing
+                                              // 50-73 u); 80 u: 30-49/min in all 6, all
+                                              // snaps 168 vs 176 unbridged, >200 u 16 vs 24.
+const float NPC_LEAD_VEL_CAP = 2.0f;          // NPC walk lead speed, x the owner's cSpeed
 const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking a pose
 const float TASK_DRIFT_MAX = 4.0f;         // committed pose drift beyond which we park
 const unsigned long TASK_RETRY_MS = 1500;  // throttle between pose apply attempts
@@ -233,6 +245,10 @@ const unsigned long FURN_EXIT_MS = 3000;  // stream must stop reporting occupanc
                                           // this long before the local copy exits
 const unsigned long FURN_PEER_MS = 5000;  // third-party PEER-ENTER re-author gap
                                           // (protocol 36: guard jails a peer PC)
+const unsigned long FURN_PEER_REFUSE_MS = 10000; // owner's stream up and out of
+                                          // furniture this long while we hold a
+                                          // PEER placement = the owner refused it
+                                          // (its body is not down): release
 const float FURN_MATCH_DIST = 6.0f;       // self-heal fixture search radius around
                                           // the streamed occupant position
 // Stealth sync (protocol 20). The posture is CONTINUOUS state (a pure bool in

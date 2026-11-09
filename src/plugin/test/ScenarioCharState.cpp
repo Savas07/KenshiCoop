@@ -1,8 +1,9 @@
 // ScenarioCharState.cpp - carry/furniture/stealth/speed scenarios (monolith
 // split from Scenario.cpp, 2026-07-12): carry_order, npc_carry, bed_pose,
-// bed_put, cage_put, chain_put, cage_peer_sync, sneak_probe, sneak_pose, sneak_detect,
-// speed_sync, speed_probe. Classes are TU-private (anonymous namespace);
-// only makeCharStateScenario (ScenarioSupport.h) is exported.
+// bed_put, cage_put, chain_put, cage_peer_sync, cage_peer_refuse, sneak_probe,
+// sneak_pose, sneak_detect, speed_sync, speed_probe. Classes are TU-private
+// (anonymous namespace); only makeCharStateScenario (ScenarioSupport.h) is
+// exported.
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
 #include "ScenarioSupport.h"
@@ -1453,19 +1454,29 @@ private:
 //   t=44s  JOIN exits its OWN body (owner-authored exit, the symmetric path).
 // Both sides log the 2 Hz "SCENARIO FURN hand=..." occupancy series for L1;
 // Test-CagePeer gates author/apply/occupancy/no-eject/exit-clean.
+//
+// cage_peer_refuse: the same placement REFUSED by the owner - the world_parity
+// desync where the host sim KO'd and jailed its copy of a join PC whose own
+// body was never down. The join leaves L1 up; the HOST knocks its driven copy
+// out from t=10s (re-topped every 2 s - the host sim's KO, which the hold's
+// skipped posture apply never wakes) and cages it at t=14s. The join skips the
+// PEER-ENTER (down=0), so the host must stop holding after FURN_PEER_REFUSE_MS,
+// eject the copy, and - once the scenario stops re-topping the KO at the eject
+// - wake it back onto its owner. Test-CagePeerRefuse gates it.
 class CagePeerScenario : public TimedScenario {
 public:
-    CagePeerScenario()
-        : TimedScenario("cage_peer_sync", 0), recvCount_(0), lastLogMs_(0), haveL1_(false),
+    explicit CagePeerScenario(bool refuse)
+        : TimedScenario(refuse ? "cage_peer_refuse" : "cage_peer_sync", 0), refuse_(refuse),
+          recvCount_(0), lastLogMs_(0), haveL1_(false),
           lastHoldMs_(0), downDone_(false), putDone_(false), outDone_(false),
-          putOk_(false), lastPutMs_(0) {}
+          putOk_(false), lastPutMs_(0), hostDownDone_(false), released_(false) {}
 
     virtual void onStart(const ScenarioContext&) {}
 
     virtual bool onTick(const ScenarioContext& ctx) {
         if (!haveL1_) latchL1(ctx);
 
-        if (!ctx.isHost && haveL1_) {
+        if (!ctx.isHost && haveL1_ && !refuse_) {
             // Owner-side KO + hold (the join owns L1).
             if (!downDone_ && ctx.elapsedMs >= DOWN_AT_MS) {
                 bool ok = engine::orderDownSubject(ctx.gw, l1Hand_);
@@ -1494,6 +1505,7 @@ public:
             putOk_ = engine::putSubjectInFurniture(ctx.gw, l1Hand_, KIND, true);
             if (!putDone_) { logAct("host put", putOk_); putDone_ = true; }
         }
+        if (refuse_ && ctx.isHost && haveL1_) tickHostKo(ctx);
 
         if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
             lastLogMs_ = ctx.elapsedMs;
@@ -1514,7 +1526,8 @@ public:
         unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
         if (ctx.elapsedMs >= dur) {
             passed_ = ctx.isHost ? (putDone_ && putOk_)
-                                 : (downDone_ && outDone_ && recvCount_ >= 1);
+                                 : (refuse_ ? recvCount_ >= 1
+                                            : (downDone_ && outDone_ && recvCount_ >= 1));
             return true;
         }
         return false;
@@ -1523,12 +1536,39 @@ public:
 private:
     static const int           KIND = 2; // cage (setPrisonMode)
     static const unsigned long DOWN_AT_MS      = 8000;
+    static const unsigned long HOST_KO_AT_MS   = 10000;
     static const unsigned long PUT_AT_MS       = 14000;
     static const unsigned long HOLD_UNTIL_MS   = 42000;
     static const unsigned long OUT_AT_MS       = 44000;
     static const unsigned long JOIN_DURATION_MS = 56000;
     static const unsigned long HOST_DURATION_MS = 62000;
     static const unsigned int  MAX_SQUAD        = 32;
+
+    // refuse mode: the host sim's KO on its driven copy, re-topped every 2 s
+    // until the copy is out of the cage again after the put landed.
+    void tickHostKo(const ScenarioContext& ctx) {
+        if (released_ || ctx.elapsedMs < HOST_KO_AT_MS) return;
+        Character* c = engine::resolveCharByHand(
+            l1Hand_[3], l1Hand_[4], l1Hand_[0], l1Hand_[1], l1Hand_[2]);
+        if (!c) return;
+        if (putOk_) {
+            engine::FurnitureRead fr;
+            if (engine::readFurniture(c, &fr) && fr.valid && fr.kind == 0 &&
+                ctx.elapsedMs - lastPutMs_ >= 3000) {
+                released_ = true;
+                logAct("host released", true);
+                return;
+            }
+        }
+        if (!hostDownDone_) {
+            logAct("host down", engine::knockDown(c, true));
+            hostDownDone_ = true;
+            lastHoldMs_ = ctx.elapsedMs;
+        } else if (ctx.elapsedMs - lastHoldMs_ >= 2000) {
+            lastHoldMs_ = ctx.elapsedMs;
+            engine::holdDown(c);
+        }
+    }
 
     void latchL1(const ScenarioContext& ctx) {
         EntityState sq[MAX_SQUAD];
@@ -1568,6 +1608,7 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
+    bool          refuse_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveL1_;
@@ -1575,6 +1616,7 @@ private:
     bool          downDone_, putDone_, outDone_;
     bool          putOk_;
     unsigned long lastPutMs_;
+    bool          hostDownDone_, released_;
     unsigned int  l1Hand_[5];
 };
 
@@ -2725,7 +2767,8 @@ Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "cage_put")     return new FurnPutScenario(2);
     if (name == "chain_put")    return new FurnPutScenario(3);
     if (name == "pole_put")     return new FurnPutScenario(4);
-    if (name == "cage_peer_sync") return new CagePeerScenario();
+    if (name == "cage_peer_sync") return new CagePeerScenario(false);
+    if (name == "cage_peer_refuse") return new CagePeerScenario(true);
     if (name == "sneak_probe")  return new SneakProbeScenario();
     if (name == "sneak_pose")   return new SneakPoseScenario();
     if (name == "sneak_detect") return new SneakDetectScenario();

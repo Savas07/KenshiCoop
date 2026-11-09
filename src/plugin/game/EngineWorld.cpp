@@ -52,6 +52,16 @@ Character* traderOf(ShopTrader* st) {
     if (!t && g_shopGetTraderFn) t = g_shopGetTraderFn(st);
     return t;
 }
+
+// The only way a hand reaches a Building cast. Hands arrive from peers (door,
+// deed, machine, build, container rows), and the native resolver dispatches on
+// hand.type, so a CHARACTER or ITEM hand comes back as that object - its
+// classType / imADoor / UseableStuff offsets are unrelated memory, and the
+// writers below would call building methods on it.
+RootObject* buildingByHand(const unsigned int h[5]) {
+    if (!h || h[0] != (unsigned int)BUILDING) return 0;
+    return resolveObjectByHand(h);
+}
 } // namespace
 
 unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut,
@@ -465,7 +475,7 @@ unsigned int enumDoorsNear(GameWorld* gw, float radius, DoorRead* out, unsigned 
 
 bool readDoorByHand(const unsigned int dHand[5], DoorRead* out) {
     if (!dHand || !out) return false;
-    RootObject* ro = resolveObjectByHand(dHand);
+    RootObject* ro = buildingByHand(dHand);
     if (!ro) return false;
     __try {
         Building* b = static_cast<Building*>(ro);
@@ -479,7 +489,7 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
                      DoorRead* outAfter) {
     if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
     if (!dHand || !g_doorOpenFn || !g_doorCloseFn) return false;
-    RootObject* ro = resolveObjectByHand(dHand);
+    RootObject* ro = buildingByHand(dHand);
     if (!ro) return false;
     __try {
         Building* b = static_cast<Building*>(ro);
@@ -634,7 +644,7 @@ unsigned int enumBuildingsNear(GameWorld* gw, float radius, DeedRead* out,
 
 bool readDeedByHand(GameWorld* gw, const unsigned int bHand[5], DeedRead* out) {
     if (!gw || !bHand || !out) return false;
-    RootObject* ro = resolveObjectByHand(bHand);
+    RootObject* ro = buildingByHand(bHand);
     if (!ro) return false;
     __try {
         Building* b = static_cast<Building*>(ro);
@@ -648,7 +658,7 @@ bool writeDeedByHand(GameWorld* gw, const unsigned int bHand[5], int wantOwned,
                      const char* ownerSid, DeedRead* outAfter) {
     if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
     if (!gw || !bHand || !g_ownAddObjFn || !g_ownRemObjFn) return false;
-    RootObject* ro = resolveObjectByHand(bHand);
+    RootObject* ro = buildingByHand(bHand);
     if (!ro) return false;
     __try {
         Building* b = static_cast<Building*>(ro);
@@ -719,7 +729,7 @@ bool auditDeed(GameWorld* gw, const unsigned int bHand[5], DeedAudit* out) {
     out->curOwn = out->curHome = -1;
     out->townPlayer = out->townLevel = -1;
     if (!gw || !bHand) return false;
-    RootObject* ro = resolveObjectByHand(bHand);
+    RootObject* ro = buildingByHand(bHand);
     if (!ro) return false;
     __try {
         Building* b = static_cast<Building*>(ro);
@@ -882,7 +892,7 @@ unsigned int enumSitesNear(GameWorld* gw, float radius, BuildRead* out, unsigned
 
 bool readBuildingByHand(const unsigned int bHand[5], BuildRead* out) {
     if (!bHand || !out) return false;
-    RootObject* ro = resolveObjectByHand(bHand);
+    RootObject* ro = buildingByHand(bHand);
     if (!ro) return false;
     __try {
         fillBuildRead(static_cast<Building*>(ro), out);
@@ -894,7 +904,7 @@ bool writeBuildProgressByHand(const unsigned int bHand[5], float progress,
                               bool markComplete, BuildRead* outAfter) {
     if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
     if (!bHand || !g_buildSetProgFn) return false;
-    RootObject* ro = resolveObjectByHand(bHand);
+    RootObject* ro = buildingByHand(bHand);
     if (!ro) return false;
     __try {
         Building* b = static_cast<Building*>(ro);
@@ -1091,7 +1101,7 @@ int probePlaceBuilding(GameWorld* gw, float fwd, float side, bool wantDoor,
 bool readDoorOfBuilding(const unsigned int bHand[5], unsigned int doorIndex,
                         DoorRead* out) {
     if (!bHand || !out) return false;
-    RootObject* ro = resolveObjectByHand(bHand);
+    RootObject* ro = buildingByHand(bHand);
     if (!ro) return false;
     __try {
         Building* b = static_cast<Building*>(ro);
@@ -1105,7 +1115,7 @@ bool readDoorOfBuilding(const unsigned int bHand[5], unsigned int doorIndex,
 
 bool destroyBuildingByHand(GameWorld* gw, const unsigned int bHand[5]) {
     if (!gw || !bHand || !g_destroyObjFn) return false;
-    RootObject* ro = resolveObjectByHand(bHand);
+    RootObject* ro = buildingByHand(bHand);
     if (!ro) return false;
     __try {
         return g_destroyObjFn(gw, ro, /*justUnloaded*/false, "coop-build-remove");
@@ -1252,7 +1262,7 @@ unsigned int enumMachinesNear(GameWorld* gw, float radius, ProdRead* out,
 
 bool readMachineByHand(const unsigned int mHand[5], ProdRead* out) {
     if (!mHand || !out) return false;
-    RootObject* ro = resolveObjectByHand(mHand);
+    RootObject* ro = buildingByHand(mHand);
     if (!ro) return false;
     __try {
         Building* b = static_cast<Building*>(ro);
@@ -1268,7 +1278,7 @@ bool writeMachineByHand(const unsigned int mHand[5], int wantPower,
                         ProdRead* outAfter) {
     if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
     if (!mHand) return false;
-    RootObject* ro = resolveObjectByHand(mHand);
+    RootObject* ro = buildingByHand(mHand);
     if (!ro) return false;
     __try {
         Building* b = static_cast<Building*>(ro);
@@ -1329,7 +1339,7 @@ bool writeMachineByHand(const unsigned int mHand[5], int wantPower,
 
 bool operateMachineByHand(GameWorld* gw, const unsigned int mHand[5], float amount) {
     if (!gw || !mHand) return false;
-    RootObject* ro = resolveObjectByHand(mHand);
+    RootObject* ro = buildingByHand(mHand);
     if (!ro) return false;
     __try {
         if (!gw->player || gw->player->playerCharacters.size() == 0) return false;
@@ -1452,7 +1462,7 @@ static GameData* findProdTemplate(GameWorld* gw, int kind, int skip) {
 
 // SEH-guarded: the live Building's classType at the hand, or -1.
 static int readBuildingClassByHand(const unsigned int h[5]) {
-    RootObject* ro = resolveObjectByHand(h);
+    RootObject* ro = buildingByHand(h);
     if (!ro) return -1;
     __try {
         return (int)static_cast<Building*>(ro)->classType;
@@ -1703,7 +1713,7 @@ unsigned int enumNpcBodiesNear(GameWorld* gw, float radius, CorpseRead* out,
 
 bool readContainerByHand(const unsigned int cHand[5], ContRead* out) {
     if (!cHand || !out) return false;
-    RootObject* ro = resolveObjectByHand(cHand);
+    RootObject* ro = buildingByHand(cHand);
     if (!ro) return false;
     __try {
         Building* b = static_cast<Building*>(ro);
@@ -1715,7 +1725,7 @@ bool readContainerByHand(const unsigned int cHand[5], ContRead* out) {
 
 bool readShopCounterOwner(const unsigned int cHand[5], unsigned int owner[5]) {
     if (!cHand || !owner) return false;
-    RootObject* ro = resolveObjectByHand(cHand);
+    RootObject* ro = buildingByHand(cHand);
     if (!ro) return false;
     __try {
         int fn = 0;
@@ -2108,9 +2118,11 @@ ShopTrader* shopOfTrader(GameWorld* gw, Character* c, Inventory** outInv) {
 ShopTrader* shopByTraderHand(GameWorld* gw, const unsigned int traderHand[5],
                              Character** outChar, Inventory** outInv) {
     *outInv = 0;
-    RootObject* ro = resolveObjectByHand(traderHand);
-    if (!ro) return 0;
-    Character* c = static_cast<Character*>(ro);
+    // Resolved as a CHARACTER (a peer supplies this hand): any other object
+    // type must never be read as one.
+    Character* c = resolveCharByHand(traderHand[3], traderHand[4], traderHand[0],
+                                     traderHand[1], traderHand[2]);
+    if (!c) return 0;
     if (outChar) *outChar = c;
     return shopOfTrader(gw, c, outInv);
 }

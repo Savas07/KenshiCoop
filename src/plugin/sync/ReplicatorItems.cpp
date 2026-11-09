@@ -2709,6 +2709,10 @@ bool Replicator::applyTradeTable(GameWorld* gw, const Key& k, const char* why) {
     int n = engine::captureTraderStock(gw, th, cur, INV_ITEMS_MAX, &money, &trunc);
     if (n < 0) return false;
     std::vector<InvItemEntry> target(cur, cur + n);
+    // A line's count comes off the wire (u16): one entry per unit for every
+    // line could ask for 255 x 65535 entries. No real shop is near this; past
+    // it the table is refused rather than built.
+    const size_t TRADE_APPLY_ENTRIES_MAX = 4096;
     for (std::map<std::string, InvItemEntry>::const_iterator it = t.lines.begin();
          it != t.lines.end(); ++it) {
         // Replace every entry of the line with its table count. A line already
@@ -2727,7 +2731,20 @@ bool Replicator::applyTradeTable(GameWorld* gw, const Key& k, const char* why) {
         InvItemEntry e = it->second;
         if (count <= 0) continue;
         if (stacked) { e.quantity = (u16)count; target.push_back(e); }
-        else { e.quantity = 1; for (int u = 0; u < count; ++u) target.push_back(e); }
+        else {
+            e.quantity = 1;
+            for (int u = 0; u < count && target.size() <= TRADE_APPLY_ENTRIES_MAX; ++u)
+                target.push_back(e);
+        }
+        if (target.size() > TRADE_APPLY_ENTRIES_MAX) {
+            char ob[200];
+            _snprintf(ob, sizeof(ob) - 1,
+                      "[trade] APPLY refused trader=%u,%u,%u,%u,%u: table expands past %u entries",
+                      k.t, k.c, k.cs, k.i, k.s, (unsigned int)TRADE_APPLY_ENTRIES_MAX);
+            ob[sizeof(ob) - 1] = '\0'; coop::logLine(ob);
+            t.applied = false;
+            return false;
+        }
     }
     int r = engine::applyTraderStock(gw, th, target.empty() ? 0 : &target[0],
                                      (unsigned int)target.size(), trunc, t.money);
@@ -2803,7 +2820,15 @@ void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me,
             // Merge (host: the releaser's lines win) / adopt (join: the host's
             // merged table) - absolute counts, so re-applying is harmless.
             TradeTable& t = tradeTable_[k];
-            for (size_t i = 0; i < tail.size(); ++i) t.lines[tradeLineKey(tail[i])] = tail[i];
+            // New lines are capped (a merged shop table is a few hundred at
+            // most); a stream of fresh keys must not grow the table forever.
+            const size_t TRADE_TABLE_LINES_MAX = 1024;
+            for (size_t i = 0; i < tail.size(); ++i) {
+                const std::string lk = tradeLineKey(tail[i]);
+                if (t.lines.size() >= TRADE_TABLE_LINES_MAX && t.lines.find(lk) == t.lines.end())
+                    continue;
+                t.lines[lk] = tail[i];
+            }
             if (h.money >= 0) t.money = h.money;
             bool own = !isHost && h.target == me; // our own session, echoed
             if (own) {

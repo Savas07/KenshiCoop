@@ -496,6 +496,26 @@ bool walkTo(Character* c, float x, float y, float z, float speed) {
     }
 }
 
+// walkTo minus the player move order: only the CharMovement HIGH_PRIORITY
+// destination, so an AI body is moved WITHOUT a new current task. For a world NPC
+// in a fight, Character::setDestination is a move order that replaces the attack
+// it is arming (MOVE_ON_FREE_WILL), and the goal is gone when the walk ends.
+bool steerTo(Character* c, float x, float y, float z, float speed) {
+    if (!c) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        Ogre::Vector3 dest(x, y, z);
+        mv->setDestination(dest, HIGH_PRIORITY, false);
+        float s = speed;
+        if (s < 1.0f) s = (float)RUN;
+        mv->setDesiredSpeed(s);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool park(Character* c, float x, float y, float z, float heading) {
     if (!c) return false;
     __try {

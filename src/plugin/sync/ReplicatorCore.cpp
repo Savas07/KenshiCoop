@@ -42,7 +42,7 @@ Replicator::Replicator()
       translateFrames_(0), walkTruthFrames_(0),
       restSampleFrames_(0), marchFrames_(0),
       marchHold_(0), marchSettle_(0), marchRelapse_(0),
-      marchHoldDip_(0), marchHoldStop_(0),
+      marchHoldDip_(0), marchHoldStop_(0), marchStepSkip_(0),
       gateSamples_(0), gateAgree_(0), gateLogTick_(0),
       probeRecruit_(false), probedCount_(0),
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
@@ -802,6 +802,12 @@ void Replicator::logSmoothSummary() {
               marchHoldDip_, marchHoldStop_);
     m[sizeof(m) - 1] = '\0';
     coop::logLine(m);
+    // Frames the march oracle skipped because the owner was walking a stepped
+    // stream (not at rest). Separate line: Test-MarchInPlace parses the one above.
+    char ms[96];
+    _snprintf(ms, sizeof(ms) - 1, "SCENARIO MARCHSTEP skipped=%lu", marchStepSkip_);
+    ms[sizeof(ms) - 1] = '\0';
+    coop::logLine(ms);
 
     // Step-2 pruning evidence: how often the legacy quieting patchwork actually
     // fired this run. Sustained relapse=0 across regressions = the I11 re-quiet is

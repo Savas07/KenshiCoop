@@ -29,12 +29,14 @@ function Test-CombatProbe {
     return (Add-GateResult -Name "combat_probe" -Status PASS -Metrics @{ samples = $fighting.Count })
 }
 
-# combat_order LIVE-transition: the join's own copies flip NOT-combat -> combat
-# (task=65024) after the host's "SCENARIO COMBAT issued" marker.
+# combat_order LIVE-transition: the join's copies of the host NPCs that went from
+# peace to a fight at the host's "SCENARIO COMBAT issued" marker fight on the join
+# too (task=65024), as much as the host's own did over the same window.
 function Test-CombatOrder {
     param([string]$HostFile, [string]$JoinFile, [int]$GraceMs = 5000,
-          [double]$PostMin = 0.40, [double]$PreMax = 0.10)
+          [double]$PreMax = 0.10, [double]$HostPostMin = 0.25, [double]$RelMin = 0.75)
     $COMBAT = 65024 # TASK_COMBAT_MELEE (0xFE00)
+    $WAIT   = 65025 # TASK_COMBAT_WAIT (0xFE01)
     $T = Get-MarkerTimeMs -File $HostFile -Pattern "SCENARIO COMBAT issued"
     if ($null -eq $T) { Write-Host "  COMBAT-ORDER FAIL - no 'SCENARIO COMBAT issued' marker on host"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "no COMBAT marker") }
     $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
@@ -46,19 +48,41 @@ function Test-CombatOrder {
     # 20261023_194654 / _195152_s3: postTotal 44 = 2 hands x 22 samples).
     $wireOf = Get-RekeyWireOf -File $JoinFile
     $Jw = @{}
+    $jEnd = $null
     foreach ($k in $J.Keys) {
         $parts = $k.Split(',')
         $is = $parts[0] + ',' + $parts[1]
         if ($wireOf.ContainsKey($is)) { $is = $wireOf[$is] }
         if (-not $Jw.ContainsKey($is)) { $Jw[$is] = New-Object System.Collections.ArrayList }
         [void]$Jw[$is].AddRange(@($J[$k]))
+        foreach ($s in $J[$k]) { if ($null -eq $jEnd -or $s.t -gt $jEnd) { $jEnd = $s.t } }
     }
-    $duelists = @()
+    # The duelists are the host NPCs that MADE the transition: a melee sample after
+    # the order, and at most PreMax of their pre-order samples in a combat stance.
+    # The bar's own brawl is often running before the order (host pre ratio
+    # 0.39-0.54 in runs 20261023_222146_s2 / _223313 / _224018); judging those
+    # bodies failed the join for mirroring a fight the host was already having.
+    $duelists = @(); $brawlers = 0
     foreach ($hand in $H.Keys) {
-        if (@($H[$hand] | Where-Object { $_.t -ge $T -and $_.task -eq $COMBAT }).Count -gt 0) { $duelists += $hand }
+        $hs = @($H[$hand])
+        if (@($hs | Where-Object { $_.t -ge $T -and $_.task -eq $COMBAT }).Count -eq 0) { continue }
+        $hpre = @($hs | Where-Object { $_.t -lt $T })
+        $hpreFight = @($hpre | Where-Object { $_.task -eq $COMBAT -or $_.task -eq $WAIT }).Count
+        if ($hpre.Count -gt 0 -and ($hpreFight / $hpre.Count) -gt $PreMax) { $brawlers++; continue }
+        $duelists += $hand
     }
-    if ($duelists.Count -lt 1) { Write-Host "  COMBAT-ORDER FAIL - host never streamed a combat task after the order"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "no combat task streamed") }
+    if ($duelists.Count -lt 1) {
+        if ($brawlers -gt 0) {
+            Write-Host "  COMBAT-ORDER SKIP - all $brawlers host NPC(s) fighting after the order were already fighting before it; no peaceful->fighting transition to replicate"
+            return (Add-GateResult -Name "combat_order" -Status SKIP -Metrics @{ brawlers = $brawlers } -Detail "no host transition (pre-existing brawl)")
+        }
+        Write-Host "  COMBAT-ORDER FAIL - host never streamed a combat task after the order"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "no combat task streamed")
+    }
+    # Both sides are scored over the JOIN's capture window: it stops ~16 s after
+    # the order while the host's runs to ~34 s, and a fight that only got going on
+    # the host after the join stopped recording counted against the join.
     $preCombat = 0; $preTotal = 0; $postCombat = 0; $postTotal = 0; $seen = 0
+    $hostCombat = 0; $hostTotal = 0
     foreach ($hand in $duelists) {
         $hp = $hand.Split(',')
         $is = $hp[0] + ',' + $hp[1]
@@ -66,17 +90,28 @@ function Test-CombatOrder {
         $seen++
         $pre  = @($Jw[$is] | Where-Object { $_.t -lt $T })
         $post = @($Jw[$is] | Where-Object { $_.t -ge ($T + $GraceMs) })
+        $hpost = @($H[$hand] | Where-Object { $_.t -ge ($T + $GraceMs) -and $_.t -le $jEnd })
         $preTotal  += $pre.Count;  $preCombat  += @($pre  | Where-Object { $_.task -eq $COMBAT }).Count
         $postTotal += $post.Count; $postCombat += @($post | Where-Object { $_.task -eq $COMBAT }).Count
+        $hostTotal += $hpost.Count; $hostCombat += @($hpost | Where-Object { $_.task -eq $COMBAT }).Count
     }
     if ($seen -lt 1) { Write-Host "  COMBAT-ORDER FAIL - join never received any duelist hand (saw $($duelists.Count) on host)"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "join received no duelists") }
-    if ($preTotal -lt 1 -or $postTotal -lt 1) { Write-Host "  COMBAT-ORDER FAIL - insufficient join samples (preTotal=$preTotal postTotal=$postTotal)"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "insufficient join samples") }
+    if ($preTotal -lt 1 -or $postTotal -lt 1 -or $hostTotal -lt 1) { Write-Host "  COMBAT-ORDER FAIL - insufficient samples (preTotal=$preTotal postTotal=$postTotal hostTotal=$hostTotal)"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "insufficient samples") }
     $preRatio  = [Math]::Round($preCombat  / $preTotal, 3)
     $postRatio = [Math]::Round($postCombat / $postTotal, 3)
-    $ok = ($preRatio -le $PreMax -and $postRatio -ge $PostMin)
+    $hostRatio = [Math]::Round($hostCombat / $hostTotal, 3)
+    $m = @{ preRatio = $preRatio; postRatio = $postRatio; hostPostRatio = $hostRatio; duelists = $duelists.Count; brawlers = $brawlers }
+    # A fight the host itself barely had (host 0.01-0.25 in 5 of 15 runs: the
+    # duel resolved within seconds) is no signal for the join either way.
+    if ($hostRatio -lt $HostPostMin) {
+        Write-Host "  COMBAT-ORDER SKIP - the host's own fight was too weak to judge (host ratio=$hostRatio<$HostPostMin, join=$postRatio)"
+        return (Add-GateResult -Name "combat_order" -Status SKIP -Metrics $m -Detail "host fight too weak")
+    }
+    $need = [Math]::Round($RelMin * $hostRatio, 3)
+    $ok = ($preRatio -le $PreMax -and $postRatio -ge $need)
     $v = if ($ok) { "PASS" } else { "FAIL" }
-    Write-Host "  COMBAT-ORDER [join] $v - duelists=$($duelists.Count) seen=$seen combat-before $preCombat/$preTotal (ratio=$preRatio<=$PreMax), combat-after $postCombat/$postTotal (ratio=$postRatio>=$PostMin)"
-    return (Add-GateResult -Name "combat_order" -Status $v -Metrics @{ preRatio = $preRatio; postRatio = $postRatio; duelists = $duelists.Count })
+    Write-Host "  COMBAT-ORDER [join] $v - duelists=$($duelists.Count) seen=$seen brawlers=$brawlers combat-before $preCombat/$preTotal (ratio=$preRatio<=$PreMax), combat-after $postCombat/$postTotal (ratio=$postRatio>=$need = $RelMin x host $hostRatio)"
+    return (Add-GateResult -Name "combat_order" -Status $v -Metrics $m)
 }
 
 # combat_kill OUTCOME oracle: host-authoritative resolution + attribution +
